@@ -11,6 +11,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, mock_open, patch
@@ -1049,6 +1050,68 @@ class ApiStartStopEndpointTests(unittest.TestCase):
         self.assertTrue(body["ok"])
 
 
+class StartBotStatusTests(unittest.TestCase):
+    """_start_bot_in_thread must not report "running" for a dead bot.
+
+    Regression test for the dashboard showing 「停止机器人」 while the worker
+    thread had already exited on a startup error (e.g. a missing API key),
+    which made the bot look alive while nothing polled WeChat at all.
+    """
+
+    def tearDown(self):
+        from src.web.server import _bot_control
+        _bot_control.mark_stopped()
+
+    def _start_and_wait(self, join_timeout=5.0):
+        import threading
+        from src.web.server import _start_bot_in_thread, _status, _bot_control
+
+        _bot_control.mark_stopped()
+        result = _start_bot_in_thread()
+        self.assertTrue(result["ok"])
+        for t in threading.enumerate():
+            if t.name == "bot-main":
+                t.join(timeout=join_timeout)
+        return _status.snapshot(), _bot_control.is_running()
+
+    def test_crashing_startup_leaves_status_not_running(self):
+        """A startup exception must end with running=False in the snapshot."""
+        with patch("src.config.load_config",
+                   side_effect=RuntimeError("ANTHROPIC_API_KEY 未设置")):
+            snap, control_running = self._start_and_wait()
+
+        self.assertFalse(snap["running"], "dashboard would show a live bot")
+        self.assertFalse(control_running)
+        self.assertIn("ANTHROPIC_API_KEY", snap["error"])
+
+    def test_normal_exit_clears_running_flag(self):
+        """Bot.run() returning (clean shutdown) also clears running."""
+        class _FakeBot:
+            def __init__(self, config):
+                pass
+
+            def run(self):
+                return  # backend stopped cleanly, no exception
+
+        fake_config = MagicMock()
+        fake_config.wechat_backend = "wcdb"
+        fake_config.ai_backend = "deepseek"
+
+        # Stub the module instead of importing it: src.bot pulls in optional
+        # heavy deps (pydantic, AI SDKs) that a unit test shouldn't require.
+        fake_bot_module = types.ModuleType("src.bot")
+        fake_bot_module.Bot = _FakeBot
+
+        with (
+            patch("src.config.load_config", return_value=fake_config),
+            patch.dict(sys.modules, {"src.bot": fake_bot_module}),
+        ):
+            snap, control_running = self._start_and_wait()
+
+        self.assertFalse(snap["running"])
+        self.assertFalse(control_running)
+
+
 # ---------------------------------------------------------------------------
 # /api/config and /api/load-config endpoint tests
 # ---------------------------------------------------------------------------
@@ -1705,6 +1768,221 @@ class SetEnvKeyTests(unittest.TestCase):
         finally:
             tmp_env.unlink(missing_ok=True)
             tmp_dir.rmdir()
+
+
+# ---------------------------------------------------------------------------
+# .env → os.environ synchronisation (config actually reaching the process)
+# ---------------------------------------------------------------------------
+
+
+class ApplyEnvFileTests(unittest.TestCase):
+    """Tests for src.config.apply_env_file -- the .env→os.environ bridge.
+
+    Regression tests for "引导页配置完成后仍报 ANTHROPIC_API_KEY 未设置":
+    load_config() reads only os.environ, and .env was otherwise loaded once
+    at import time (before the file existed).
+    """
+
+    def setUp(self):
+        self.tmp_dir = Path(tempfile.mkdtemp())
+        self.tmp_env = self.tmp_dir / ".env"
+
+    def tearDown(self):
+        self.tmp_env.unlink(missing_ok=True)
+        self.tmp_dir.rmdir()
+
+    def test_applies_file_values_to_environ(self):
+        """Values from the given .env land in os.environ."""
+        from src.config import apply_env_file
+
+        self.tmp_env.write_text(
+            "AI_BACKEND=deepseek\nDEEPSEEK_API_KEY=sk-from-file\n",
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AI_BACKEND", None)
+            os.environ.pop("DEEPSEEK_API_KEY", None)
+            applied = apply_env_file(self.tmp_env)
+            self.assertEqual(applied, self.tmp_env)
+            self.assertEqual(os.getenv("AI_BACKEND"), "deepseek")
+            self.assertEqual(os.getenv("DEEPSEEK_API_KEY"), "sk-from-file")
+
+    def test_overrides_stale_environ_values(self):
+        """A changed .env wins over whatever the process saw at import time."""
+        from src.config import apply_env_file
+
+        self.tmp_env.write_text("AI_BACKEND=openai\n", encoding="utf-8")
+        with patch.dict(os.environ, {"AI_BACKEND": "claude"}, clear=False):
+            apply_env_file(self.tmp_env)
+            self.assertEqual(os.getenv("AI_BACKEND"), "openai")
+
+    def test_returns_none_for_missing_file(self):
+        """No file → no error, nothing applied."""
+        from src.config import apply_env_file
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AI_BACKEND", None)
+            self.assertIsNone(apply_env_file(self.tmp_dir / "nope.env"))
+            self.assertIsNone(os.getenv("AI_BACKEND"))
+
+    def test_unreadable_file_does_not_raise(self):
+        """A read failure after a successful write must not fail the request."""
+        from src.config import apply_env_file
+
+        with patch("src.config.load_dotenv", side_effect=OSError("bad fd")):
+            self.tmp_env.write_text("AI_BACKEND=deepseek\n", encoding="utf-8")
+            self.assertIsNone(apply_env_file(self.tmp_env))
+
+
+class OnboardingEnvPersistenceTests(unittest.TestCase):
+    """End-to-end: onboarding writes .env AND the running process sees it."""
+
+    def setUp(self):
+        self.tmp_dir = Path(tempfile.mkdtemp())
+        self.tmp_env = self.tmp_dir / ".env"
+        from src.web import server as srv
+        self.srv = srv
+        self._orig_data = dict(srv._onboarding_data)
+        self._orig_find = srv._find_or_create_env
+
+    def tearDown(self):
+        self.srv._find_or_create_env = self._orig_find
+        with self.srv._onboarding_lock:
+            self.srv._onboarding_data.clear()
+            self.srv._onboarding_data.update(self._orig_data)
+        self.tmp_env.unlink(missing_ok=True)
+        self.tmp_dir.rmdir()
+
+    def test_write_onboarding_to_env_applies_to_environ(self):
+        """After step4, load_config() sees the backend the user picked.
+
+        This is the exact failure the user reported: onboarding completes,
+        yet the bot refuses to start with a missing-Anthropic-key error.
+        """
+        from src.config import load_config
+
+        self.srv._find_or_create_env = lambda: self.tmp_env
+        with self.srv._onboarding_lock:
+            self.srv._onboarding_data.update({
+                "ai_backend": "deepseek",
+                "deepseek_api_key": "sk-deepseek-e2e-1234567890",
+                "deepseek_base_url": "https://api.deepseek.com",
+                "deepseek_model": "deepseek-v4-flash",
+                "bot_display_name": "群聊小助手",
+                "wechat_groups": "*",
+                "wechat_backend": "wcdb",
+                "key": "a" * 64,
+            })
+        with patch.dict(os.environ, {}, clear=False):
+            for k in ("AI_BACKEND", "DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY"):
+                os.environ.pop(k, None)
+            self.srv._write_onboarding_to_env(self.tmp_env)
+            config = load_config()
+            self.assertEqual(config.ai_backend, "deepseek")
+            self.assertEqual(config.deepseek_api_key, "sk-deepseek-e2e-1234567890")
+
+    def test_reset_preserves_ai_configuration(self):
+        """/api/onboarding/reset must not blank a working AI configuration.
+
+        The dashboard's "重新获取密钥" button hits this endpoint; blanking
+        ai_backend / *_api_key there wrote empty values over a good .env on
+        the next onboarding write, so the bot then failed to start.
+        """
+        self.srv._find_or_create_env = lambda: self.tmp_env
+        self.tmp_env.write_text(
+            "AI_BACKEND=deepseek\n"
+            "DEEPSEEK_API_KEY=sk-existing-1234567890\n"
+            "DEEPSEEK_MODEL=deepseek-v4-pro\n"
+            "BOT_DISPLAY_NAME=我的助手\n"
+            "WECHAT_GROUPS=测试群\n"
+            "WCDB_KEY=" + "b" * 64 + "\n"
+            "ONBOARDING_DONE=true\n",
+            encoding="utf-8",
+        )
+        with self.srv._onboarding_lock:
+            self.srv._onboarding_data.update({
+                "step1_done": True, "key": "b" * 64,
+                "ai_backend": "deepseek",
+                "deepseek_api_key": "sk-existing-1234567890",
+                "bot_display_name": "我的助手",
+                "wechat_groups": "测试群",
+            })
+
+        handler, sock = _build_handler("/api/onboarding/reset", method="POST")
+        body = json.loads(sock.get_response_text().split("\r\n\r\n", 1)[1])
+        self.assertTrue(body["ok"])
+
+        with self.srv._onboarding_lock:
+            self.assertFalse(self.srv._onboarding_data["step1_done"])
+            self.assertEqual(self.srv._onboarding_data["key"], "")
+            # Everything else survives — both in memory and after a re-write.
+            self.assertEqual(self.srv._onboarding_data["ai_backend"], "deepseek")
+            self.assertEqual(
+                self.srv._onboarding_data["deepseek_api_key"],
+                "sk-existing-1234567890",
+            )
+
+        self.srv._write_onboarding_to_env(self.tmp_env)
+        saved = self.tmp_env.read_text(encoding="utf-8")
+        self.assertIn("AI_BACKEND=deepseek", saved)
+        self.assertIn("DEEPSEEK_API_KEY=sk-existing-1234567890", saved)
+        self.assertIn("DEEPSEEK_MODEL=deepseek-v4-pro", saved)
+        self.assertIn("BOT_DISPLAY_NAME=我的助手", saved)
+
+    def test_reset_reseeds_from_env_when_memory_is_empty(self):
+        """A reset on a fresh process reloads AI config from the .env file."""
+        self.srv._find_or_create_env = lambda: self.tmp_env
+        self.tmp_env.write_text(
+            "AI_BACKEND=openai\nOPENAI_API_KEY=sk-openai-1234567890\n"
+            "OPENAI_MODEL=glm-4-flash\n",
+            encoding="utf-8",
+        )
+        with self.srv._onboarding_lock:
+            self.srv._onboarding_data.update({
+                "ai_backend": "", "openai_api_key": "", "openai_model": "",
+            })
+
+        handler, sock = _build_handler("/api/onboarding/reset", method="POST")
+        body = json.loads(sock.get_response_text().split("\r\n\r\n", 1)[1])
+        self.assertTrue(body["ok"])
+
+        with self.srv._onboarding_lock:
+            self.assertEqual(self.srv._onboarding_data["ai_backend"], "openai")
+            self.assertEqual(
+                self.srv._onboarding_data["openai_api_key"], "sk-openai-1234567890"
+            )
+            self.assertEqual(self.srv._onboarding_data["openai_model"], "glm-4-flash")
+
+    def test_step3_persists_openai_fields(self):
+        """step3 must store the OpenAI-compatible provider's key/url/model.
+
+        The frontend sends them; the handler used to drop them, so choosing
+        "OpenAI 兼容" during onboarding produced an empty OPENAI_API_KEY.
+        """
+        post_body = json.dumps({
+            "ai_backend": "openai",
+            "openai_api_key": "sk-openai-step3-1234567890",
+            "openai_base_url": "https://open.bigmodel.cn/api/paas/v4/",
+            "openai_model": "glm-4-flash",
+        })
+        handler, sock = _build_handler(
+            "/api/onboarding/step3", method="POST",
+            body=post_body.encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        result = json.loads(sock.get_response_text().split("\r\n\r\n", 1)[1])
+        self.assertTrue(result["ok"])
+        with self.srv._onboarding_lock:
+            self.assertEqual(self.srv._onboarding_data["ai_backend"], "openai")
+            self.assertEqual(
+                self.srv._onboarding_data["openai_api_key"],
+                "sk-openai-step3-1234567890",
+            )
+            self.assertEqual(
+                self.srv._onboarding_data["openai_base_url"],
+                "https://open.bigmodel.cn/api/paas/v4/",
+            )
+            self.assertEqual(self.srv._onboarding_data["openai_model"], "glm-4-flash")
 
 
 # ---------------------------------------------------------------------------

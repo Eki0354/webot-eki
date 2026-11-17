@@ -117,6 +117,34 @@ def find_env_file() -> Path | None:
     return None
 
 
+def apply_env_file(env_path: Path | None = None) -> Path | None:
+    """Reload a .env file into ``os.environ`` and return the path used.
+
+    This is the single entry point for "the .env file changed on disk —
+    make the running process see it".  ``load_config()`` reads only
+    ``os.environ``, while the file is otherwise loaded exactly once at
+    import time, so every writer of .env (onboarding, config save, WCDB
+    key persistence) must call this afterwards.  Skipping it is what made
+    a freshly completed onboarding still look unconfigured.
+
+    Returns None when there is no file to load.
+    """
+    path = env_path or find_env_file()
+    if path is None or not path.exists():
+        return None
+    try:
+        load_dotenv(path, override=True)
+    except OSError as e:
+        # The file was written successfully — a read-back failure must not
+        # fail the caller (the config is already on disk for the next start).
+        import logging
+        logging.getLogger(__name__).warning(
+            "Failed to apply %s to os.environ: %s", path, e
+        )
+        return None
+    return path
+
+
 _env_path = find_env_file()
 
 if _env_path:
@@ -417,6 +445,23 @@ def load_config() -> BotConfig:
     Raises RuntimeError if required configuration is missing.
     """
     ai_backend = os.getenv("AI_BACKEND", "claude").strip().lower()
+
+    # An empty AI_BACKEND is never a legitimate choice: it means the .env was
+    # never applied to this process (or was blanked).  Say so instead of
+    # silently validating the "claude" fallback and blaming an Anthropic key
+    # the user never configured.
+    if not ai_backend:
+        msg = (
+            "AI_BACKEND 未设置（当前进程没有读到 AI 配置）。"
+            "请到「系统配置 → AI 后端配置」保存一次，或重新走一遍引导页"
+        )
+        raise RuntimeError(msg)
+    if ai_backend not in ("claude", "deepseek", "openai"):
+        msg = (
+            f"AI_BACKEND 值 '{ai_backend}' 无效，"
+            "仅支持 claude / deepseek / openai"
+        )
+        raise RuntimeError(msg)
 
     # Validate required API keys based on selected backend
     if ai_backend == "deepseek":

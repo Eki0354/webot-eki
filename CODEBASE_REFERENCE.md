@@ -221,7 +221,8 @@ todo_delete_keywords: list[str] = [
 | `_resolve_project_root()` | ~70 | 解析项目根目录(支持 EXE frozen 模式) | 无 | `Path` |
 | `resolve_env_file()` | ~85 | 返回 .env 的权威路径(单一来源, 读写统一) | 无 | `Path` |
 | `find_env_file()` | ~100 | 返回实际存在的 .env 路径(canonical 优先, 向后兼容 cwd) | 无 | `Path \| None` |
-| `load_config()` | ~180 | 从环境变量加载并验证配置 | 无 | `BotConfig` |
+| `apply_env_file(env_path=None)` | ~120 | 把 .env 重新载入 `os.environ`(.env→进程内存的唯一入口, `override=True`; 文件缺失/读取失败返回 None) | `env_path: Path \| None` | `Path \| None` |
+| `load_config()` | ~200 | 从环境变量加载并验证配置(只读 `os.environ`; `AI_BACKEND` 为空或非法时抛 RuntimeError 指明真因) | 无 | `BotConfig` |
 | `_validate_config(kwargs)` | ~240 | 验证数值配置范围 | `kwargs: dict` | `None` (无效时抛 RuntimeError) |
 | `is_onboarding_done()` | ~370 | 检查引导流程是否完成 | 无 | `bool` |
 
@@ -607,7 +608,7 @@ todo_delete_keywords: list[str] = [
 | `update_status(**kwargs)` | 推送状态到所有 WebSocket 客户端 | 关键字参数 | `None` |
 | `register_bot(thread, backend)` | 注册 bot 线程/后端 | `thread, backend` | `None` |
 | `_stop_bot()` | 停止运行中的 bot | 无 | `bool` |
-| `_start_bot_in_thread()` | 在新守护线程中启动 bot | 无 | `dict` ({"ok": True/False}) |
+| `_start_bot_in_thread()` | 在新守护线程中启动 bot(先发布 running=True 再 start, 避免秒退被覆盖; 线程 finally 里必定复位 running=False) | 无 | `dict` ({"ok": True/False}) |
 | `_register_backend(backend)` | 从 Bot.run() 注册后端 | `backend` | `None` |
 | `_bot_exited()` | 通知 bot 线程已退出 | 无 | `None` |
 | `signal_shutdown()` | 信号关闭所有组件 | 无 | `None` |
@@ -617,6 +618,8 @@ todo_delete_keywords: list[str] = [
 | `_read_ws_frame(sock)` | 读取 WebSocket 帧 | `sock` | `bytes \| None` |
 | `_recv_exactly(sock, n)` | 精确接收 n 字节 | `sock, n: int` | `bytes \| None` |
 | `_find_or_create_env()` | 查找或创建 .env 文件(统一写到 resolve_env_file() 权威路径) | 无 | `Path` |
+| `_read_env_map(env_path)` | 把 .env 解析成 key→value 字典(忽略注释) | `env_path` | `dict[str, str]` |
+| `_reseed_onboarding_from_env(env_path)` | 密钥重提取后, 从现有 .env 回填非密钥引导字段(调用方须持有 `_onboarding_lock`) | `env_path` | `None` |
 | `_detect_wxid_and_db_path()` | 自动检测微信 wxid 和数据库路径 | 无 | `tuple[str \| None, str \| None]` |
 | `_set_env_key(env_path, key, value)` | 原子设置 .env 键值 | `env_path: Path, key: str, value: str` | `None` |
 | `_detect_default_data_dir()` | 检测默认微信数据目录 | 无 | `str` |
@@ -625,7 +628,7 @@ todo_delete_keywords: list[str] = [
 | `_macos_wechat_diagnostics(...)` | macOS 微信权限诊断 | 可选参数 | `dict` |
 | `_read_recent_logs()` | 读取最近 500 行日志 | 无 | `dict` |
 | `_run_step1_extraction()` | 后台执行密钥提取 | 无 | `None` |
-| `_write_onboarding_to_env(env_path)` | 写入引导数据到 .env | `env_path` | `None` |
+| `_write_onboarding_to_env(env_path)` | 写入引导数据到 .env, 并调用 `apply_env_file()` 同步到 `os.environ` | `env_path` | `None` |
 
 ### 2.34 前端组件 (`ui/src/components/`)
 
@@ -1115,13 +1118,53 @@ MessageRouter.handle(msg) → [无 @mention]
 | `POST` | `/api/onboarding/step1` | 启动密钥提取(异步) | 无 |
 | `GET` | `/api/onboarding/step1-status` | 轮询密钥提取状态 | 无 |
 | `POST` | `/api/onboarding/step2` | 保存微信配置 | 无 |
-| `POST` | `/api/onboarding/step3` | 保存 AI 配置 | 无 |
+| `POST` | `/api/onboarding/step3` | 保存 AI 配置 (含 deepseek/openai/anthropic 三套字段) | 无 |
 | `POST` | `/api/onboarding/step4` | 保存功能设置+完成引导 | 无 |
-| `POST` | `/api/onboarding/reset` | 重置引导流程 | 无 |
+| `POST` | `/api/onboarding/reset` | 仅重置密钥提取状态(step1/key/wxid/db_path), 保留 AI 与身份配置并从 .env 回填 | 无 |
 | `GET` | `/api/voice/model-status?model=small` | 语音模型下载状态 | 无 |
 | `POST` | `/api/voice/download-model` | 触发语音模型下载 | 无 |
 | `GET` | `/api/macos/diagnose` | macOS 微信权限诊断 | 无 |
 | `GET` | `/ws` | WebSocket 升级 (状态推送) | 无 |
+
+#### .env 生效链路（配置写入后必须同步到进程内存）
+
+`load_config()` **只读 `os.environ`**，而 `.env` 原本只在进程 import 时 `load_dotenv()` 一次。
+因此任何写 `.env` 的路径都必须在写盘后调用 `src.config.apply_env_file()`，否则磁盘已更新、进程仍看到旧值（表现为"配置好了却提示 key 未设置"）。
+
+```
+写 .env 的 4 个入口                      写盘后同步
+─────────────────────────────────────   ─────────────────────────
+_write_onboarding_to_env()   ────────→  apply_env_file(env_path)
+/api/config        (保存)    ────────→  apply_env_file(env_path)
+/api/config/import (导入)    ────────→  apply_env_file(env_path)
+wcdb_client._save_key_to_env()          （只影响 WCDB_KEY，由 _key_candidates 读 environ）
+                                        ↑ 该处已单独 os.environ["WCDB_KEY"] = key
+```
+
+`apply_env_file(env_path=None)` 语义：
+
+| 情况 | 行为 |
+|---|---|
+| 未传路径 | 用 `find_env_file()`（canonical 优先，兼容 cwd） |
+| 文件不存在 | 返回 `None`，不改动 `os.environ` |
+| 读取失败 (OSError) | 记录 warning 并返回 `None`——写盘已成功，不能让请求失败 |
+| 正常 | `load_dotenv(path, override=True)`，返回实际路径 |
+
+#### 启动状态机（避免"面板显示运行但实际没跑"）
+
+`_start_bot_in_thread()` 的 `running` 发布顺序是刻意的：
+
+```
+update_status(running=True)   ← 先发布
+thread.start()                ← 再启动 worker
+        │
+        └─ worker 启动失败 → update_status(running=False, error=...)
+                             finally: _bot_control.mark_stopped()
+                                      update_status(running=False)
+```
+
+若先 `start()` 后发布 `running=True`，worker 秒退（如缺 API key）写入的 `False` 会被主线程覆盖，
+Dashboard 就一直显示「停止机器人」，而后台没有任何轮询线程。
 
 #### WebSocket 消息类型
 

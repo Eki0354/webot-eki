@@ -345,6 +345,58 @@ def _set_env_key(env_path: Path, key: str, value: str) -> None:
         os.replace(tmp, env_path)
 
 
+def _read_env_map(env_path) -> dict[str, str]:
+    """Parse a .env file into a plain key→value dict (comments ignored)."""
+    raw: dict[str, str] = {}
+    if not env_path or not env_path.exists():
+        return raw
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            raw[k.strip()] = v.strip()
+    return raw
+
+
+# .env key → _onboarding_data field, for fields that survive a key re-extraction.
+_ENV_TO_ONBOARDING = {
+    "AI_BACKEND": ("ai_backend", str),
+    "DEEPSEEK_API_KEY": ("deepseek_api_key", str),
+    "DEEPSEEK_BASE_URL": ("deepseek_base_url", str),
+    "DEEPSEEK_MODEL": ("deepseek_model", str),
+    "OPENAI_API_KEY": ("openai_api_key", str),
+    "OPENAI_BASE_URL": ("openai_base_url", str),
+    "OPENAI_MODEL": ("openai_model", str),
+    "ANTHROPIC_API_KEY": ("anthropic_api_key", str),
+    "ANTHROPIC_BASE_URL": ("anthropic_base_url", str),
+    "SUMMARIZE_MODEL": ("summarize_model", str),
+    "WECHAT_BACKEND": ("wechat_backend", str),
+    "WECHAT_GROUPS": ("wechat_groups", str),
+    "BOT_DISPLAY_NAME": ("bot_display_name", str),
+    "PROACTIVE_ENABLED": ("proactive_enabled", "bool"),
+    "STICKY_MENTION_ENABLED": ("sticky_mention_enabled", "bool"),
+}
+
+
+def _reseed_onboarding_from_env(env_path) -> None:
+    """Reload non-key onboarding fields from an existing .env.
+
+    Called after a key re-extraction reset.  Values already present in
+    memory win only when the file has nothing to say, so a user who just
+    edited the config panel keeps their choice.  Must be called with
+    ``_onboarding_lock`` held.
+    """
+    raw = _read_env_map(env_path)
+    for env_key, (field_name, kind) in _ENV_TO_ONBOARDING.items():
+        value = raw.get(env_key)
+        if value is None or value == "":
+            continue
+        if kind == "bool":
+            _onboarding_data[field_name] = value.strip().lower() == "true"
+        else:
+            _onboarding_data[field_name] = value
+
+
 def _write_onboarding_to_env(env_path):
     """Write accumulated onboarding data to .env file atomically."""
     with _onboarding_lock:
@@ -390,7 +442,13 @@ def _write_onboarding_to_env(env_path):
     tmp_path = env_path.with_suffix(".tmp")
     tmp_path.write_text(content, encoding="utf-8")
     os.replace(tmp_path, env_path)
-    logger.info("Onboarding complete — wrote .env")
+    # Make the just-written file visible to load_config(), which reads only
+    # os.environ.  Without this the running process keeps whatever it saw at
+    # import time (usually nothing, since .env didn't exist yet) and the bot
+    # reports a missing API key right after onboarding finished.
+    from src.config import apply_env_file
+    apply_env_file(env_path)
+    logger.info("Onboarding complete — wrote .env and applied it to os.environ")
 
 
 def _run_step1_extraction():
@@ -830,7 +888,11 @@ _onboarding_data = {
     "key": "", "wxid": "", "db_path": "",
     "bot_display_name": "", "wechat_groups": "*", "wechat_backend": "wcdb",
     "ai_backend": "deepseek", "deepseek_api_key": "", "deepseek_model": "deepseek-v4-flash",
-    "anthropic_api_key": "", "summarize_model": "claude-haiku-4-5-20251001",
+    "deepseek_base_url": "https://api.deepseek.com",
+    "openai_api_key": "", "openai_model": "gpt-4o-mini",
+    "openai_base_url": "https://api.openai.com/v1",
+    "anthropic_api_key": "", "anthropic_base_url": "https://api.anthropic.com",
+    "summarize_model": "claude-haiku-4-5-20251001",
     "proactive_enabled": False,
     "sticky_mention_enabled": True,
 }
@@ -917,12 +979,19 @@ def _start_bot_in_thread():
             # Always clear the running flag so the user can restart
             # (bot.run() exits gracefully on errors like KEY_MISSING)
             _bot_control.mark_stopped()
+            # The dashboard reads this flag, not _bot_control — a normal
+            # backend shutdown (Bot.run() returning) otherwise leaves the UI
+            # showing "running" with no poll loop behind it.
+            update_status(running=False)
 
+    # Publish "running" BEFORE the worker can fail, so a fast crash is not
+    # overwritten by this line afterwards (the dashboard would then show a
+    # live bot whose thread is already gone).
+    update_status(running=True, error="")
     thread = threading.Thread(target=_run, daemon=True, name="bot-main")
-    thread.start()
     _bot_control.set_thread(thread)
     _bot_control.set_running()
-    update_status(running=True)
+    thread.start()
     return {"ok": True}
 
 
@@ -1298,9 +1367,11 @@ class _UIHandler(SimpleHTTPRequestHandler):
                 with _env_write_lock:
                     tmp_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
                     os.replace(tmp_path, env_path)
-                for key, val in updates.items():
-                    if val is not None:
-                        os.environ[key] = str(val)
+                # Single source of truth: the file.  Reloading it (instead of
+                # patching os.environ key by key) keeps the process and the
+                # file in step, including secrets we deliberately skipped.
+                from src.config import apply_env_file
+                apply_env_file(env_path)
                 self.send_json({
                     "ok": True,
                     "saved": list(seen),
@@ -1385,10 +1456,9 @@ class _UIHandler(SimpleHTTPRequestHandler):
                 with _env_write_lock:
                     tmp_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
                     os.replace(tmp_path, env_path)
-                # Update in-process environment
-                for key, val in updates.items():
-                    if val is not None:
-                        os.environ[key] = str(val)
+                # Update in-process environment from the file we just wrote.
+                from src.config import apply_env_file
+                apply_env_file(env_path)
                 self.send_json({
                     "ok": True,
                     "imported": list(seen),
@@ -2048,6 +2118,9 @@ class _UIHandler(SimpleHTTPRequestHandler):
                     _onboarding_data["deepseek_api_key"] = data.get("deepseek_api_key", "")
                     _onboarding_data["deepseek_base_url"] = data.get("deepseek_base_url", "https://api.deepseek.com")
                     _onboarding_data["deepseek_model"] = data.get("deepseek_model", "deepseek-v4-flash")
+                    _onboarding_data["openai_api_key"] = data.get("openai_api_key", "")
+                    _onboarding_data["openai_base_url"] = data.get("openai_base_url", "https://api.openai.com/v1")
+                    _onboarding_data["openai_model"] = data.get("openai_model", "gpt-4o-mini")
                     _onboarding_data["anthropic_api_key"] = data.get("anthropic_api_key", "")
                     _onboarding_data["anthropic_base_url"] = data.get("anthropic_base_url", "https://api.anthropic.com")
                     _onboarding_data["summarize_model"] = data.get("summarize_model", "claude-haiku-4-5-20251001")
@@ -2079,17 +2152,28 @@ class _UIHandler(SimpleHTTPRequestHandler):
 
         # ── API: Reset onboarding → allow re-extraction ─────────────
         if self.path == "/api/onboarding/reset":
-            # 1. Reset file-based state
+            # Only the KEY-EXTRACTION state is reset here.  This endpoint is
+            # reached from the dashboard's "重新获取密钥" button, which must
+            # never destroy an already-working AI / identity configuration:
+            # the onboarding writer later persists every field it holds, so
+            # blanking ai_backend / *_api_key would write empty values over a
+            # good .env and the bot would then refuse to start.
             env_path = _find_or_create_env()
             _set_env_key(env_path, "ONBOARDING_DONE", "false")
             _set_env_key(env_path, "WCDB_KEY", "")
-            # 2. Reset in-memory state so a fresh extraction can start
+            # The file now says "no key" — drop the in-process copy too, or
+            # the next wcdb open would silently reuse the key we just cleared
+            # (masking a failed re-extraction).
+            os.environ.pop("WCDB_KEY", None)
             with _onboarding_lock:
-                for k in _onboarding_data:
-                    if isinstance(_onboarding_data[k], bool):
-                        _onboarding_data[k] = False
-                    elif isinstance(_onboarding_data[k], str):
-                        _onboarding_data[k] = ""
+                _onboarding_data["step1_done"] = False
+                _onboarding_data["key"] = ""
+                _onboarding_data["wxid"] = ""
+                _onboarding_data["db_path"] = ""
+                # Re-seed everything else from the existing .env so a partial
+                # re-run of onboarding (e.g. user only redoes step 1) still
+                # writes back the real values instead of empties.
+                _reseed_onboarding_from_env(env_path)
             with _step1_lock:
                 _step1_state["running"] = False
                 _step1_state["phase"] = "idle"
