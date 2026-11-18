@@ -154,6 +154,7 @@ else:
 
 # Log which .env was loaded (helpful for debugging EXE packaging issues)
 import logging as _logging
+import threading as _threading
 _log = _logging.getLogger(__name__)
 if _env_path:
     _log.info("Loaded .env from: %s", _env_path)
@@ -161,6 +162,63 @@ else:
     _log.warning(
         ".env not found (canonical: %s). Using defaults.", resolve_env_file()
     )
+
+
+# Serializes .env writes across HTTP threads and background workers.
+_env_write_lock = _threading.Lock()
+
+
+def write_env_file(env_path: Path, content: str) -> str:
+    """Write ``content`` to ``env_path``; return "atomic" or "direct".
+
+    Prefers the atomic write-temp-then-rename pattern, but that pattern is
+    not universally available: on network shares and shared folders
+    (VMware HGFS ``\\\\vmware-host\\Shared Folders\\...``, SMB, some
+    virtualized disks) ``os.replace`` onto an existing file is refused,
+    which used to surface as a dropped HTTP connection and a bogus
+    "无法连接服务器" in the UI.  When the rename fails we fall back to
+    overwriting the file in place — a torn write is only possible if the
+    process dies mid-write, which is strictly better than not saving at all.
+
+    The temp file is always named after the *full* file name
+    (``.env.tmp.<pid>.<tid>``) rather than via ``Path.with_suffix``, which
+    would turn ``config.env`` into ``config.tmp`` and clobber an unrelated
+    file.  Unique names keep concurrent writers from stepping on each other
+    even before the lock is taken.
+
+    Raises OSError when neither strategy can write the file.
+    """
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = env_path.with_name(
+        f"{env_path.name}.tmp.{os.getpid()}.{_threading.get_ident()}"
+    )
+
+    with _env_write_lock:
+        replaced = False
+        try:
+            tmp_path.write_text(content, encoding="utf-8")
+            try:
+                os.replace(tmp_path, env_path)
+                replaced = True
+                return "atomic"
+            except OSError as e:
+                _log.warning(
+                    "Atomic replace of %s failed (%s) — falling back to a "
+                    "direct write. This is expected on network/shared folders "
+                    "such as UNC paths and VMware shared folders.",
+                    env_path, e,
+                )
+        finally:
+            if not replaced:
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except OSError:
+                    pass
+
+        # Rename unsupported here — overwrite in place instead.
+        env_path.write_text(content, encoding="utf-8")
+        return "direct"
 
 
 @dataclass

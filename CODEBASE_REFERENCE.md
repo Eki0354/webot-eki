@@ -161,6 +161,7 @@ grep "文件名" CODEBASE_REFERENCE.md
 | `PROJECT_ROOT` | `Path` | 自动解析 | `src/config.py` | 项目根目录（支持 frozen EXE 模式） |
 | `UI_DIR` | `Path` | `ui/dist/` | `src/web/server.py` | 前端静态文件目录 |
 | `WEBSOCKET_GUID` | `bytes` | `b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"` | `src/web/server.py` | WebSocket 协议 GUID |
+| `_env_write_lock` | `threading.Lock` | `threading.Lock()` | `src/config.py` | 串行化所有 .env 写盘（`write_env_file` 内部持有；server 侧不再单独加锁） |
 | `CONSOLIDATE_MSG_THRESHOLD` | `int` | `50` | `src/memory/consolidator.py` | 触发记忆合并的消息数阈值 |
 | `CONSOLIDATE_TIME_THRESHOLD_SEC` | `int` | `3600` (1小时) | `src/memory/consolidator.py` | 触发记忆合并的时间阈值 |
 | `MAX_NEW_MSGS_PER_CONSOLIDATION` | `int` | `400` | `src/memory/consolidator.py` | 每次合并最多处理的消息数 |
@@ -222,6 +223,7 @@ todo_delete_keywords: list[str] = [
 | `resolve_env_file()` | ~85 | 返回 .env 的权威路径(单一来源, 读写统一) | 无 | `Path` |
 | `find_env_file()` | ~100 | 返回实际存在的 .env 路径(canonical 优先, 向后兼容 cwd) | 无 | `Path \| None` |
 | `apply_env_file(env_path=None)` | ~120 | 把 .env 重新载入 `os.environ`(.env→进程内存的唯一入口, `override=True`; 文件缺失/读取失败返回 None) | `env_path: Path \| None` | `Path \| None` |
+| `write_env_file(env_path, content)` | ~165 | 写 .env 的唯一落盘入口: 优先"唯一临时名 + `os.replace`"原子写, rename 被拒(UNC / VMware 共享文件夹 / SMB)时回退为原地覆盖并记 warning; 临时名基于完整文件名, 不会像 `Path.with_suffix` 那样把 `config.env` 变成 `config.tmp` | `env_path: Path, content: str` | `str` (`"atomic"` / `"direct"`; 两种策略都失败时抛 `OSError`) |
 | `load_config()` | ~200 | 从环境变量加载并验证配置(只读 `os.environ`; `AI_BACKEND` 为空或非法时抛 RuntimeError 指明真因) | 无 | `BotConfig` |
 | `_validate_config(kwargs)` | ~240 | 验证数值配置范围 | `kwargs: dict` | `None` (无效时抛 RuntimeError) |
 | `is_onboarding_done()` | ~370 | 检查引导流程是否完成 | 无 | `bool` |
@@ -355,14 +357,24 @@ todo_delete_keywords: list[str] = [
 | 函数 | 描述 | 参数 | 返回值 |
 |---|---|---|---|
 | `__init__(dll_dir)` | 初始化 WCDB 客户端 | `dll_dir: str` | `None` |
-| `init()` | 初始化 wcdb_api.dll | 无 | `bool` |
-| `open()` | 打开加密数据库 | 无 | `bool` |
+| `init()` | 初始化 wcdb_api.dll（自动识别替代 DLL，仅在原版 WeFlow DLL 上打 DRM 补丁） | 无 | `bool` |
+| `open()` | 打开加密数据库(逐个密钥源尝试; 失败时按原因抛 `KEY_MISSING`(未配置) 或 `KEY_INVALID`(密钥不匹配本机数据库)) | 无 | `bool` |
 | `close()` | 关闭数据库连接 | 无 | `None` |
 | `get_sessions()` | 获取所有会话列表 | 无 | `list[dict]` |
 | `get_messages(talker, limit)` | 获取指定 talker 的消息 | `talker: str, limit: int` | `list[dict]` |
 | `get_group_members(talker)` | 获取群成员列表 | `talker: str` | `list[dict] \| None` |
 | `resolve_nickname(wxid)` | 解析 wxid → 昵称 | `wxid: str` | `str` |
 | `get_display_names(wxids)` | 批量解析昵称 | `wxids: list[str]` | `dict[str, str]` |
+| `_save_key_to_env(key)` | 把可用的 WCDB 密钥持久化到 `resolve_env_file()`(静态; 经 `config.write_env_file()` 落盘, 兼容 UNC / 共享文件夹), 并同步 `os.environ["WCDB_KEY"]` | `key: str` | `None` |
+
+模块级辅助函数（非方法）：
+
+| 函数 | 描述 | 参数 | 返回值 |
+|---|---|---|---|
+| `_preload_libcrypto(dll_dir)` | 加载 `libcrypto-3.dll`，使替代 DLL 的 OpenSSL 依赖可解析 | `dll_dir: str` | `bool` |
+| `_key_failure_message(tried_real_key)` | 生成"所有密钥源都失败"的错误文案：`tried_real_key=True` → `KEY_INVALID:`（密钥不匹配，多为多机共用 .env），`False` → `KEY_MISSING:`（未配置） | `tried_real_key: bool` | `str` |
+| `_is_replacement_dll(dll)` | 通过 `webot_wcdb_api_replacement` 导出识别自建替代 DLL | `dll: CDLL` | `bool` |
+| `_apply_drm_patch(dll_handle, dll_path)` | 单字节 DRM 补丁（仅原版 DLL 需要；字节不匹配时拒绝写入） | `dll_handle: int, dll_path: str` | `None` |
 
 ### 2.10 `src/wechat/window_controller.py` (WeChatWindowController)
 
@@ -621,7 +633,7 @@ todo_delete_keywords: list[str] = [
 | `_read_env_map(env_path)` | 把 .env 解析成 key→value 字典(忽略注释) | `env_path` | `dict[str, str]` |
 | `_reseed_onboarding_from_env(env_path)` | 密钥重提取后, 从现有 .env 回填非密钥引导字段(调用方须持有 `_onboarding_lock`) | `env_path` | `None` |
 | `_detect_wxid_and_db_path()` | 自动检测微信 wxid 和数据库路径 | 无 | `tuple[str \| None, str \| None]` |
-| `_set_env_key(env_path, key, value)` | 原子设置 .env 键值 | `env_path: Path, key: str, value: str` | `None` |
+| `_set_env_key(env_path, key, value)` | 设置单个 .env 键值(经 `config.write_env_file()` 落盘, 兼容 UNC / 共享文件夹) | `env_path: Path, key: str, value: str` | `None` |
 | `_detect_default_data_dir()` | 检测默认微信数据目录 | 无 | `str` |
 | `_platform_dependency_report(...)` | 平台依赖诊断 | 可选参数 | `dict` |
 | `_platform_wechat_report(...)` | 微信进程状态诊断 | 可选参数 | `dict` |
@@ -629,6 +641,18 @@ todo_delete_keywords: list[str] = [
 | `_read_recent_logs()` | 读取最近 500 行日志 | 无 | `dict` |
 | `_run_step1_extraction()` | 后台执行密钥提取 | 无 | `None` |
 | `_write_onboarding_to_env(env_path)` | 写入引导数据到 .env, 并调用 `apply_env_file()` 同步到 `os.environ` | `env_path` | `None` |
+
+`_UIHandler` 方法（HTTP 请求处理）：
+
+| 方法 | 描述 | 参数 | 返回值 |
+|---|---|---|---|
+| `do_OPTIONS()` | 处理 CORS 预检请求 | 无 | `None` |
+| `do_POST()` | POST 入口; 仅放行白名单路径(`/api/onboarding/*`、`/api/sandbox/test`、`/api/lots`、`/api/todos/action` 等), 其余返回 405 JSON | 无 | `None` |
+| `do_GET()` | GET 入口 → `_handle_request()` | 无 | `None` |
+| `_handle_request()` | **最后一道异常兜底**: 调用 `_handle_request_inner()`, 任何未捕获异常都记录 traceback 并走 `_send_error_json()`, 避免 socketserver 直接断连导致前端只看到"无法连接服务器" | 无 | `None` |
+| `_send_error_json(exc)` | 尽力返回 `{"ok": false, "error": "<类型>: <消息>"}` 的 500 JSON; WebSocket 已升级时跳过(避免污染帧流) | `exc: Exception` | `None` |
+| `_handle_request_inner()` | 真正的路由分发(静态文件 / WebSocket 升级 / 全部 API 分支) | 无 | `None` |
+| `send_json(data)` | 返回 200 + `application/json`(含 CORS 头) | `data: dict` | `None` |
 
 ### 2.34 前端组件 (`ui/src/components/`)
 
@@ -638,8 +662,25 @@ todo_delete_keywords: list[str] = [
 | `Dashboard.jsx` | `Dashboard` | 主仪表板(指标卡片+系统状态+控制栏) |
 | `Dashboard.jsx` | `MetricCard` | 指标卡片组件(图标/标签/数值/副标题/迷你SVG图表) |
 | `Dashboard.jsx` | `LiveIndicator` | 实时状态指示灯(脉冲动画) |
-| `Dashboard.jsx` | `KeyExtractionBanner` | 内联密钥提取横幅(单文件内组件) |
+| `Dashboard.jsx` | `KeyExtractionBanner` | 内联密钥提取横幅(单文件内组件); 按 `KEY_MISSING`/`KEY_INVALID` 区分标题, 轮询 step1-status |
 | `LogViewer.jsx` | `LogViewer` | 实时日志查看器(过滤/搜索/高亮) |
+
+`Dashboard.jsx` 内联辅助函数（非组件）：
+
+| 函数 | 描述 | 参数 | 返回值 |
+|---|---|---|---|
+| `generateSmoothPath(data, width, height)` | 把数值序列转成 SVG 平滑折线路径 | `data: number[], width=120, height=30` | `str` |
+| `isKeyError(text)` | 判断错误文案是否属于密钥类错误(前缀 `KEY_MISSING` / `KEY_INVALID`) | `text: str` | `bool` |
+| `readApiResponse(res)` | 无论 HTTP 状态码都先读 JSON body, 优先返回 `body.error`, 其次 `HTTP <status>` —— 保证服务端真实原因不被通用文案盖住 | `res: Response` | `dict` |
+
+模块级常量：
+
+| 常量 | 值 | 说明 |
+|---|---|---|
+| `API` | `'http://127.0.0.1:7327'` | 所有请求都打本地后端 |
+| `KEY_ERROR_PREFIXES` | `['KEY_MISSING', 'KEY_INVALID']` | 密钥类错误前缀 |
+| `EXTRACTION_PHASE_MAP` | `{hooking, waiting_exit, waiting_login, hooking_restart}` | 提取阶段 → 提示文案 |
+| `BACKEND_UNREACHABLE` | 见下 | fetch 被 reject 时的提示: "本地后端未响应（127.0.0.1:7327）。请确认 webot 仍在运行；若已退出，请重新启动程序后再试。" |
 
 ---
 
@@ -725,7 +766,8 @@ Bot.run()
 #### src/web/server.py → 调用链
 
 ```
-_API 请求 → _UIHandler._handle_request()
+_API 请求 → _UIHandler._handle_request()      # 全局异常兜底 → _send_error_json()
+  └── _handle_request_inner()                 # 实际路由分发
   ├── /api/start          → _start_bot_in_thread() → Bot.run()
   ├── /api/stop           → _stop_bot()
   ├── /api/load-config    → _find_or_create_env() → 读取 .env
@@ -884,7 +926,11 @@ WcdbBackend.start(callback)
   │     └── ctypes 加载 wcdb_api.dll
   │
   ├── WcdbNativeClient.open()
-  │     └── 应用 1-byte DRM patch + 打开 session.db
+  │     ├── 应用 1-byte DRM patch + 打开 session.db
+  │     └── _key_candidates() 逐个密钥源尝试(env → builtin)
+  │           每个源再试多种投递格式(fmt) × 路径(path)
+  │           成功 → os.environ["WCDB_KEY"] = key + _save_key_to_env(key)
+  │           全失败 → 按 tried_real_key 抛 KEY_INVALID / KEY_MISSING
   │
   ├── _resolve_groups()
   │     ├── get_sessions() → 获取所有 @chatroom 会话
@@ -912,6 +958,35 @@ WcdbBackend.start(callback)
 | `max_workers` | `4` | 回调线程池大小 |
 | `MAX_CONSECUTIVE_ERRORS` | `5` | 连续错误触发重初始化 |
 | `MAX_DEDUP_SIZE` | `5000` | 去重集合上限 |
+
+#### 密钥源与失败分类（排障必读）
+
+`_key_candidates()` 的尝试顺序与日志标记：
+
+| 顺序 | 源 | 日志 | 说明 |
+|---|---|---|---|
+| 1 | `env` | `Trying WCDB key source #1: env (len=64)` | 来自 `os.environ["WCDB_KEY"]`，即 `.env` 里持久化的密钥 |
+| 2 | `builtin` | `Trying WCDB key source #2: builtin (len=0)` | 内置/兜底源，通常为空 |
+
+每个源会再遍历多种投递格式与路径，日志形如 `wcdb_open_account FAIL (ret=-3) fmt=hex path=file source=env`：
+
+| 返回值 | 含义 |
+|---|---|
+| `-3` | `SQLITE_NOTADB` — 密钥**不对**（该密钥不属于本机这份数据库） |
+| `-4` | 数据库能打开但解出 0 条会话（代码内部标记，非 SQLite 原生码） |
+
+`tried_real_key` 决定最终错误文案（见 `_key_failure_message()`）：
+
+| 情况 | 抛出 | 前端标题 | 真实原因 |
+|---|---|---|---|
+| 至少试过一个非空密钥 | `KEY_INVALID: 微信数据库密钥不匹配…` | "密钥不匹配 — 当前密钥无法解密本机微信数据库，需在本机重新获取" | 密钥存在但打不开。**最常见：宿主机与虚拟机共用同一个 `.env`**（如 `\\vmware-host\Shared Folders\...`），或微信重新登录后密钥更换 |
+| 一个非空密钥都没有 | `KEY_MISSING: 密钥未配置。` | "加密密钥缺失 — 需要重新获取才能读取微信消息" | 真的没配 |
+
+> 排障提示：看到 `Trying WCDB key source #1: env (len=64)` 后紧跟 `ret=-3`，说明密钥**有**但是错的。
+> 此时不是"重新获取"能自动解决的——必须让本机拥有自己的 `.env`（用 `WEBOT_ENV_FILE` 指向本机路径，
+> 或把项目复制到本机磁盘），然后**在虚拟机里**重新提取一次密钥。
+> 若 `reset` 阶段就失败，见 §功能D 的"前端错误呈现约定"与 `config.write_env_file()`：共享文件夹拒绝
+> `os.replace` 会让整个请求断连，旧版本把这种情况误报成"无法连接服务器"。
 
 #### 消息标准化输出格式
 
@@ -1140,6 +1215,24 @@ _write_onboarding_to_env()   ────────→  apply_env_file(env_pat
 wcdb_client._save_key_to_env()          （只影响 WCDB_KEY，由 _key_candidates 读 environ）
                                         ↑ 该处已单独 os.environ["WCDB_KEY"] = key
 ```
+
+**所有落盘统一经过 `config.write_env_file(env_path, content)`**（含 `_set_env_key()` 与
+`/api/onboarding/reset`）。它先尝试"唯一临时名 + `os.replace`"原子写，rename 被拒时
+（UNC / VMware 共享文件夹 / SMB / 部分虚拟磁盘）回退为原地覆盖并记 warning，返回
+`"atomic"` 或 `"direct"`；两种策略都失败才抛 `OSError`。**不要在调用方再自己写
+`os.replace`** —— 这正是"重新获取密钥"在共享文件夹里报"无法连接服务器"的成因。
+
+#### 前端错误呈现约定（避免把本地后端故障误报成网络问题）
+
+所有 API 都发往 `127.0.0.1:7327`（`const API = 'http://127.0.0.1:7327'`），因此
+`fetch` 被 reject **不等于**机器没联网。约定：
+
+| 环节 | 约定 |
+|---|---|
+| 服务端 | 任何未捕获异常都由 `_handle_request()` 兜底，返回 500 JSON `{ok:false, error}`；绝不能直接断连 |
+| 前端读取 | `readApiResponse(res)` 无论状态码都先读 JSON body，优先用 `body.error`，其次 `HTTP <status>` |
+| 前端展示 | 连不上后端时显示 `BACKEND_UNREACHABLE`（"本地后端未响应（127.0.0.1:7327）…"），而不是"无法连接服务器" |
+| 密钥报错分类 | 文案含 `KEY_MISSING` → "加密密钥缺失"；含 `KEY_INVALID` → "密钥不匹配 — 当前密钥无法解密本机微信数据库，需在本机重新获取" |
 
 `apply_env_file(env_path=None)` 语义：
 
@@ -1688,7 +1781,7 @@ WCDB_KEY=
 # 二进制:
 #   - WebView2Loader.dll → runtimes/win-x64/native
 #   - WebBrowserInterop.x64.dll → lib/
-#   - wcdb_api.dll → native/windows/
+#   - wcdb_api.dll → native/windows/   (自建替代版, 见 5.4)
 #   - WCDB.dll → native/windows/
 #   - MSVCP140.dll → native/windows/
 #   - VCRUNTIME140.dll → native/windows/
@@ -1748,3 +1841,73 @@ WCDB_KEY=
 | `data/voice_cache.json` | `src/voice/pipeline.py` | 语音识别缓存 |
 | `data/send_failures.log` | `src/wechat/window_controller.py` | 发送失败记录 |
 | `data/crash.log` | `desktop.py` / `desktop_mac.py` | 崩溃日志 |
+
+### 5.6 自建 `wcdb_api.dll` 替代品 (Windows)
+
+**为什么需要**：仓库原先捆绑的 `native/windows/wcdb_api.dll` 来自 WeFlow，`wcdb_init()` 里写死了一个授权到期检查，到期后无条件返回 `-1000`，导致 webot 一点启动就报 `wcdb_init failed:-1000`。反汇编证据（`wcdb_init`，RVA `0xe4120`）：
+
+```asm
+0x1800e4439  mov  dword [rsp+0x6c], 0x7e   ; tm_year = 126 → 2026
+0x1800e4441  mov  dword [rsp+0x68], 0x08   ; tm_mon  = 8   → 9 月
+0x1800e4449  mov  dword [rsp+0x64], 0x1e   ; tm_mday = 30
+0x1800e4451  mov  dword [rsp+0x60], 0x17   ; tm_hour = 23
+0x1800e4459  mov  dword [rsp+0x5c], 0x3b   ; tm_min  = 59
+0x1800e4461  mov  dword [rsp+0x58], 0x3b   ; tm_sec  = 59
+0x1800e4469  call _mktime64                ; → 到期时间戳
+0x1800e447e  call _time64                  ; → 当前时间
+0x1800e4484  cmp  rax, rbx
+0x1800e4487  jle  0x1800e45bd              ; 未过期 → return 0
+0x1800e45b1  call 0x18006cb70              ; 过期 → 自毁分支
+0x1800e45b6  mov  eax, 0xfffffc18          ; return -1000
+```
+
+到期时间为 **2026-09-30 23:59:59 UTC**。`0xfffffc18` 在整个 `.text` 节只出现一次，返回路径唯一。
+
+**替代方案**：`native/src/wcdb_api_replacement.c` 用 SQLCipher 重新实现 webot 实际使用的 10 个 C ABI 导出，无任何授权检查。
+
+| 项 | 说明 |
+|---|---|
+| 源码 | `native/src/wcdb_api_replacement.c` |
+| 构建脚本 | `tools/build_wcdb_api.py`（离线，无需网络） |
+| 编译器 | gcc（已验证 Strawberry Perl 13.2；MSVC 亦可） |
+| 加密库 | SQLCipher 4.5.7 amalgamation，取自 cargo registry 的 `libsqlite3-sys-*/sqlcipher/` |
+| OpenSSL | 链接 **Python 自带的** `libcrypto-3.dll`（`<prefix>/DLLs/`），无需额外分发文件 |
+| 产物 | `native/windows/wcdb_api.dll`（约 1.2 MB） |
+
+**导出函数**（12 个）：
+
+| 导出 | 说明 |
+|---|---|
+| `InitProtection` | 恒返回 0（无授权检查） |
+| `wcdb_init` / `wcdb_shutdown` | 引擎生命周期，幂等 |
+| `wcdb_open_account` | 先用 key 探测 session.db 再注册账号；非法路径 `-3`、空 key `-2`、NULL `-1` |
+| `wcdb_close_account` | 释放账号槽位与 contact 句柄 |
+| `wcdb_free_string` | 释放返回的 JSON 缓冲 |
+| `wcdb_get_sessions` | `SELECT * FROM SessionTable ORDER BY sort_timestamp DESC, last_timestamp DESC` |
+| `wcdb_get_messages` | 按 `Msg_<md5(talker)>` 定位分库，`LEFT JOIN Name2Id` 解析 `real_sender_id` |
+| `wcdb_get_display_names` | 按 remark → nick_name → alias 优先级解析，未知名回显 wxid |
+| `wcdb_get_contacts_compact` | 关键字过滤通讯录 |
+| `wcdb_get_group_members` | 经 `name2id` + `chatroom_member` 关联群成员 |
+| `webot_wcdb_api_replacement` | 标记函数，供 `wcdb_client.py` 识别替代品 |
+
+**关键 schema 差异**（易错点）：`contact.db` 的 `name2id` 用 `username` 列，而 `message_*.db` 的 `Name2Id` 用 `user_name` 列。
+
+**关键密钥投递方式**（最易错，踩过）：微信是把 32 字节原始密钥交给 `sqlite3_key()`，SQLCipher 会把它当**口令**过 PBKDF2，**不是**当 raw key。用 `PRAGMA key = "x'<64hex>'"` 派生出的密钥完全不同，合法密钥会被判成 `SQLITE_NOTADB`（`wcdb_open_account` 返回 `-3`）。实测同一个真实密钥对 `session.db` / `contact.db` / `message_0.db` 的三种投递方式：
+
+| 投递方式 | session.db | contact.db | message_0.db |
+|---|---|---|---|
+| `sqlite3_key(db, raw32, 32)`（微信自己的用法） | ✅ 18 objects | ✅ 29 | ✅ 307 |
+| `PRAGMA key = "x'<64hex>'"`（raw key） | ❌ not a database | ❌ | ❌ |
+| `PRAGMA key = '<64hex>'`（hex 当口令） | ❌ | ❌ | ❌ |
+
+因此 `open_encrypted()` 按 `sqlite3_key(raw32)` → raw-key → hex 口令 → 纯口令 的顺序依次尝试，第一个能解密 `sqlite_master` 的胜出。改这里前务必用真实库回归，别只信自建 fixture——自建库用哪种方式写就能用哪种方式读，测不出这个坑。
+
+**构建与校验**：
+
+```bash
+python tools/build_wcdb_api.py           # 构建并安装到 native/windows/
+python tools/build_wcdb_api.py --check   # 只校验已安装的 DLL
+```
+
+**与 DRM patch 的关系**：`wcdb_client.py` 通过 `webot_wcdb_api_replacement` 标记识别替代品；识别到就**跳过** `_apply_drm_patch`——原版补丁 RVA `0x6e1f6` 在替代品里并不存在，强行写入只会破坏代码。此外 `_apply_drm_patch` 现在会先校验字节，不匹配时拒绝写入。
+

@@ -233,6 +233,116 @@ class FindEnvFileTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# write_env_file — atomic write with a fallback for UNC / shared folders
+# ---------------------------------------------------------------------------
+
+
+class WriteEnvFileTests(unittest.TestCase):
+    """Tests for write_env_file()'s atomic-then-direct strategy.
+
+    VMware HGFS / SMB shares refuse os.replace() onto an existing file.
+    That used to raise inside an HTTP handler and surface in the UI as a
+    bogus "无法连接服务器"; the write must fall back to overwriting instead.
+    """
+
+    def setUp(self):
+        from tempfile import TemporaryDirectory
+
+        self._tmpdir = TemporaryDirectory()
+        self.dir = Path(self._tmpdir.name)
+        self.env = self.dir / ".env"
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def test_writes_new_file_atomically(self):
+        from src.config import write_env_file
+
+        how = write_env_file(self.env, "A=1\nB=2\n")
+
+        self.assertEqual(how, "atomic")
+        self.assertEqual(self.env.read_text(encoding="utf-8"), "A=1\nB=2\n")
+
+    def test_overwrites_existing_file(self):
+        from src.config import write_env_file
+
+        self.env.write_text("A=old\n", encoding="utf-8")
+        how = write_env_file(self.env, "A=new\n")
+
+        self.assertEqual(how, "atomic")
+        self.assertEqual(self.env.read_text(encoding="utf-8"), "A=new\n")
+
+    def test_falls_back_to_direct_write_when_rename_fails(self):
+        """os.replace failing (HGFS/SMB) must not lose the write."""
+        import errno
+
+        from src.config import write_env_file
+
+        self.env.write_text("A=old\n", encoding="utf-8")
+
+        def boom(src, dst):
+            raise OSError(errno.EACCES, "simulated shared-folder rename failure")
+
+        with patch("src.config.os.replace", side_effect=boom):
+            how = write_env_file(self.env, "A=new\nC=3\n")
+
+        self.assertEqual(how, "direct")
+        self.assertEqual(self.env.read_text(encoding="utf-8"), "A=new\nC=3\n")
+
+    def test_temp_file_is_cleaned_up_after_fallback(self):
+        import errno
+
+        from src.config import write_env_file
+
+        self.env.write_text("A=old\n", encoding="utf-8")
+
+        with patch(
+            "src.config.os.replace",
+            side_effect=OSError(errno.EACCES, "simulated"),
+        ):
+            write_env_file(self.env, "A=new\n")
+
+        leftovers = list(self.dir.glob(".env.tmp*"))
+        self.assertEqual(leftovers, [], f"temp files left behind: {leftovers}")
+
+    def test_temp_name_keeps_dotted_file_names_intact(self):
+        """``Path.with_suffix`` would turn ``config.env`` into ``config.tmp``.
+
+        That would clobber an unrelated file, so the temp name must be
+        derived from the full file name.
+        """
+        from src.config import write_env_file
+
+        target = self.dir / "config.env"
+        target.write_text("X=1\n", encoding="utf-8")
+
+        write_env_file(target, "X=2\n")
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "X=2\n")
+        self.assertFalse((self.dir / "config.tmp").exists())
+
+    def test_raises_when_both_strategies_fail(self):
+        """A genuinely unwritable location must still raise OSError."""
+        import errno
+
+        from src.config import write_env_file
+
+        with (
+            patch(
+                "src.config.os.replace",
+                side_effect=OSError(errno.EACCES, "simulated"),
+            ),
+            patch.object(
+                Path,
+                "write_text",
+                side_effect=OSError(errno.EROFS, "read-only"),
+            ),
+        ):
+            with self.assertRaises(OSError):
+                write_env_file(self.env, "A=1\n")
+
+
+# ---------------------------------------------------------------------------
 # is_onboarding_done
 # ---------------------------------------------------------------------------
 

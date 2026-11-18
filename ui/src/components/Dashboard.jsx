@@ -230,8 +230,8 @@ export default function Dashboard({ status }) {
         </span>
       </div>
 
-      {/* Error banner */}
-      {status.error && !status.error.includes('KEY_MISSING') && (
+      {/* Error banner — anything that is not a key problem */}
+      {status.error && !isKeyError(status.error) && (
         <motion.div
           initial={{ opacity: 0, y: -8 }}
           animate={{ opacity: 1, y: 0 }}
@@ -242,9 +242,9 @@ export default function Dashboard({ status }) {
         </motion.div>
       )}
 
-      {/* KEY_MISSING banner with inline extraction */}
-      {status.error && status.error.includes('KEY_MISSING') && (
-        <KeyExtractionBanner />
+      {/* Key problem (missing OR not matching this database) with inline extraction */}
+      {status.error && isKeyError(status.error) && (
+        <KeyExtractionBanner errorText={status.error} />
       )}
 
       <div className="grid grid-cols-3 gap-6">
@@ -323,6 +323,17 @@ export default function Dashboard({ status }) {
 // ── Inline key extraction banner ───────────────────────────────────────
 
 const API = 'http://127.0.0.1:7327'
+
+// Both key failures need the extraction flow, so the banner owns both.
+// KEY_MISSING  = no key configured at all.
+// KEY_INVALID  = a key is configured but it does not decrypt this database
+//                (typical when a .env is shared between a VM and its host).
+const KEY_ERROR_PREFIXES = ['KEY_MISSING', 'KEY_INVALID']
+
+function isKeyError(text) {
+  return !!text && KEY_ERROR_PREFIXES.some((p) => text.includes(p))
+}
+
 const EXTRACTION_PHASE_MAP = {
   hooking:         { label: '正在尝试直接获取...' },
   waiting_exit:    { label: '请退出微信' },
@@ -330,63 +341,134 @@ const EXTRACTION_PHASE_MAP = {
   hooking_restart: { label: '正在安装 Hook...' },
 }
 
-function KeyExtractionBanner() {
+// A fetch rejection here almost always means the local backend is gone, not
+// that the machine has no network: every call goes to 127.0.0.1.  Say so —
+// "无法连接服务器" sent users to check their internet connection.
+const BACKEND_UNREACHABLE =
+  '本地后端未响应（127.0.0.1:7327）。请确认 webot 仍在运行；' +
+  '若已退出，请重新启动程序后再试。'
+
+async function readApiResponse(res) {
+  // The backend answers with JSON for both success and failure, including
+  // the 500 the global error guard produces.  Read the body either way so
+  // the real error text reaches the UI instead of a generic message.
+  let body = null
+  try {
+    body = await res.json()
+  } catch {
+    // Non-JSON (or empty) body — fall back to the status code below.
+  }
+  if (body && typeof body === 'object' && body.error) return body
+  if (!res.ok) return { ok: false, error: `服务器返回 HTTP ${res.status}` }
+  return body || { ok: false, error: '服务器返回了无法解析的响应' }
+}
+
+function KeyExtractionBanner({ errorText = '' }) {
   const [phase, setPhase] = useState('idle') // idle | extracting | hooking | waiting_exit | ...
   const [msg, setMsg] = useState('')
   const [result, setResult] = useState(null)
   const [busy, setBusy] = useState(false)
   const pollRef = useRef(null)
+  // Consecutive failed polls.  One dropped request shouldn't abort a
+  // multi-minute extraction, but a backend that is really gone must stop
+  // the spinner and say why.
+  const pollErrorsRef = useRef(0)
+  // The banner can be reached for two different reasons; the headline has
+  // to name the actual one instead of always claiming the key is missing.
+  const keyInvalid = errorText.includes('KEY_INVALID')
 
   useEffect(() => {
     return () => { if (pollRef.current) clearInterval(pollRef.current) }
   }, [])
+
+  function stopPolling() {
+    if (pollRef.current) {
+      clearInterval(pollRef.current)
+      pollRef.current = null
+    }
+  }
+
+  function fail(message) {
+    stopPolling()
+    setPhase('error')
+    setMsg(message)
+    setBusy(false)
+  }
 
   async function handleExtract() {
     setBusy(true)
     setPhase('extracting')
     setMsg('正在准备...')
     setResult(null)
+    pollErrorsRef.current = 0
+
+    // ── 1. Reset the stored key state ──────────────────────────────
+    // This writes .env, so it is the step most likely to fail for a real
+    // reason (read-only share, locked file).  Report whatever it says.
+    let reset
     try {
-      await fetch(`${API}/api/onboarding/reset`, { method: 'POST' })
+      const resetRes = await fetch(`${API}/api/onboarding/reset`, { method: 'POST' })
+      reset = await readApiResponse(resetRes)
+    } catch {
+      fail(BACKEND_UNREACHABLE)
+      return
+    }
+    if (!reset.ok) {
+      fail(reset.error || '重置密钥状态失败，请稍后重试')
+      return
+    }
+
+    // ── 2. Start the extraction thread ─────────────────────────────
+    let start
+    try {
       const startRes = await fetch(`${API}/api/onboarding/step1`, { method: 'POST' })
-      const start = await startRes.json()
-      if (!start.ok) {
-        setPhase('error')
-        setMsg(start.message || '启动失败，请稍后重试')
-        setBusy(false)
+      start = await readApiResponse(startRes)
+    } catch {
+      fail(BACKEND_UNREACHABLE)
+      return
+    }
+    if (!start.ok) {
+      fail(start.message || start.error || '启动失败，请稍后重试')
+      return
+    }
+
+    // ── 3. Poll until the extraction thread reports a terminal phase ─
+    pollRef.current = setInterval(async () => {
+      let s
+      try {
+        const res = await fetch(`${API}/api/onboarding/step1-status`)
+        s = await readApiResponse(res)
+      } catch {
+        pollErrorsRef.current += 1
+        if (pollErrorsRef.current >= 5) {
+          fail(BACKEND_UNREACHABLE)
+        }
+        return
+      }
+      pollErrorsRef.current = 0
+
+      if (!s.ok && s.error) {
+        fail(s.error)
         return
       }
 
-      pollRef.current = setInterval(async () => {
-        try {
-          const res = await fetch(`${API}/api/onboarding/step1-status`)
-          const s = await res.json()
-
-          if (s.phase === 'waiting_exit' || s.phase === 'waiting_login'
-              || s.phase === 'hooking' || s.phase === 'hooking_restart') {
-            setPhase(s.phase)
-            setMsg(s.message || '')
-          } else if (s.phase === 'done' && s.result) {
-            clearInterval(pollRef.current)
-            pollRef.current = null
-            setPhase('done')
-            setMsg('')
-            setResult(s.result)
-            setBusy(false)
-          } else if (s.phase === 'timeout' || s.phase === 'error') {
-            clearInterval(pollRef.current)
-            pollRef.current = null
-            setPhase(s.phase)
-            setMsg(s.message || (s.phase === 'timeout' ? '超时，请重试' : '提取失败'))
-            setBusy(false)
-          }
-        } catch {}
-      }, 1000)
-    } catch {
-      setPhase('error')
-      setMsg('无法连接服务器')
-      setBusy(false)
-    }
+      if (s.phase === 'waiting_exit' || s.phase === 'waiting_login'
+          || s.phase === 'hooking' || s.phase === 'hooking_restart') {
+        setPhase(s.phase)
+        setMsg(s.message || '')
+      } else if (s.phase === 'done' && s.result) {
+        stopPolling()
+        setPhase('done')
+        setMsg('')
+        setResult(s.result)
+        setBusy(false)
+      } else if (s.phase === 'timeout' || s.phase === 'error') {
+        stopPolling()
+        setPhase(s.phase)
+        setMsg(s.message || (s.phase === 'timeout' ? '超时，请重试' : '提取失败'))
+        setBusy(false)
+      }
+    }, 1000)
   }
 
   const phaseMeta = EXTRACTION_PHASE_MAP[phase]
@@ -408,7 +490,13 @@ function KeyExtractionBanner() {
         ) : (
           <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 1L15 14H1L8 1Z" fill="currentColor"/><path d="M8 6V9" stroke="white" strokeWidth="1.5"/><circle cx="8" cy="11.5" r="0.75" fill="white"/></svg>
         )}
-        <span>{isDone ? '密钥获取成功 — 请重启机器人' : '加密密钥缺失 — 需要重新获取才能读取微信消息'}</span>
+        <span>
+          {isDone
+            ? '密钥获取成功 — 请重启机器人'
+            : keyInvalid
+              ? '密钥不匹配 — 当前密钥无法解密本机微信数据库，需在本机重新获取'
+              : '加密密钥缺失 — 需要重新获取才能读取微信消息'}
+        </span>
       </div>
 
       {phase !== 'idle' && phase !== 'done' && phase !== 'timeout' && phase !== 'error' && phaseMeta && (

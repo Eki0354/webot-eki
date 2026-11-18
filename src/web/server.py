@@ -24,6 +24,7 @@ from urllib.parse import unquote
 # make the name a local — so it must be imported at module level too,
 # otherwise the first branch that references it raises UnboundLocalError.
 from src.config import _decode_wechat_groups
+from src.config import write_env_file
 
 logger = logging.getLogger(__name__)
 
@@ -322,9 +323,15 @@ def _detect_wxid_and_db_path():
 
 
 def _set_env_key(env_path: Path, key: str, value: str) -> None:
-    """Set or update one key=value in a .env file atomically."""
+    """Set or update one key=value in a .env file.
+
+    Writing goes through ``write_env_file`` so that filesystems which refuse
+    an atomic rename (UNC / VMware shared folders) still get a plain
+    overwrite instead of an exception the UI can only report as a dropped
+    connection.
+    """
     if not env_path.exists():
-        env_path.write_text(f"{key}={value}\n", encoding="utf-8")
+        write_env_file(env_path, f"{key}={value}\n")
         return
     lines = env_path.read_text(encoding="utf-8").splitlines()
     new_lines, found = [], False
@@ -339,10 +346,7 @@ def _set_env_key(env_path: Path, key: str, value: str) -> None:
         new_lines.append(line)
     if not found:
         new_lines.append(f"{key}={value}")
-    tmp = env_path.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}")
-    with _env_write_lock:
-        tmp.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-        os.replace(tmp, env_path)
+    write_env_file(env_path, "\n".join(new_lines) + "\n")
 
 
 def _read_env_map(env_path) -> dict[str, str]:
@@ -439,9 +443,9 @@ def _write_onboarding_to_env(env_path):
     else:
         content = "\n".join(f"{k}={v}" for k, v in env_map.items() if v is not None) + "\n"
 
-    tmp_path = env_path.with_suffix(".tmp")
-    tmp_path.write_text(content, encoding="utf-8")
-    os.replace(tmp_path, env_path)
+    # Shared writer: atomic rename when the filesystem supports it, plain
+    # overwrite on UNC / VMware shared folders (see config.write_env_file).
+    write_env_file(env_path, content)
     # Make the just-written file visible to load_config(), which reads only
     # os.environ.  Without this the running process keeps whatever it saw at
     # import time (usually nothing, since .env didn't exist yet) and the bot
@@ -866,7 +870,9 @@ class _ServerStartGuard:
 
 _status = _ServerStatus()
 _bot_control = _BotControl()
-_env_write_lock = threading.Lock()  # serialize all .env writes across threads
+# NOTE: .env writes are serialized by src.config._env_write_lock, taken
+# inside write_env_file().  No separate lock here — a second one would just
+# be a second thing to keep in sync.
 _server_guard = _ServerStartGuard()
 _shutdown_event = threading.Event()
 _voice_downloads: dict[str, dict] = {}  # model → {active, msg}
@@ -1121,12 +1127,60 @@ class _UIHandler(SimpleHTTPRequestHandler):
         self._handle_request()
 
     def _handle_request(self):
+        """Entry point with a last-resort error guard.
+
+        Every API branch below writes its own JSON response, but an
+        unexpected exception (a disk error while persisting .env, a DLL
+        failure, ...) used to escape into socketserver, which drops the
+        connection without answering.  The browser then sees a rejected
+        fetch and shows the generic "无法连接服务器" — hiding the real
+        cause and leaving no trace anywhere in the log.
+
+        Catch it here: log the traceback and answer with JSON so the UI
+        can surface what actually went wrong.
+        """
+        try:
+            self._handle_request_inner()
+        except Exception as e:
+            logger.exception(
+                "Unhandled error while serving %s %s", self.command, self.path
+            )
+            self._send_error_json(e)
+
+    def _send_error_json(self, exc):
+        """Best-effort JSON error response for an unhandled exception."""
+        if getattr(self, "_ws_upgraded", False):
+            # The socket no longer speaks HTTP — writing a status line here
+            # would corrupt the WebSocket stream.
+            return
+        try:
+            body = json.dumps(
+                {"ok": False, "error": f"{type(exc).__name__}: {exc}"},
+                ensure_ascii=False,
+            ).encode("utf-8")
+        except Exception:
+            body = b'{"ok": false, "error": "internal error"}'
+        try:
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception:
+            # Response already partially flushed, or the client went away.
+            logger.debug("Could not deliver error response to client")
+
+    def _handle_request_inner(self):
         # ── WebSocket upgrade ─────────────────────────────────────────
         if self.path == "/ws":
             connection_header = self.headers.get("Connection", "").lower()
             upgrade_header = self.headers.get("Upgrade", "").lower()
             if "upgrade" in connection_header and upgrade_header == "websocket":
                 if _handle_ws_upgrade(self.headers, self.request):
+                    # From here on the socket carries WebSocket frames, not
+                    # HTTP — the error guard must never write a status line.
+                    self._ws_upgraded = True
                     _status.add_client(self.request)
                     # Send initial status
                     try:
@@ -1359,14 +1413,9 @@ class _UIHandler(SimpleHTTPRequestHandler):
                 for key, val in updates.items():
                     if key not in seen and val is not None:
                         new_lines.append(f"{key}={val}")
-                # Atomic write: unique temp file + lock to prevent races
-                # across HTTP threads and background extraction thread.
-                tmp_path = env_path.with_suffix(
-                    f".tmp.{os.getpid()}.{threading.get_ident()}"
-                )
-                with _env_write_lock:
-                    tmp_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-                    os.replace(tmp_path, env_path)
+                # Shared writer: atomic rename when the filesystem supports
+                # it, plain overwrite on UNC / VMware shared folders.
+                write_env_file(env_path, "\n".join(new_lines) + "\n")
                 # Single source of truth: the file.  Reloading it (instead of
                 # patching os.environ key by key) keeps the process and the
                 # file in step, including secrets we deliberately skipped.
@@ -1449,13 +1498,9 @@ class _UIHandler(SimpleHTTPRequestHandler):
                 for key, val in updates.items():
                     if key not in seen and val is not None:
                         new_lines.append(f"{key}={val}")
-                # Atomic write with unique temp file + lock
-                tmp_path = env_path.with_suffix(
-                    f".tmp.{os.getpid()}.{threading.get_ident()}"
-                )
-                with _env_write_lock:
-                    tmp_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-                    os.replace(tmp_path, env_path)
+                # Shared writer: atomic rename when the filesystem supports
+                # it, plain overwrite on UNC / VMware shared folders.
+                write_env_file(env_path, "\n".join(new_lines) + "\n")
                 # Update in-process environment from the file we just wrote.
                 from src.config import apply_env_file
                 apply_env_file(env_path)
@@ -2159,8 +2204,19 @@ class _UIHandler(SimpleHTTPRequestHandler):
             # blanking ai_backend / *_api_key would write empty values over a
             # good .env and the bot would then refuse to start.
             env_path = _find_or_create_env()
-            _set_env_key(env_path, "ONBOARDING_DONE", "false")
-            _set_env_key(env_path, "WCDB_KEY", "")
+            try:
+                _set_env_key(env_path, "ONBOARDING_DONE", "false")
+                _set_env_key(env_path, "WCDB_KEY", "")
+            except OSError as e:
+                # Persisting failed (read-only share, locked file, ...).
+                # Report it as JSON: the caller must not be left guessing
+                # whether the reset happened.
+                logger.error("Reset could not write %s: %s", env_path, e)
+                self.send_json({
+                    "ok": False,
+                    "error": f"无法写入配置文件 {env_path}: {e}",
+                })
+                return
             # The file now says "no key" — drop the in-process copy too, or
             # the next wcdb open would silently reuse the key we just cleared
             # (masking a failed re-extraction).

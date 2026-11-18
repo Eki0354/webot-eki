@@ -6,7 +6,6 @@ the same data access as a dedicated HTTP bridge but entirely in-process.
 """
 import ctypes as ct
 from ctypes import wintypes
-import hashlib
 import json
 import logging
 import os
@@ -57,6 +56,91 @@ else:
 _kernel32 = ct.WinDLL("kernel32", use_last_error=True)
 
 
+REPLACEMENT_MARKER = b"webot-wcdb-api-replacement"
+
+
+def _preload_libcrypto(dll_dir):
+    """Make libcrypto-3.dll resolvable before loading wcdb_api.dll.
+
+    The replacement DLL links against OpenSSL (SQLCipher has no Windows CNG
+    backend).  It does not ship its own copy: the Python process this app runs
+    in always carries one already, so we just load it by name first and the
+    dependency resolves to that module.
+
+    Searched in order: next to wcdb_api.dll, the PyInstaller bundle root, the
+    directory holding the interpreter/EXE, and Python's own DLLs folder.
+    """
+    candidates = []
+    if dll_dir:
+        candidates.append(Path(dll_dir) / "libcrypto-3.dll")
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass) / "libcrypto-3.dll")
+    candidates.append(Path(sys.executable).resolve().parent / "libcrypto-3.dll")
+    candidates.append(Path(sys.prefix) / "DLLs" / "libcrypto-3.dll")
+
+    for c in candidates:
+        try:
+            if c.is_file():
+                ct.CDLL(str(c))
+                logger.debug("Preloaded %s", c)
+                return True
+        except OSError as e:
+            logger.debug("Preload of %s failed: %s", c, e)
+    logger.debug("No libcrypto-3.dll preloaded; relying on default search path")
+    return False
+
+
+
+def _key_failure_message(tried_real_key: bool) -> str:
+    """Build the error text for "no key source could open the database".
+
+    Two very different situations used to share one message that claimed the
+    key was simply missing, which sent users to re-extract a key they already
+    had.  Keep the machine-readable prefix (the UI keys off ``KEY_MISSING`` /
+    ``KEY_INVALID``) and make the advice match the actual cause.
+
+    Args:
+        tried_real_key: True when at least one non-empty key was attempted —
+            i.e. a key IS configured but it does not decrypt this database.
+    """
+    if tried_real_key:
+        return (
+            "KEY_INVALID: 微信数据库密钥不匹配——已配置的密钥无法解密当前数据库。"
+            "常见原因：多台机器或多个微信账号共用同一个 .env"
+            "（例如虚拟机与宿主机共用共享文件夹里的 .env），"
+            "或微信重新登录后密钥已更换。"
+            "请点击下方「重新获取密钥」，在本机重新提取一次。"
+        )
+    return (
+        "KEY_MISSING: 密钥未配置。"
+        "点击下方「重新获取密钥」按钮，按提示退出并重新登录微信即可。"
+    )
+
+
+def _is_replacement_dll(dll):
+    """True when `dll` is the self-built SQLCipher replacement, not the
+    original WeFlow binary.
+
+    The replacement exports `webot_wcdb_api_replacement()`; the original does
+    not.  This matters because the original needs a one-byte DRM patch at a
+    fixed RVA, while the replacement has no such code — writing those bytes
+    into it would corrupt live code.
+    """
+    try:
+        fn = dll.webot_wcdb_api_replacement
+    except AttributeError:
+        return False
+    try:
+        fn.argtypes = []
+        fn.restype = ct.c_char_p
+        marker = fn()
+        return bool(marker) and REPLACEMENT_MARKER in marker
+    except Exception as e:
+        logger.debug("Replacement marker probe failed: %s", e)
+        return False
+
+
 def _apply_drm_patch(dll_handle, dll_path):
     """One-byte DRM patch: mov eax,2 -> mov eax,0 at the configured RVA.
 
@@ -65,16 +149,10 @@ def _apply_drm_patch(dll_handle, dll_path):
     WCDB_PATCH_RVA / WCDB_PATCH_BYTE environment variables when WeChat
     updates change the patch location.
 
-    Also verifies the DLL hasn't been tampered with beyond our patch.
+    Only the original WeFlow DLL carries this check.  For any other binary we
+    verify the byte first and refuse to write when it does not match, so a
+    dropped-in replacement (or a future WeChat build) is never corrupted.
     """
-    # Verify SHA256 baseline
-    known_sha = None
-    try:
-        with open(dll_path, "rb") as f:
-            sha = hashlib.sha256(f.read()).hexdigest()
-    except Exception:
-        sha = None
-
     # Apply the patch
     patch_addr = ct.c_void_p(dll_handle + PATCH_RVA)
     old_protect = wintypes.DWORD()
@@ -319,10 +397,19 @@ class WcdbNativeClient:
         """Load wcdb_api.dll, patch DRM, and initialize the WCDB engine."""
         os.add_dll_directory(self._dll_dir)
         dll_path = os.path.join(self._dll_dir, "wcdb_api.dll")
+
+        # The replacement links OpenSSL; make libcrypto resolvable first.
+        _preload_libcrypto(self._dll_dir)
         self._dll = ct.CDLL(dll_path)
 
-        # Apply DRM patch
-        _apply_drm_patch(self._dll._handle, dll_path)
+        # The self-built replacement has no DRM check, so patching it would
+        # only corrupt its code.  Only the original WeFlow binary needs this.
+        if _is_replacement_dll(self._dll):
+            self._is_replacement = True
+            logger.info("Using self-built wcdb_api replacement (no DRM patch needed)")
+        else:
+            self._is_replacement = False
+            _apply_drm_patch(self._dll._handle, dll_path)
 
         # Set up function signatures
         self._dll.InitProtection.argtypes = [ct.c_char_p]
@@ -383,8 +470,11 @@ class WcdbNativeClient:
     def open(self):
         """Open the WeChat session.db for the configured account.
 
-        Tries cached keys first.  If they produce 0 sessions (stale key),
-        attempts live extraction from the running WeChat process.
+        Tries each key source in turn and returns True on the first one that
+        yields sessions.  Raises RuntimeError when none works — the message
+        is prefixed KEY_MISSING (no key configured) or KEY_INVALID (a key is
+        configured but does not decrypt this database), because the two need
+        different user actions.
         """
         my_wxid = self._config.get("myWxid", "")
         db_base = self._config.get("dbPath", "")
@@ -411,12 +501,23 @@ class WcdbNativeClient:
         # ── Resolve key, try each source until one yields data ──────
         import os as _os
 
+        # Distinguishes "no key configured" from "the key we have does not
+        # decrypt this database".  Both end in the same failure, but they
+        # need very different user action: the first wants extraction, the
+        # second usually means the .env carries another machine's/session's
+        # key (e.g. a shared folder reused across a VM and its host).
+        tried_real_key = False
+        last_ret = 0
+        last_source = ""
+
         for attempt, (key_candidate, source_label) in enumerate(self._key_candidates()):
             logger.info(
                 "Trying WCDB key source #%d: %s (len=%d)",
                 attempt + 1, source_label,
                 len(key_candidate) if key_candidate else 0,
             )
+            if key_candidate:
+                tried_real_key = True
 
             # Build key variants to try.  The DLL accepts 64-char hex strings
             # (ret=0) but explicitly rejects raw bytes (ret=-3).  Only try hex.
@@ -443,6 +544,7 @@ class WcdbNativeClient:
                             "wcdb_open_account FAIL (ret=%d) fmt=%s path=%s source=%s",
                             ret, key_fmt, path_label, source_label,
                         )
+                        last_ret, last_source = ret, source_label
                         continue
 
                     self._handle = handle.value
@@ -470,6 +572,10 @@ class WcdbNativeClient:
                         "Key from %s (fmt=%s, path=%s) → 0 sessions",
                         source_label, key_fmt, path_label,
                     )
+                    # The key opened the database but decrypted nothing —
+                    # record it so the final message can tell this apart from
+                    # "no key at all".
+                    last_ret, last_source = -4, source_label
                     self._close_handle()
 
             logger.warning(
@@ -477,10 +583,19 @@ class WcdbNativeClient:
                 source_label,
             )
 
-        raise RuntimeError(
-            "KEY_MISSING: 密钥未配置。"
-            "点击下方「重新获取密钥」按钮，按提示退出并重新登录微信即可。"
-        )
+        if tried_real_key:
+            # A key IS configured, it just does not belong to this database.
+            # Extraction will not help by itself — the stored key must be
+            # replaced, which the same button does, so point at it while
+            # naming the real cause instead of claiming the key is missing.
+            logger.warning(
+                "WCDB key rejected (source=%s, last_ret=%s) — the configured "
+                "key does not decrypt %s",
+                last_source or "env", last_ret, session_db,
+            )
+            raise RuntimeError(_key_failure_message(tried_real_key=True))
+
+        raise RuntimeError(_key_failure_message(tried_real_key=False))
 
     @staticmethod
     def _save_key_to_env(key: str):
@@ -488,8 +603,10 @@ class WcdbNativeClient:
 
         Writes to resolve_env_file() (the canonical .env location), creating
         the file if missing, so the key lands exactly where config reads it.
+        Uses config.write_env_file so a filesystem that refuses an atomic
+        rename (UNC / VMware shared folder) still persists the key.
         """
-        from src.config import resolve_env_file
+        from src.config import resolve_env_file, write_env_file
         env_path = resolve_env_file()
         try:
             lines = (
@@ -508,13 +625,10 @@ class WcdbNativeClient:
                     new_lines.append(line)
             if not found:
                 new_lines.append(f"WCDB_KEY={key}")
-            env_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = env_path.with_suffix(".tmp")
-            tmp.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-            os.replace(tmp, env_path)
-            logger.debug("Persisted WCDB_KEY to %s", env_path)
+            how = write_env_file(env_path, "\n".join(new_lines) + "\n")
+            logger.debug("Persisted WCDB_KEY to %s (%s write)", env_path, how)
         except Exception as e:
-            logger.debug("Failed to persist WCDB_KEY: %s", e)
+            logger.warning("Failed to persist WCDB_KEY to %s: %s", env_path, e)
 
     def _key_candidates(self):
         """Generate (key, label) pairs in priority order.
