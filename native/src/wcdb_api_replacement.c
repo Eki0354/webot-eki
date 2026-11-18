@@ -148,6 +148,50 @@ static int sb_json_string(strbuf *sb, const char *s) {
     return sb_addc(sb, '"');
 }
 
+/* Emit raw bytes as a base64 JSON string literal.
+ *
+ * Why this exists: WeChat 4.x stores non-text message bodies (image, emoji,
+ * quote, ...) as zstd-compressed BLOBs. Those bytes routinely contain 0x00,
+ * so reading the column through sqlite3_column_text() + sb_json_string()
+ * truncates the payload at the first NUL and hands Python a few bytes of
+ * mojibake. Base64 is NUL-free and ASCII-safe, so the full payload survives
+ * the JSON hop and Python can decode + decompress it. */
+static int sb_json_base64(strbuf *sb, const unsigned char *data, size_t n) {
+    static const char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if (!sb_addc(sb, '"')) {
+        return 0;
+    }
+    if (data) {
+        size_t i = 0;
+        for (; i + 2 < n; i += 3) {
+            unsigned v = ((unsigned)data[i] << 16) |
+                         ((unsigned)data[i + 1] << 8) |
+                         (unsigned)data[i + 2];
+            char q[4] = { tbl[(v >> 18) & 0x3f], tbl[(v >> 12) & 0x3f],
+                          tbl[(v >> 6) & 0x3f], tbl[v & 0x3f] };
+            if (!sb_addn(sb, q, 4)) {
+                return 0;
+            }
+        }
+        if (n - i == 1) {
+            unsigned v = (unsigned)data[i] << 16;
+            char q[4] = { tbl[(v >> 18) & 0x3f], tbl[(v >> 12) & 0x3f], '=', '=' };
+            if (!sb_addn(sb, q, 4)) {
+                return 0;
+            }
+        } else if (n - i == 2) {
+            unsigned v = ((unsigned)data[i] << 16) | ((unsigned)data[i + 1] << 8);
+            char q[4] = { tbl[(v >> 18) & 0x3f], tbl[(v >> 12) & 0x3f],
+                          tbl[(v >> 6) & 0x3f], '=' };
+            if (!sb_addn(sb, q, 4)) {
+                return 0;
+            }
+        }
+    }
+    return sb_addc(sb, '"');
+}
+
 /* Hand ownership of the buffer to the caller (freed via wcdb_free_string). */
 static void *sb_detach(strbuf *sb) {
     char *p = sb->data;
@@ -442,6 +486,14 @@ static int emit_column(strbuf *sb, sqlite3_stmt *st, int i) {
         return sb_printf(sb, "%lld", (long long)sqlite3_column_int64(st, i));
     case SQLITE_FLOAT:
         return sb_printf(sb, "%.17g", sqlite3_column_double(st, i));
+    case SQLITE_BLOB: {
+        /* Base64, not text: WeChat 4.x packs non-text bodies as zstd BLOBs
+         * full of NULs, and sqlite3_column_text() would stop at the first
+         * one. Callers that care use typeof() to know it was a BLOB. */
+        const unsigned char *b = sqlite3_column_blob(st, i);
+        int n = sqlite3_column_bytes(st, i);
+        return sb_json_base64(sb, b, n > 0 ? (size_t)n : 0);
+    }
     default: {
         const unsigned char *t = sqlite3_column_text(st, i);
         return sb_json_string(sb, t ? (const char *)t : "");
@@ -741,7 +793,9 @@ WCDB_EXPORT int32_t wcdb_get_messages(int64_t handle, const char *talker,
         "SELECT m.local_id AS local_id, m.server_id AS server_id, "
         "m.local_type AS localType, m.sort_seq AS sort_seq, "
         "m.create_time AS create_time, m.status AS status, "
-        "m.message_content AS message_content, m.source AS source, ");
+        "m.message_content AS message_content, "
+        "typeof(m.message_content) AS content_kind, "
+        "m.source AS source, typeof(m.source) AS source_kind, ");
     if (n2i) {
         sb_printf(&sql, "n.user_name AS sender_username ");
         sb_printf(&sql, "FROM \"%s\" m LEFT JOIN %s n ON n.rowid = m.real_sender_id ", table, n2i);
