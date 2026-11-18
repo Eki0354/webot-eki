@@ -383,10 +383,12 @@ todo_delete_keywords: list[str] = [
 | 函数 | 描述 | 参数 | 返回值 |
 |---|---|---|---|
 | `__init__()` | 初始化窗口控制器 | 无 | `None` |
-| `find_hwnd(force=False)` | 查找微信窗口 HWND | `force: bool` | `int \| None` |
+| `find_hwnd(force=False)` | 查找微信窗口 HWND(无可见候选时尝试唤醒托盘隐藏窗口) | `force: bool` | `int \| None` |
+| `_revive_hidden_candidate(candidates)` | 显示被收进托盘的隐藏微信窗口并重新打分 | `candidates: list[WindowCandidate]` | `WindowCandidate \| None` |
 | `_validate_hwnd(hwnd)` | 验证 HWND 有效性 | `hwnd: int` | `bool` |
 | `invalidate_cache()` | 清除 HWND 缓存 | 无 | `None` |
 | `activate(hwnd)` | 激活微信窗口(4层策略) | `hwnd: int` | `bool` |
+| `_try_set_foreground(hwnd)` | SetForegroundWindow 包装，失败返回 False 而不抛异常 | `hwnd: int` | `bool` |
 | `navigate_to_chat(hwnd, group_name)` | 键盘导航到指定群聊 | `hwnd: int, group_name: str` | `bool` |
 | `send_message(hwnd, text)` | 键盘发送消息(Ctrl+V→Enter) | `hwnd: int, text: str` | `bool` |
 | `send_to_chat(group_name, text, max_retries=2)` | 完整发送管道(主入口) | `group_name: str, text: str, max_retries: int` | `bool` |
@@ -1351,14 +1353,22 @@ WeChatWindowController.send_to_chat(group_name, text)  ← 主入口
   │     ├── EnumWindows → _score_window() 打分所有窗口
   │     ├── 验证: 进程名 ∈ {wechat.exe, weixin.exe}
   │     ├── 评分: title="微信" (+50), Qt class (+30), visible (+20), size (+10)
+  │     ├── 无可用的可见候选 → _revive_hidden_candidate()
+  │     │     ├── 挑尺寸合格的隐藏候选(最多3个) — 微信收进托盘时清 WS_VISIBLE
+  │     │     ├── ShowWindow(SW_SHOW/SW_RESTORE) + BringWindowToTop
+  │     │     └── _score_window() 重新打分，仍不可见则放弃
   │     └── 缓存 30 秒
   │
   ├── activate(hwnd) — 4层激活策略
   │     ├── Layer 1: _prime_foreground_authority() — Alt 按键获取前台权限
-  │     │           + AllowSetForegroundWindow(-1) + SetForegroundWindow
-  │     ├── Layer 2: _force_foreground() — AttachThreadInput 绕过
-  │     ├── Layer 3: _alt_tab_to_window() — Alt+Esc 循环切换
-  │     └── Layer 4: (失败)
+  │     │           + AllowSetForegroundWindow(-1)
+  │     ├── Layer 2: _try_set_foreground(hwnd) — SetForegroundWindow
+  │     ├── Layer 3: _force_foreground() — AttachThreadInput 绕过
+  │     └── Layer 4: _alt_tab_to_window() — Alt+Esc 循环切换
+  │
+  │     ※ 每层失败都必须返回 False 而非抛异常，否则会短路后续降级层。
+  │       pywin32 的 SetForegroundWindow 失败时抛 pywintypes.error
+  │       (ERROR_ACCESS_DENIED=5)，故统一走 _try_set_foreground 包装。
   │
   ├── navigate_to_chat(hwnd, group_name)
   │     ├── Phase 0: _goto_contacts_tab() — Ctrl+2 到通讯录标签

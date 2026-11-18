@@ -243,11 +243,19 @@ class WeChatWindowController:
             and (c.rect[3] - c.rect[1]) >= MIN_WINDOW_HEIGHT
         ]
         if not usable_candidates:
-            logger.error(
-                "WeChat is running, but no usable chat main window was found. "
-                "It may be locked, logged out, or showing a small login prompt."
-            )
-            return None
+            # WeChat clears WS_VISIBLE on its main window when it is tucked
+            # into the tray, so IsWindowVisible reports 0 while the HWND is
+            # still alive and correctly sized.  Sending needs the window on
+            # screen anyway, so try to revive the best hidden candidate once
+            # before declaring the chat window missing.
+            revived = self._revive_hidden_candidate(wechat_candidates)
+            if revived is None:
+                logger.error(
+                    "WeChat is running, but no usable chat main window was found. "
+                    "It may be locked, logged out, or showing a small login prompt."
+                )
+                return None
+            usable_candidates = [revived]
 
         # Sort by score descending
         usable_candidates.sort(key=lambda x: -x.score)
@@ -267,6 +275,67 @@ class WeChatWindowController:
             f"title='{best.title[:30]}' class='{best.class_name}'"
         )
         return best.hwnd
+
+    def _revive_hidden_candidate(
+        self, candidates: list["WindowCandidate"],
+    ) -> Optional["WindowCandidate"]:
+        """Try to make a hidden WeChat main window visible again.
+
+        WeChat hides its main window (clearing WS_VISIBLE) instead of
+        destroying it when the user sends it to the tray.  Such a window
+        still has a valid HWND and its original size, so it is a perfectly
+        good send target once it is shown again — but ``find_hwnd`` skips
+        invisible windows, which used to make sending fail with
+        "no usable chat main window".
+
+        Only candidates that already look like a main chat window
+        (big enough, correct process) are revived, so a small hidden login
+        prompt is never mistaken for the chat window.
+
+        Returns the revived candidate (re-scored) or None.
+        """
+        hidden = [
+            c for c in candidates
+            if not c.visible
+            and (c.rect[2] - c.rect[0]) >= MIN_WINDOW_WIDTH
+            and (c.rect[3] - c.rect[1]) >= MIN_WINDOW_HEIGHT
+        ]
+        if not hidden:
+            return None
+
+        hidden.sort(key=lambda x: -x.score)
+        for candidate in hidden[:3]:
+            hwnd = candidate.hwnd
+            try:
+                logger.info(
+                    "Reviving hidden WeChat window: HWND=%s score=%s title='%s'",
+                    hwnd, candidate.score, candidate.title[:30],
+                )
+                if win32gui.IsIconic(hwnd):
+                    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                else:
+                    win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+                win32gui.BringWindowToTop(hwnd)
+                time.sleep(0.3)
+            except Exception as e:
+                logger.warning("Failed to revive HWND=%s: %s", hwnd, e)
+                continue
+
+            # Re-score: the window may still refuse to appear (locked or
+            # logged-out client), in which case we must not use it.
+            refreshed = _score_window(hwnd)
+            if refreshed.visible:
+                logger.info(
+                    "Hidden WeChat window revived: HWND=%s score=%s",
+                    hwnd, refreshed.score,
+                )
+                return refreshed
+            logger.warning(
+                "HWND=%s still not visible after ShowWindow (may be locked "
+                "or logged out)", hwnd,
+            )
+
+        return None
 
     def _validate_hwnd(self, hwnd: int) -> bool:
         """Check if an HWND is still valid and belongs to WeChat."""
@@ -332,7 +401,7 @@ class WeChatWindowController:
             ctypes.windll.user32.AllowSetForegroundWindow(-1)
 
             # ── Layer 2: SetForegroundWindow ────────────────────────
-            foreground_set = win32gui.SetForegroundWindow(hwnd)
+            foreground_set = self._try_set_foreground(hwnd)
             time.sleep(0.3)
             if self._foreground_matches(hwnd):
                 logger.debug("Window activated: HWND=%s is foreground", hwnd)
@@ -422,6 +491,24 @@ class WeChatWindowController:
             pass
 
     @staticmethod
+    def _try_set_foreground(hwnd: int) -> bool:
+        """SetForegroundWindow that returns a bool instead of raising.
+
+        pywin32 raises ``pywintypes.error`` when the call fails (e.g.
+        ERROR_ACCESS_DENIED=5 under the Windows foreground lock,
+        ERROR_INVALID_WINDOW_HANDLE=1400).  The activation strategy is a
+        layered fallback chain, so a failed layer must report False and
+        let the caller try the next one — not abort the whole chain.
+
+        Returns True if the call reported success, False on any failure.
+        """
+        try:
+            return bool(win32gui.SetForegroundWindow(hwnd))
+        except Exception as e:
+            logger.debug("SetForegroundWindow(HWND=%s) failed: %s", hwnd, e)
+            return False
+
+    @staticmethod
     def _force_foreground(hwnd: int) -> bool:
         """Use AttachThreadInput to bypass common Windows foreground restrictions.
 
@@ -461,13 +548,13 @@ class WeChatWindowController:
             # unless we also attached threads above)
             ctypes.windll.user32.AllowSetForegroundWindow(-1)
 
-            success = bool(win32gui.SetForegroundWindow(hwnd))
+            success = WeChatWindowController._try_set_foreground(hwnd)
 
             # If SetForegroundWindow failed but we got thread attachments,
             # try one more time after a brief sleep
             if not success and (attached_current or attached_foreground):
                 time.sleep(0.15)
-                success = bool(win32gui.SetForegroundWindow(hwnd))
+                success = WeChatWindowController._try_set_foreground(hwnd)
 
             return success
         except Exception as e:
@@ -899,7 +986,7 @@ class WeChatWindowController:
                     win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
                     win32gui.BringWindowToTop(hwnd)
                     ctypes.windll.user32.AllowSetForegroundWindow(-1)
-                    win32gui.SetForegroundWindow(hwnd)
+                    WeChatWindowController._try_set_foreground(hwnd)
                     time.sleep(0.2)
                 except Exception:
                     pass
