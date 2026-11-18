@@ -1128,6 +1128,22 @@ MessageRouter.handle(msg)
 | `MAX_CONTENT_LENGTH` | `997` | 单条消息最大字符数 |
 | `AT_MENTION_MAX_AGE_SEC` | `300` | @mention 最大有效年龄(秒) |
 
+#### 媒体占位符的语义约定（重要）
+
+`MediaPipeline` 无法解析的消息会降级为占位符（`[图片]`/`[视频]`/`[文件]`）。
+这些占位符**只表示"收到过一条此类消息"，不携带任何内容**，AI 看不到像素。
+
+为此三处 prompt 均显式声明了该约定，防止模型顺着上下文编造图片内容：
+
+| Prompt | 位置 | 声明内容 |
+|---|---|---|
+| `CHAT_SYSTEM_PROMPT` | `base.py` §关于图片和媒体消息 | `[图片]` 等看不到实际内容，让描述图片时直接说看不到，禁止假装看到 |
+| `PROACTIVE_SYSTEM_PROMPT` | `base.py` §关于图片和媒体消息 | 同上（主动发言不编造媒体内容） |
+| `SYSTEM_PROMPT` / `CHUNK_SYSTEM_PROMPT` | `prompts.py` | 总结时不得编造 `[图片]` 等占位符的内容 |
+
+例外：`[表情]` 后带文字（如 `[表情] 一只猫在摇头`）是 `MediaPipeline` 已成功描述的，
+属于真实可用信息，可正常引用。
+
 #### Claude 后端特有
 
 - 使用 `client.messages.parse()` 进行原生 Pydantic 结构化输出
