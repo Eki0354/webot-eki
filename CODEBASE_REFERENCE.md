@@ -1914,8 +1914,14 @@ WCDB_KEY=
 # 数据:
 #   - ui/dist → ui/dist (前端构建产物)
 #   - .env.example → . (示例配置)
+# hiddenimports: 显式列出 src.* 各模块 + 第三方包 (dotenv/anthropic/openai/
+#   pydantic/webview/psutil/PIL/comtypes/uiautomation) + src.media 与 zstandard
 # 排除: faster_whisper, ctranslate2, numpy, onnxruntime, pysilk, tkinter, matplotlib, scipy
 ```
+
+`src/media` 与 `zstandard` 必须留在 `hiddenimports` 里：`MediaPipeline` 是在
+`WcdbBackend._get_media()` 内部延迟导入的，PyInstaller 的静态分析看不到这条
+路径，漏掉会让打出的 EXE 在运行时抛 `ImportError`。
 
 ### 5.3 `requirements.txt` 依赖说明
 
@@ -1936,6 +1942,7 @@ WCDB_KEY=
 | `silk-python>=0.2.8` | SILK v3 音频解码 | 语音功能 |
 | `faster-whisper>=1.0` | 本地语音识别 | 语音功能 |
 | `opencc-python-reimplemented>=0.1.7` | 繁简中文转换 | 语音功能 |
+| `zstandard>=0.22` | 解压微信非文本消息体 (base64 → zstd → 文本) | 媒体功能 |
 
 ### 5.4 前端依赖 (`ui/package.json`)
 
