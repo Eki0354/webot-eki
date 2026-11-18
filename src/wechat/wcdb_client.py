@@ -236,19 +236,50 @@ def _read_gbk_string(ptr):
         logger.warning("Pointer validation failed for 0x%x: %s", addr, exc)
         return ""
 
+    # Walk the buffer chunk-by-chunk, never reading past the end of the
+    # committed region that holds it.  The old fixed 500000-byte ceiling
+    # silently truncated large payloads — a 800-message page with base64
+    # blobs runs past 500 KB, which used to surface as a JSON parse error.
+    # Chunked reads also avoid the byte-at-a-time ctypes overhead.
     raw = bytearray()
-    for _ in range(500000):
+    cursor = addr
+    while True:
         try:
-            b = (ct.c_ubyte * 1).from_address(addr)[0]
+            mbi = _MEMORY_BASIC_INFORMATION()
+            if not _kernel32.VirtualQuery(
+                ct.c_void_p(cursor), ct.byref(mbi), ct.sizeof(mbi)
+            ):
+                logger.warning(
+                    "VirtualQuery failed for ptr 0x%x — stopping read", cursor
+                )
+                break
+            if mbi.State != MEM_COMMIT or (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)):
+                logger.warning(
+                    "Pointer 0x%x left readable memory (state=%d protect=0x%x)",
+                    cursor, mbi.State, mbi.Protect,
+                )
+                break
+            region_end = (mbi.BaseAddress or 0) + mbi.RegionSize
+        except Exception as exc:
+            logger.warning("Pointer walk failed at 0x%x: %s", cursor, exc)
+            break
+
+        if cursor >= region_end:
+            break
+        chunk = min(region_end - cursor, 1 << 20)
+        try:
+            block = ct.string_at(cursor, chunk)
         except (OSError, ValueError):
             logger.warning(
-                "Access violation reading 0x%x (ptr returned by DLL)", addr
+                "Access violation reading 0x%x (ptr returned by DLL)", cursor
             )
             break
-        if b == 0:
+        nul = block.find(b"\x00")
+        if nul >= 0:
+            raw += block[:nul]
             break
-        raw.append(b)
-        addr += 1
+        raw += block
+        cursor += chunk
     # Try UTF-8 first (DLL inputs are always UTF-8), fall back to GBK.
     # GBK decode of UTF-8 bytes can produce valid JSON with garbled Chinese
     # (JSON structural chars are ASCII, identical in both encodings), so the
@@ -697,18 +728,23 @@ class WcdbNativeClient:
         if not out.value:
             logger.debug("WCDB call %s returned null pointer", func.__name__)
             return {}
+        # Free exactly once, and only after the buffer has been copied out.
+        # Freeing again in an except branch corrupts the DLL heap and the next
+        # allocation dies with an access violation, so keep the free in a
+        # finally and do all parsing on the Python-owned copy.
         try:
             data = _read_gbk_string(out)
+        finally:
             self._dll.wcdb_free_string(out)
+        if not data:
+            logger.warning("WCDB call %s returned an unreadable buffer",
+                           func.__name__)
+            return {}
+        try:
             return json.loads(data)
         except json.JSONDecodeError as e:
-            logger.debug("JSON parse error: %s", e)
-            self._dll.wcdb_free_string(out)
-            return {}
-        except Exception as e:
-            logger.warning("Unexpected error in _call_json for %s: %s",
-                           func.__name__, e)
-            self._dll.wcdb_free_string(out)
+            logger.warning("JSON parse error in %s: %s (%d bytes)",
+                           func.__name__, e, len(data))
             return {}
 
     def get_sessions(self, limit=500):

@@ -49,6 +49,10 @@
 #define MAX_ACCOUNTS      16
 #define MAX_PATH_LEN      1024
 #define MAX_TABLE_CACHE   128
+/* WeChat 4.x splits one chat's Msg_<md5> table across message_0.db,
+ * message_1.db, ... A chat's history therefore lives in several shards and
+ * all of them must be read; see find_message_dbs(). */
+#define MAX_SHARDS        8
 
 /* ── growable string buffer ─────────────────────────────────────────── */
 
@@ -221,7 +225,8 @@ static int md5_hex(const char *in, char out[33]) {
 
 typedef struct {
     char table[128];
-    char db[MAX_PATH_LEN];
+    char db[MAX_SHARDS][MAX_PATH_LEN];  /* every shard holding this table */
+    int  db_count;
 } table_cache_entry;
 
 typedef struct {
@@ -429,24 +434,43 @@ static int table_exists(sqlite3 *db, const char *name) {
     return found;
 }
 
-/* Find which message_*.db holds Msg_<md5>, caching the answer. */
-static const char *find_message_db(account *a, const char *table) {
+/* Collect every message_*.db shard that holds Msg_<md5>, caching the answer.
+ *
+ * WeChat 4.x shards one chat's history across message_0.db, message_1.db, ...
+ * Each shard holds a slice of the same Msg_<md5> table, so stopping at the
+ * first hit silently drops everything written to the other shards.  Measured
+ * on a real install: message_0.db stopped at 2026-09-21 while message_1.db
+ * carried the following two months, so the bot never saw recent traffic.
+ *
+ * Returns the number of shards found, writing their paths into `out`. */
+static int find_message_dbs(account *a, const char *table,
+                            char out[][MAX_PATH_LEN], int max_out) {
     for (int i = 0; i < a->table_count; i++) {
         if (strcmp(a->tables[i].table, table) == 0) {
-            return a->tables[i].db[0] ? a->tables[i].db : NULL;
+            int n = a->tables[i].db_count;
+            if (n > max_out) {
+                n = max_out;
+            }
+            for (int k = 0; k < n; k++) {
+                snprintf(out[k], MAX_PATH_LEN, "%s", a->tables[i].db[k]);
+            }
+            return n;
         }
     }
 
+    int count = 0;
     char pattern[MAX_PATH_LEN];
     snprintf(pattern, sizeof(pattern), "%s\\*.db", a->message_dir);
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(pattern, &fd);
-    char found[MAX_PATH_LEN] = "";
 
     if (h != INVALID_HANDLE_VALUE) {
         do {
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                 continue;
+            }
+            if (count >= max_out) {
+                break;
             }
             char candidate[MAX_PATH_LEN];
             snprintf(candidate, sizeof(candidate), "%s\\%s", a->message_dir, fd.cFileName);
@@ -454,12 +478,10 @@ static const char *find_message_db(account *a, const char *table) {
             if (!db) {
                 continue;
             }
-            if (table_exists(db, table)) {
-                snprintf(found, sizeof(found), "%s", candidate);
-            }
+            int has_table = table_exists(db, table);
             sqlite3_close(db);
-            if (found[0]) {
-                break;
+            if (has_table) {
+                snprintf(out[count++], MAX_PATH_LEN, "%s", candidate);
             }
         } while (FindNextFileA(h, &fd));
         FindClose(h);
@@ -470,10 +492,15 @@ static const char *find_message_db(account *a, const char *table) {
     if (a->table_count < MAX_TABLE_CACHE) {
         table_cache_entry *e = &a->tables[a->table_count++];
         snprintf(e->table, sizeof(e->table), "%s", table);
-        snprintf(e->db, sizeof(e->db), "%s", found);
-        return e->db[0] ? e->db : NULL;
+        e->db_count = count;
+        for (int k = 0; k < count; k++) {
+            snprintf(e->db[k], MAX_PATH_LEN, "%s", out[k]);
+        }
+        for (int k = 0; k < count; k++) {
+            snprintf(out[k], MAX_PATH_LEN, "%s", e->db[k]);
+        }
     }
-    return NULL;
+    return count;
 }
 
 /* ── generic row -> JSON ────────────────────────────────────────────── */
@@ -744,7 +771,31 @@ WCDB_EXPORT int32_t wcdb_get_sessions(int64_t handle, void **out_json) {
 /*
  * Messages for one chat. Table name is Msg_<md5(talker)>; the sender wxid
  * comes from the per-database Name2Id/name2id mapping on real_sender_id.
+ *
+ * The table is sharded across message_*.db, so every shard is queried and the
+ * rows are merged before applying offset/limit — otherwise only the oldest
+ * shard's slice of history is ever visible.
  */
+
+/* One rendered message row, kept so the merged set can be sorted. */
+typedef struct {
+    long long create_time;
+    long long local_id;
+    char     *json;
+} msg_row;
+
+static int msg_row_cmp(const void *pa, const void *pb) {
+    const msg_row *a = (const msg_row *)pa;
+    const msg_row *b = (const msg_row *)pb;
+    if (a->create_time != b->create_time) {
+        return (a->create_time < b->create_time) ? 1 : -1;  /* newest first */
+    }
+    if (a->local_id != b->local_id) {
+        return (a->local_id < b->local_id) ? 1 : -1;
+    }
+    return 0;
+}
+
 WCDB_EXPORT int32_t wcdb_get_messages(int64_t handle, const char *talker,
                                       int32_t limit, int32_t offset, void **out_json) {
     ensure_lock();
@@ -767,8 +818,9 @@ WCDB_EXPORT int32_t wcdb_get_messages(int64_t handle, const char *talker,
     char table[64];
     snprintf(table, sizeof(table), "Msg_%s", digest);
 
-    const char *db_path = find_message_db(a, table);
-    if (!db_path) {
+    char shards[MAX_SHARDS][MAX_PATH_LEN];
+    int shard_count = find_message_dbs(a, table, shards, MAX_SHARDS);
+    if (shard_count == 0) {
         /* No table for this chat yet — empty result is not an error. */
         strbuf empty;
         sb_init(&empty);
@@ -777,69 +829,115 @@ WCDB_EXPORT int32_t wcdb_get_messages(int64_t handle, const char *talker,
         return WCDB_OK;
     }
 
-    sqlite3 *db = open_encrypted(db_path, a->key);
-    if (!db) {
+    int want = limit > 0 ? limit : 200;
+    int skip = offset > 0 ? offset : 0;
+    /* A row in the global top (skip+want) is necessarily in its own shard's
+     * top (skip+want), so this per-shard fetch is sufficient to merge. */
+    long long per_shard = (long long)skip + (long long)want;
+
+    msg_row *rows = NULL;
+    int row_count = 0;
+    int row_cap = 0;
+    int opened = 0;
+
+    for (int s = 0; s < shard_count; s++) {
+        sqlite3 *db = open_encrypted(shards[s], a->key);
+        if (!db) {
+            continue;
+        }
+        opened++;
+
+        /* Resolve the sender table name variant present in this shard. */
+        const char *n2i = table_exists(db, "Name2Id") ? "Name2Id"
+                        : table_exists(db, "name2id") ? "name2id"
+                        : NULL;
+
+        strbuf sql;
+        sb_init(&sql);
+        sb_add(&sql,
+            "SELECT m.local_id AS local_id, m.server_id AS server_id, "
+            "m.local_type AS localType, m.sort_seq AS sort_seq, "
+            "m.create_time AS create_time, m.status AS status, "
+            "m.message_content AS message_content, "
+            "typeof(m.message_content) AS content_kind, "
+            "m.source AS source, typeof(m.source) AS source_kind, ");
+        if (n2i) {
+            sb_add(&sql, "n.user_name AS sender_username ");
+            sb_printf(&sql, "FROM \"%s\" m LEFT JOIN %s n ON n.rowid = m.real_sender_id ", table, n2i);
+        } else {
+            sb_add(&sql, "'' AS sender_username ");
+            sb_printf(&sql, "FROM \"%s\" m ", table);
+        }
+        sb_add(&sql, "ORDER BY m.create_time DESC, m.local_id DESC LIMIT ?1 OFFSET 0;");
+
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, sql.data, -1, &st, NULL) != SQLITE_OK) {
+            free(sql.data);
+            sqlite3_close(db);
+            continue;
+        }
+        free(sql.data);
+
+        sqlite3_bind_int64(st, 1, per_shard);
+
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            if (row_count == row_cap) {
+                int next = row_cap ? row_cap * 2 : 256;
+                msg_row *grown = (msg_row *)realloc(rows, (size_t)next * sizeof(msg_row));
+                if (!grown) {
+                    break;
+                }
+                rows = grown;
+                row_cap = next;
+            }
+            strbuf item;
+            sb_init(&item);
+            sb_addc(&item, '{');
+            int cols = sqlite3_column_count(st);
+            for (int i = 0; i < cols; i++) {
+                if (i) {
+                    sb_addc(&item, ',');
+                }
+                sb_json_string(&item, sqlite3_column_name(st, i));
+                sb_addc(&item, ':');
+                emit_column(&item, st, i);
+            }
+            sb_addc(&item, '}');
+            rows[row_count].create_time = sqlite3_column_int64(st, 4);
+            rows[row_count].local_id    = sqlite3_column_int64(st, 0);
+            rows[row_count].json        = (char *)sb_detach(&item);
+            row_count++;
+        }
+        sqlite3_finalize(st);
+        sqlite3_close(db);
+    }
+
+    if (opened == 0) {
+        free(rows);
         return WCDB_ERR_OPEN;
     }
 
-    /* Resolve the sender table name variant present in this database. */
-    const char *n2i = table_exists(db, "Name2Id") ? "Name2Id"
-                    : table_exists(db, "name2id") ? "name2id"
-                    : NULL;
-
-    strbuf sql;
-    sb_init(&sql);
-    sb_add(&sql,
-        "SELECT m.local_id AS local_id, m.server_id AS server_id, "
-        "m.local_type AS localType, m.sort_seq AS sort_seq, "
-        "m.create_time AS create_time, m.status AS status, "
-        "m.message_content AS message_content, "
-        "typeof(m.message_content) AS content_kind, "
-        "m.source AS source, typeof(m.source) AS source_kind, ");
-    if (n2i) {
-        sb_printf(&sql, "n.user_name AS sender_username ");
-        sb_printf(&sql, "FROM \"%s\" m LEFT JOIN %s n ON n.rowid = m.real_sender_id ", table, n2i);
-    } else {
-        sb_add(&sql, "'' AS sender_username ");
-        sb_printf(&sql, "FROM \"%s\" m ", table);
+    if (row_count > 1) {
+        qsort(rows, (size_t)row_count, sizeof(msg_row), msg_row_cmp);
     }
-    sb_add(&sql, "ORDER BY m.create_time DESC, m.local_id DESC LIMIT ?1 OFFSET ?2;");
-
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(db, sql.data, -1, &st, NULL) != SQLITE_OK) {
-        free(sql.data);
-        sqlite3_close(db);
-        return WCDB_ERR_QUERY;
-    }
-    free(sql.data);
-
-    sqlite3_bind_int(st, 1, limit > 0 ? limit : 200);
-    sqlite3_bind_int(st, 2, offset > 0 ? offset : 0);
 
     strbuf out;
     sb_init(&out);
     sb_add(&out, "{\"messages\":[");
-    int rows = 0;
-    while (sqlite3_step(st) == SQLITE_ROW) {
-        if (rows++) {
+    int emitted = 0;
+    for (int i = skip; i < row_count && emitted < want; i++) {
+        if (emitted++) {
             sb_addc(&out, ',');
         }
-        sb_addc(&out, '{');
-        int cols = sqlite3_column_count(st);
-        for (int i = 0; i < cols; i++) {
-            if (i) {
-                sb_addc(&out, ',');
-            }
-            sb_json_string(&out, sqlite3_column_name(st, i));
-            sb_addc(&out, ':');
-            emit_column(&out, st, i);
-        }
-        sb_addc(&out, '}');
+        sb_add(&out, rows[i].json);
     }
-    sb_printf(&out, "],\"count\":%d}", rows);
+    sb_printf(&out, "],\"count\":%d}", emitted);
 
-    sqlite3_finalize(st);
-    sqlite3_close(db);
+    for (int i = 0; i < row_count; i++) {
+        free(rows[i].json);
+    }
+    free(rows);
+
     *out_json = sb_detach(&out);
     return WCDB_OK;
 }
