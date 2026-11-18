@@ -14,3 +14,6 @@ pyperclip>=1.8
 silk-python>=0.2.8
 faster-whisper>=1.0
 opencc-python-reimplemented>=0.1.7
+
+# Media messages — WeChat stores non-text bodies as zstd-compressed BLOBs
+zstandard>=0.22

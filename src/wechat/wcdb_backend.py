@@ -20,13 +20,25 @@ from typing import Optional
 from .base import AbstractWeChatBackend, MessageCallback
 from .wcdb_client import WcdbNativeClient
 from .window_controller import WeChatWindowController
-from .helpers import DedupSet
+from .helpers import DedupSet, format_nontext_content
+from src.media.appmsg import looks_like_xml, strip_sender_prefix
+from src.media.blob import decode_blob, is_binary
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_POLL_SEC = 1.0
 MAX_DEDUP_SIZE = 5000
 MAX_CONSECUTIVE_ERRORS = 5   # trigger reinit after this many consecutive failures
+
+# Message types whose body is media rather than text.  Used to pick a
+# placeholder when MediaPipeline cannot describe them.
+_MEDIA_LOCAL_TYPES = frozenset({
+    3,      # image
+    43,     # video
+    47,     # emoji / sticker
+    48,     # location
+    49,     # appmsg (link / file / mini-program)
+})
 
 
 class WcdbBackend(AbstractWeChatBackend):
@@ -67,6 +79,8 @@ class WcdbBackend(AbstractWeChatBackend):
         self._pool: concurrent.futures.ThreadPoolExecutor | None = None
         # Voice recognition pipeline (lazy-init when voice_asr_enabled)
         self._voice: Optional[object] = None
+        # Media (emoji/appmsg/vision) pipeline (lazy-init when media_vision_enabled)
+        self._media: Optional[object] = None
         self._voice_config = config
 
     # ── Public API ─────────────────────────────────────────────────
@@ -520,6 +534,59 @@ class WcdbBackend(AbstractWeChatBackend):
             logger.exception("VoicePipeline.process failed")
             return None
 
+    # ── Media helpers ────────────────────────────────────────────────
+
+    def _get_media(self):
+        """Lazy-init the MediaPipeline (avoids import unless enabled)."""
+        if self._media is not None:
+            return self._media
+        if self._voice_config is None:
+            self._media = False  # Sentinel: no config → disabled
+            return False
+        try:
+            from src.media import MediaPipeline
+            self._media = MediaPipeline(self._voice_config)
+        except Exception:
+            logger.exception("MediaPipeline init failed — media disabled")
+            self._media = False
+        return self._media
+
+    def _try_media(self, msg: dict) -> Optional[str]:
+        """Describe a media message; return text or None on failure."""
+        media = self._get_media()
+        if not media:  # False or None → disabled
+            return None
+        try:
+            return media.process(msg)
+        except Exception:
+            logger.exception("MediaPipeline.process failed")
+            return None
+
+    def _blob_text(self, msg: dict) -> str:
+        """Decode a non-media BLOB body to plain chat text.
+
+        WeChat compresses some ordinary text messages the same way it stores
+        media.  A decoded payload that is markup is *not* chat text — it is a
+        system notice or an appmsg body, which the media pipeline and the join
+        filter deal with.  Returning markup here would put kilobytes of XML
+        into the AI prompt, so those yield "" and the message is dropped,
+        matching the behaviour before BLOB columns were emitted at all.
+
+        The stored body is often prefixed with the sender id
+        (``wxid_xxx:\\n<msg>...``), so the prefix is stripped before deciding
+        whether the payload is markup.
+        """
+        raw = msg.get("message_content") or msg.get("content") or ""
+        if not raw:
+            return ""
+        text = decode_blob(str(raw))
+        if not text:
+            return ""
+        body = strip_sender_prefix(text).strip()
+        if not body or looks_like_xml(body):
+            return ""
+        return body
+
     # ── Message standardization ──────────────────────────────────────
 
     def _standardize(self, msg: dict, group_name: str,
@@ -527,8 +594,16 @@ class WcdbBackend(AbstractWeChatBackend):
         """Convert WCDB raw message to standard format."""
         # WCDB message fields: sender_username, message_content, local_type, create_time
         sender = str(msg.get("sender_username", msg.get("senderUsername", msg.get("sender", ""))))
-        content = str(msg.get("message_content", msg.get("content", ""))).strip()
         local_type = int(msg.get("localType", msg.get("msg_type", 1)))
+
+        # ── Binary bodies ─────────────────────────────────────────
+        # The native layer emits BLOB columns base64-encoded.  That string
+        # is a compressed XML payload, never message text — using it as
+        # content would push kilobytes of base64 into the AI prompt.
+        if is_binary(msg):
+            content = ""
+        else:
+            content = str(msg.get("message_content", msg.get("content", ""))).strip()
 
         # ── Voice recognition ──────────────────────────────────────
         # Voice messages (localType=34) have empty message_content;
@@ -539,6 +614,18 @@ class WcdbBackend(AbstractWeChatBackend):
                 content = f"[语音] {voice_text}"
             else:
                 content = "[语音]"
+        elif local_type in _MEDIA_LOCAL_TYPES:
+            # Media is described by MediaPipeline when enabled; otherwise
+            # it degrades to a plain placeholder.
+            content = self._try_media(msg) or format_nontext_content(local_type)
+        elif is_binary(msg):
+            # A BLOB that is not media: WeChat compresses ordinary text and
+            # system notices the same way.  Try the media pipeline first (it
+            # reduces appmsg XML to a title), then fall back to plain text.
+            # The raw base64 must never become content.
+            content = self._try_media(msg) or self._blob_text(msg)
+            if not content:
+                return None
         elif not content:
             return None
 

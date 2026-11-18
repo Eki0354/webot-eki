@@ -364,6 +364,12 @@ class BotConfig:
     # Convert traditional Chinese → simplified (opencc t2s)
     voice_asr_to_simplified: bool = True
 
+    # === Media (image / emoji / appmsg) ===
+    # Master switch (default off — user must opt in)
+    media_vision_enabled: bool = False
+    # Vision model override. Empty = reuse the configured AI backend's model.
+    media_vision_model: str = ""
+
 
 def _safe_float(raw: str, default: float, label: str) -> float:
     """Parse env value to float, raising RuntimeError with a friendly message on failure."""
@@ -631,6 +637,9 @@ def load_config() -> BotConfig:
         "voice_openai_base_url": os.getenv("VOICE_OPENAI_BASE_URL", "").strip(),
         "voice_local_model": os.getenv("VOICE_LOCAL_MODEL", "small").strip(),
         "voice_asr_to_simplified": os.getenv("VOICE_ASR_TO_SIMPLIFIED", "true").strip().lower() == "true",
+        # Media (image / emoji / appmsg)
+        "media_vision_enabled": os.getenv("MEDIA_VISION_ENABLED", "false").strip().lower() == "true",
+        "media_vision_model": os.getenv("MEDIA_VISION_MODEL", "").strip(),
     }
 
     deepseek_model = os.getenv("DEEPSEEK_MODEL")

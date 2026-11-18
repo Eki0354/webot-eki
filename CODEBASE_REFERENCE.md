@@ -135,6 +135,8 @@ grep "文件名" CODEBASE_REFERENCE.md
 | `VOICE_OPENAI_BASE_URL` | `str` | `""` | `src/config.py` | `src/voice/asr.py:OpenAiWhisperASR.__init__()` |
 | `VOICE_LOCAL_MODEL` | `str` | `"small"` | `src/config.py` | `src/voice/asr.py:LocalWhisperASR.__init__()` |
 | `VOICE_ASR_TO_SIMPLIFIED` | `bool` | `True` | `src/config.py` | `src/voice/asr.py` (各ASR后端) |
+| `MEDIA_VISION_ENABLED` | `bool` | `False` | `src/config.py` | `src/media/pipeline.py:MediaPipeline.__init__()` |
+| `MEDIA_VISION_MODEL` | `str` | `""` | `src/config.py` | `src/media/pipeline.py:MediaPipeline._create_vision()` |
 | `FEISHU_EXPORT_ENABLED` | `bool` | `False` | `src/config.py` | `src/integrations/feishu/exporter.py` |
 | `FEISHU_APP_ID` | `str` | `""` | `src/config.py` | `src/integrations/feishu/client.py:FeishuClient.__init__()` |
 | `FEISHU_APP_SECRET` | `str` | `""` | `src/config.py` | `src/integrations/feishu/client.py` |
@@ -681,6 +683,57 @@ todo_delete_keywords: list[str] = [
 | `KEY_ERROR_PREFIXES` | `['KEY_MISSING', 'KEY_INVALID']` | 密钥类错误前缀 |
 | `EXTRACTION_PHASE_MAP` | `{hooking, waiting_exit, waiting_login, hooking_restart}` | 提取阶段 → 提示文案 |
 | `BACKEND_UNREACHABLE` | 见下 | fetch 被 reject 时的提示: "本地后端未响应（127.0.0.1:7327）。请确认 webot 仍在运行；若已退出，请重新启动程序后再试。" |
+
+### 2.35 `src/media/` (媒体消息模块)
+
+`src/media/blob.py` — BLOB 消息体解码：
+
+| 函数 | 描述 | 参数 | 返回值 |
+|---|---|---|---|
+| `is_binary(msg)` | 判断消息体是否为 BLOB（`content_kind == "blob"`） | `msg: dict` | `bool` |
+| `decode_blob(raw)` | base64 → zstd → UTF-8 文本；非 zstd 时回退按文本解 | `raw: str` | `str \| None` |
+
+`src/media/appmsg.py` — appmsg/sysmsg XML 归约（纯文本处理，无网络/配置依赖）：
+
+| 函数 | 描述 | 参数 | 返回值 |
+|---|---|---|---|
+| `strip_sender_prefix(text)` | 去掉正文前的 `wxid_xxx:` / `xxx@chatroom:` 前缀 | `text: str` | `str` |
+| `looks_like_xml(text)` | 判断内容是否为标记而非聊天文本 | `text: str` | `bool` |
+| `reduce_appmsg(xml)` | appmsg → `"[链接] 标题"`；sysmsg → `None` | `xml: str` | `str \| None` |
+
+`src/media/emoji.py` — 表情图片定位与下载：
+
+| 函数 | 描述 | 参数 | 返回值 |
+|---|---|---|---|
+| `parse_emoji_xml(xml)` | 从表情 XML 取 `(md5, cdnurl)`（含 `&amp;` 反转义） | `xml: str` | `tuple[str\|None, str\|None]` |
+| `EmojiStore.__init__(wechat_data_dir, cache_dir)` | 初始化表情存取器 | `wechat_data_dir: str, cache_dir: Path` | `None` |
+| `EmojiStore.fetch(xml)` | 本地 `Persist/{md5[:2]}/{md5}`（仅当确为图片）优先，否则 CDN 下载 | `xml: str` | `Path \| None` |
+
+`src/media/vision.py` — 图片描述（OpenAI 兼容接口）：
+
+| 函数 | 描述 | 参数 | 返回值 |
+|---|---|---|---|
+| `detect_mime(data)` | 按魔数判断图片 MIME | `data: bytes` | `str \| None` |
+| `to_data_url(path)` | 读文件生成 `data:` URL；非图片/过大返回 None | `path: Path` | `str \| None` |
+| `VisionClient.__init__(api_key, model, base_url, disable_thinking)` | 初始化视觉客户端 | 见参数 | `None` |
+| `VisionClient.available` (property) | key 与 model 是否齐备 | 无 | `bool` |
+| `VisionClient.describe(image_path, prompt)` | 返回一句话中文描述 | `image_path: Path, prompt: str` | `str \| None` |
+
+`src/media/pipeline.py` — 统一入口：
+
+| 函数 | 描述 | 参数 | 返回值 |
+|---|---|---|---|
+| `MediaPipeline.__init__(config)` | 初始化媒体管道 | `config` | `None` |
+| `MediaPipeline.process(msg)` | 媒体消息 → 文本（占位符由调用方兜底） | `msg: dict` | `str \| None` |
+| `MediaPipeline.stats()` | 计数器快照 | 无 | `dict` |
+
+模块级常量：
+
+| 常量 | 值 | 说明 |
+|---|---|---|
+| `LOCAL_TYPE_IMAGE` | `3` | 图片（`.dat` 容器不可解，恒降级 `[图片]`） |
+| `LOCAL_TYPE_EMOJI` | `47` | 表情/贴纸 |
+| `LOCAL_TYPE_SYSTEM` | `10000` | 系统提示（加入/退出/撤回），直接丢弃 |
 
 ---
 
@@ -1669,6 +1722,77 @@ MacHybridBackend
 - hiddenimports 包含 `AppKit`, `Quartz`, `objc` 等 macOS 框架
 - excludes 排除 Windows 专用模块 (`uiautomation`, `win32api`, `comtypes` 等)
 - 权限声明: `NSAppleEventsUsageDescription` + `NSScreenCaptureUsageDescription`
+
+---
+
+### 功能L: 媒体消息（表情/图片/appmsg）
+
+#### 涉及文件
+
+| 文件 | 路径 | 角色 |
+|---|---|---|
+| `pipeline.py` | `src/media/pipeline.py` | 统一入口 (归约 + 表情视觉描述) |
+| `blob.py` | `src/media/blob.py` | BLOB 消息体解码 (base64 → zstd → 文本) |
+| `appmsg.py` | `src/media/appmsg.py` | appmsg/sysmsg XML → 一行文本 |
+| `emoji.py` | `src/media/emoji.py` | 表情图片定位 (本地 Persist / CDN 下载) |
+| `vision.py` | `src/media/vision.py` | 图片描述 (OpenAI 兼容接口) |
+
+#### 调用链
+
+```
+WcdbBackend._standardize(msg)
+  │
+  ├── is_binary(msg)?  → content = ""（base64 绝不进正文）
+  │
+  ├── localType == 34  → _try_voice()
+  │
+  ├── localType in {3,43,47,48,49}
+  │     └── _try_media(msg) or format_nontext_content(localType)
+  │           ├── 3  (图片)   → None → "[图片]"（.dat 容器不可解）
+  │           ├── 47 (表情)   → MediaPipeline._describe_emoji()
+  │           │     ├── EmojiStore.fetch(xml)
+  │           │     │     ├── 本地 {wxid}/business/emoticon/Persist/{md5[:2]}/{md5}
+  │           │     │     └── 否则 CDN 下载 cdnurl → data/emoji_cache/{md5}
+  │           │     └── VisionClient.describe(image) → "[表情] 猫在摇头"
+  │           └── 其他        → "[视频]" / "[链接]" 等占位符
+  │
+  └── 其他 BLOB（localType=1 文本、10000 系统、49-family appmsg）
+        └── _try_media(msg) or _blob_text(msg)
+              ├── appmsg XML  → "[链接] 标题"（reduce_appmsg）
+              ├── sysmsg XML  → None（丢弃）
+              └── 纯文本      → 原文（"哈哈哈哈哈哈哈"）
+```
+
+#### 各类型支持状态
+
+| localType | 类型 | 状态 | 产出 |
+|---|---|---|---|
+| 3 | 图片 | ❌ 不可解 | `[图片]` |
+| 47 | 表情/贴纸 | ✅ 可用 | `[表情] <视觉描述>` |
+| 49-family | 链接/文件/小程序/视频 | ✅ 可用 | `[链接] 标题` 等 |
+| 10000 | 系统提示 | — 丢弃 | 无 |
+| 1 | 文本（BLOB 存储） | ✅ 可用 | 原文 |
+
+图片不可解的三条实测结论（详见提交记录）：
+
+1. `.dat` 容器载荷长度对 16 取模均匀分布 → **不是分组密码**，AES 全矩阵 0 命中
+2. 消息自身 XML `aeskey` 定向解密 **0/5**
+3. CDN `cdnthumburl` 直连 **全部 HTTP 400**（filekey 需客户端签名）
+
+#### 关键参数
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `media_vision_enabled` | `False` | 视觉识别主开关；关闭时仍做文本归约 |
+| `media_vision_model` | `""` | 视觉模型覆盖；空 = 复用 `AI_BACKEND` 的模型 |
+
+#### 视觉后端支持
+
+| `AI_BACKEND` | 视觉 | 说明 |
+|---|---|---|
+| `deepseek` | ✅ | 自动关闭 thinking；`max_tokens` 需 ≥ 800 否则 `content` 为空 |
+| `openai` | ✅ | 走 `OPENAI_MODEL` |
+| `claude` | ❌ | 接口形状不同，跳过（表情降级 `[表情]`） |
 
 ---
 

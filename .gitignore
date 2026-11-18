@@ -65,6 +65,9 @@ tools/macos/chatlog/
 # Runtime status
 data/bot_status.json
 
+# Media cache (emoji images downloaded from the CDN at runtime)
+data/emoji_cache/
+
 # Runtime group name resolution (contains private chatroom IDs)
 data/group_names.json
 data/group_members.json
