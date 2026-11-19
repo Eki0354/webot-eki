@@ -718,11 +718,15 @@ def _build_handler(path: str, method: str = "GET", body: bytes = b"",
         f"{k}: {v}" for k, v in headers.items()
     )
     content_length = f"Content-Length: {len(body)}\r\n" if body else ""
+    # Only the header block carries a trailing CRLF; the blank line that ends
+    # the headers is the one below.  Emitting both when ``headers`` is empty
+    # made the body start with "\r\n" and every POST body failed to parse.
+    header_block = f"{header_lines}\r\n" if header_lines else ""
     raw = (
         f"{method} {path} HTTP/1.1\r\n"
         f"Host: localhost\r\n"
         f"{content_length}"
-        f"{header_lines}\r\n"
+        f"{header_block}"
         f"\r\n"
     ).encode() + body
 
@@ -2141,6 +2145,162 @@ class OnboardingApiTests(unittest.TestCase):
                 parts = sock.get_response_text().split("\r\n\r\n", 1)
                 result = json.loads(parts[1])
                 self.assertTrue(result["ok"])
+
+
+# ---------------------------------------------------------------------------
+# AI service profile endpoints
+# ---------------------------------------------------------------------------
+
+
+class AiProfileEndpointTests(unittest.TestCase):
+    """Tests for /api/ai-profiles*, /api/ai-presets and /api/ai-models/fetch."""
+
+    def setUp(self):
+        import src.ai_profiles as profiles_mod
+        self.tmp = Path(tempfile.mkdtemp())
+        self.env_path = self.tmp / ".env"
+        self.env_path.write_text(
+            "AI_BACKEND=deepseek\n"
+            "DEEPSEEK_API_KEY=sk-deepseek-secret-123456\n"
+            "DEEPSEEK_BASE_URL=https://api.deepseek.com\n"
+            "DEEPSEEK_MODEL=deepseek-v4-flash\n",
+            encoding="utf-8",
+        )
+        self._orig_store = profiles_mod._store
+        profiles_mod._store = profiles_mod.AiProfileStore(self.tmp / "ai_profiles.json")
+        self._patches = [
+            patch("src.web.server._find_or_create_env", return_value=self.env_path),
+            patch("src.config.apply_env_file"),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        import src.ai_profiles as profiles_mod
+        profiles_mod._store = self._orig_store
+
+    def _request(self, path, payload=None, method="GET"):
+        body = b""
+        if payload is not None:
+            body = json.dumps(payload).encode()
+            method = "POST"
+        handler, sock = _build_handler(path, method=method, body=body)
+        return json.loads(sock.get_response_text().split("\r\n\r\n", 1)[1])
+
+    def test_listing_seeds_from_env_and_masks_the_key(self):
+        body = self._request("/api/ai-profiles")
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["active"], "default")
+        self.assertNotIn("sk-deepseek-secret-123456", json.dumps(body))
+        self.assertEqual(body["profiles"][0]["model"], "deepseek-v4-flash")
+        self.assertTrue(body["presets"])
+
+    def test_presets_endpoint_does_not_touch_the_store(self):
+        body = self._request("/api/ai-presets")
+        self.assertTrue(body["ok"])
+        self.assertTrue(any(p["id"] == "glm" for p in body["presets"]))
+        # Read-only: no side effect on disk.
+        self.assertFalse((self.tmp / "ai_profiles.json").exists())
+
+    def test_create_then_activate_rewrites_env(self):
+        created = self._request("/api/ai-profiles", {
+            "name": "GLM", "service": "glm", "backend": "openai",
+            "base_url": "https://open.bigmodel.cn/api/paas/v4/",
+            "model": "glm-4-flash", "api_key": "glm-key-1234567890",
+        })
+        self.assertTrue(created["ok"])
+        pid = created["profile"]["id"]
+
+        activated = self._request("/api/ai-profiles/activate", {"id": pid})
+        self.assertTrue(activated["ok"])
+        written = self.env_path.read_text(encoding="utf-8")
+        self.assertIn("AI_BACKEND=openai", written)
+        self.assertIn("OPENAI_MODEL=glm-4-flash", written)
+        self.assertEqual(self._request("/api/ai-profiles")["active"], pid)
+
+    def test_delete_refuses_the_active_profile(self):
+        body = self._request("/api/ai-profiles/delete", {"id": "default"})
+        self.assertFalse(body["ok"])
+        self.assertIn("正在使用", body["error"])
+
+    def test_activation_of_unknown_id_returns_json_error(self):
+        body = self._request("/api/ai-profiles/activate", {"id": "nope"})
+        self.assertFalse(body["ok"])
+        self.assertIn("nope", body["error"])
+
+    def test_model_fetch_resolves_a_masked_key_from_the_store(self):
+        created = self._request("/api/ai-profiles", {
+            "name": "relay", "service": "custom", "backend": "openai",
+            "base_url": "https://relay.example.com/v1",
+            "model": "alias", "api_key": "sk-relay-real-123456",
+        })
+        pid = created["profile"]["id"]
+        masked = created["profile"]["api_key"]
+        self.assertIn("***", masked)
+
+        with patch("src.web.server._fetch_model_ids",
+                   return_value=["alias-a", "alias-b"]) as fetch:
+            body = self._request("/api/ai-models/fetch", {
+                "id": pid, "base_url": "https://relay.example.com/v1",
+                "api_key": masked,
+            })
+
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["models"], ["alias-a", "alias-b"])
+        # The masked form value must be replaced by the stored secret.
+        self.assertEqual(fetch.call_args[0][1], "sk-relay-real-123456")
+
+    def test_model_fetch_surfaces_provider_errors(self):
+        with patch("src.web.server._fetch_model_ids",
+                   side_effect=ValueError("请先填写 API Key")):
+            body = self._request("/api/ai-models/fetch",
+                                 {"base_url": "https://x.invalid/v1", "api_key": ""})
+        self.assertFalse(body["ok"])
+        self.assertIn("API Key", body["error"])
+
+
+class AiConfigSaveSyncTests(unittest.TestCase):
+    """POST /api/config must keep the active profile in step with .env."""
+
+    def test_settings_page_edit_updates_the_active_profile(self):
+        import src.ai_profiles as profiles_mod
+
+        tmp = Path(tempfile.mkdtemp())
+        env_path = tmp / ".env"
+        env_path.write_text(
+            "AI_BACKEND=deepseek\n"
+            "DEEPSEEK_API_KEY=sk-deepseek-secret-123456\n"
+            "DEEPSEEK_BASE_URL=https://api.deepseek.com\n"
+            "DEEPSEEK_MODEL=deepseek-v4-flash\n",
+            encoding="utf-8",
+        )
+        original = profiles_mod._store
+        store = profiles_mod.AiProfileStore(tmp / "ai_profiles.json")
+        profiles_mod._store = store
+        try:
+            store.snapshot()
+            payload = json.dumps({
+                "ai_backend": "deepseek",
+                "deepseek_api_key": "sk-deepseek-secret-123456",
+                "deepseek_base_url": "https://api.deepseek.com",
+                "deepseek_model": "deepseek-v4-pro",
+            }).encode()
+            with (
+                patch("src.web.server._find_or_create_env", return_value=env_path),
+                patch("src.config.apply_env_file"),
+            ):
+                handler, sock = _build_handler(
+                    "/api/config", method="POST", body=payload
+                )
+                body = json.loads(sock.get_response_text().split("\r\n\r\n", 1)[1])
+
+            self.assertTrue(body["ok"])
+            # Switching away and back must not revert the edit.
+            self.assertEqual(store.active_profile()["model"], "deepseek-v4-pro")
+        finally:
+            profiles_mod._store = original
 
 
 # ---------------------------------------------------------------------------

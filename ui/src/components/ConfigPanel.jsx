@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { CheckCircle, Warning, FloppyDisk, Info, DownloadSimple, UploadSimple } from '@phosphor-icons/react'
-import { Field, Toggle, Select, Input } from './SharedComponents'
+import { CheckCircle, Warning, FloppyDisk, Info, DownloadSimple, UploadSimple, Trash, Lightning, ArrowClockwise } from '@phosphor-icons/react'
+import { Field, Toggle, Select, Input, Combobox } from './SharedComponents'
 import LotsEditor from './LotsEditor'
 
 const pageTransition = {
@@ -29,64 +29,377 @@ function TypewriterText({ text, speed = 15 }) {
   return <span>{displayedText}</span>
 }
 
-function AiSection({ form, update }) {
-  const isDeepSeek = form.ai_backend === 'deepseek'
-  const isOpenAI = form.ai_backend === 'openai'
+const WEBOT_API = 'http://127.0.0.1:7327'
+
+// Which .env-backed form fields carry each backend's credentials.
+const PROVIDER_FIELDS = {
+  deepseek: { key: 'deepseek_api_key', base: 'deepseek_base_url', model: 'deepseek_model' },
+  openai: { key: 'openai_api_key', base: 'openai_base_url', model: 'openai_model' },
+  claude: { key: 'anthropic_api_key', base: 'anthropic_base_url', model: 'summarize_model' },
+}
+
+function AiSection({ update }) {
+  const [profiles, setProfiles] = useState([])
+  const [presets, setPresets] = useState([])
+  const [activeId, setActiveId] = useState('')
+  const [draft, setDraft] = useState(null)
+  const [note, setNote] = useState(null)      // { kind: 'ok' | 'err', text }
+  const [busy, setBusy] = useState('')
+  const [fetchedModels, setFetchedModels] = useState([])
+
+  // Mirror a profile into the parent form, so the page-wide "保存配置"
+  // button writes the same values .env will get from "启用此配置".
+  //
+  // Only the *active* profile may do this.  The page-wide save writes .env
+  // directly, so mirroring an unsaved/inactive draft would let "browse a
+  // profile, then hit 保存配置" overwrite the live key — including with an
+  // empty one if that draft has no key yet.
+  function syncForm(profile, active = activeId) {
+    if (!profile) return
+    if (!profile.id || profile.id !== active) return
+    const fields = PROVIDER_FIELDS[profile.backend] || PROVIDER_FIELDS.openai
+    update('ai_backend', profile.backend)
+    update(fields.key, profile.api_key || '')
+    update(fields.base, profile.base_url || '')
+    update(fields.model, profile.model || '')
+  }
+
+  async function loadProfiles(selectId) {
+    try {
+      const res = await fetch(`${WEBOT_API}/api/ai-profiles`)
+      const data = await res.json()
+      if (!data.ok) throw new Error(data.error || '加载失败')
+      const list = data.profiles || []
+      setProfiles(list)
+      setPresets(data.presets || [])
+      const target = list.find(p => p.id === (selectId || data.active)) || list[0]
+      if (target) {
+        setActiveId(data.active)
+        setDraft({ ...target })
+        setFetchedModels([])
+        // Pass the freshly loaded active id explicitly: setActiveId above is
+        // async, so the default parameter would still read the old value.
+        syncForm(target, data.active)
+      }
+    } catch (e) {
+      setNote({ kind: 'err', text: `读取配置列表失败：${e.message}` })
+    }
+  }
+
+  useEffect(() => { loadProfiles() }, [])
+
+  function edit(patch) {
+    setDraft(prev => {
+      const next = { ...prev, ...patch }
+      // Switching service carries its canonical base URL and first model
+      // along, so the common case is "pick provider → it just works".
+      if (patch.service) {
+        const preset = presets.find(p => p.id === patch.service)
+        if (preset) {
+          next.backend = preset.backend
+          if (!preset.base_url) next.base_url = ''
+          else next.base_url = preset.base_url
+          const first = (preset.models || [])[0]
+          next.model = first ? first.id : ''
+        }
+      }
+      syncForm(next)
+      return next
+    })
+    setNote(null)
+  }
+
+  const preset = presets.find(p => p.id === (draft?.service || '')) || null
+  const modelOptions = (fetchedModels.length ? fetchedModels.map(id => ({ value: id }))
+    : (preset?.models || []).map(m => ({ value: m.id, desc: m.desc, hint: m.hint })))
+  const isCustomService = draft?.service === 'custom' || draft?.service === 'ollama'
+
+  async function handleSaveProfile() {
+    if (!draft) return null
+    setBusy('save')
+    setNote(null)
+    try {
+      const res = await fetch(`${WEBOT_API}/api/ai-profiles`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: draft.id,
+          name: (draft.name || '').trim() || preset?.label || '未命名配置',
+          service: draft.service,
+          backend: draft.backend,
+          base_url: draft.base_url,
+          model: draft.model,
+          api_key: draft.api_key,
+        }),
+      })
+      const data = await res.json()
+      if (!data.ok) throw new Error(data.error || '保存失败')
+      await loadProfiles(data.profile.id)
+      setNote({ kind: 'ok', text: '配置已保存' })
+      return data.profile
+    } catch (e) {
+      setNote({ kind: 'err', text: e.message })
+      return null
+    } finally {
+      setBusy('')
+    }
+  }
+
+  async function handleActivate() {
+    setBusy('activate')
+    setNote(null)
+    try {
+      // A brand-new profile needs an id before it can be activated.
+      let profileId = draft?.id
+      if (!profileId) {
+        const saved = await handleSaveProfile()
+        if (!saved) return
+        profileId = saved.id
+      }
+      const res = await fetch(`${WEBOT_API}/api/ai-profiles/activate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: profileId }),
+      })
+      const data = await res.json()
+      if (!data.ok) throw new Error(data.error || '启用失败')
+      setActiveId(profileId)
+      setNote({ kind: 'ok', text: '已启用，重启机器人后生效' })
+    } catch (e) {
+      setNote({ kind: 'err', text: e.message })
+    } finally {
+      setBusy('')
+    }
+  }
+
+  async function handleDelete() {
+    if (!draft?.id) return
+    setBusy('delete')
+    setNote(null)
+    try {
+      const res = await fetch(`${WEBOT_API}/api/ai-profiles/delete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: draft.id }),
+      })
+      const data = await res.json()
+      if (!data.ok) throw new Error(data.error || '删除失败')
+      await loadProfiles()
+      setNote({ kind: 'ok', text: '已删除' })
+    } catch (e) {
+      setNote({ kind: 'err', text: e.message })
+    } finally {
+      setBusy('')
+    }
+  }
+
+  async function handleFetchModels() {
+    if (!draft) return
+    setBusy('fetch')
+    setNote(null)
+    try {
+      const res = await fetch(`${WEBOT_API}/api/ai-models/fetch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: draft.id,
+          backend: draft.backend,
+          base_url: draft.base_url,
+          api_key: draft.api_key,
+        }),
+      })
+      const data = await res.json()
+      if (!data.ok) throw new Error(data.error || '拉取失败')
+      setFetchedModels(data.models || [])
+      setNote({ kind: 'ok', text: `已拉取 ${data.models.length} 个模型` })
+    } catch (e) {
+      setNote({ kind: 'err', text: `拉取失败：${e.message}` })
+    } finally {
+      setBusy('')
+    }
+  }
+
+  if (!draft) {
+    return (
+      <div className="text-sm text-text-muted py-6">正在读取 AI 配置…</div>
+    )
+  }
 
   return (
     <div>
-      <Field label="AI 服务商" hint="推荐使用 DeepSeek，中文群聊效果更好；OpenAI 兼容支持 GLM / Moonshot 等">
-        <Select value={form.ai_backend} onChange={v => update('ai_backend', v)} options={[
-          { value: 'deepseek', desc: 'DeepSeek', hint: '推荐 · 中文效果好' },
-          { value: 'openai', desc: 'OpenAI 兼容', hint: 'OpenAI / GLM / Moonshot 等' },
-          { value: 'claude', desc: 'Claude', hint: 'Anthropic' },
-        ]} />
+      {/* ── Saved profiles ──────────────────────────────────────── */}
+      <Field
+        label="已保存的 AI 配置"
+        hint="可保存多套「服务商 + 密钥 + 模型」，随时切换；只有「启用」的那套会写入 .env 生效"
+      >
+        <div className="flex flex-col sm:flex-row gap-2.5">
+          <div className="flex-1 min-w-0">
+            <Select
+              value={draft.id || '__new__'}
+              onChange={v => {
+                if (v === '__new__') {
+                  const first = presets[0] || null
+                  const fresh = {
+                    id: '', name: '新配置', service: first?.id || 'custom',
+                    backend: first?.backend || 'openai',
+                    base_url: first?.base_url || '', model: first?.models?.[0]?.id || '',
+                    api_key: '',
+                  }
+                  setDraft(fresh); setFetchedModels([]); syncForm(fresh); setNote(null)
+                  return
+                }
+                const picked = profiles.find(p => p.id === v)
+                if (picked) { setDraft({ ...picked }); setFetchedModels([]); syncForm(picked); setNote(null) }
+              }}
+              options={[
+                ...profiles.map(p => ({
+                  value: p.id,
+                  desc: p.name,
+                  hint: `${p.backend} · ${p.model}${p.id === activeId ? ' · 使用中' : ''}`,
+                })),
+                { value: '__new__', desc: '+ 新建配置', hint: '从服务商预设开始' },
+              ]}
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleActivate}
+              disabled={busy !== ''}
+              className="px-4 py-2.5 rounded-full text-[13px] font-semibold border border-border-main bg-bg-main
+                         hover:bg-bg-raised hover:border-text-muted/30 transition-all cursor-pointer
+                         flex items-center gap-1.5 disabled:opacity-50 whitespace-nowrap"
+            >
+              <Lightning size={14} /> 启用此配置
+            </button>
+            <button
+              type="button"
+              onClick={handleDelete}
+              disabled={busy !== '' || !draft.id}
+              title={draft.id === activeId ? '使用中的配置不能删除' : '删除此配置'}
+              className="px-3 py-2.5 rounded-full text-[13px] font-semibold border border-border-main bg-bg-main
+                         hover:border-[#d45656]/40 hover:text-[#d45656] transition-all cursor-pointer
+                         disabled:opacity-40 flex items-center gap-1.5"
+            >
+              <Trash size={14} />
+            </button>
+          </div>
+        </div>
+        {draft.id === activeId && (
+          <p className="text-xs text-brand-green-hover dark:text-brand-green mt-1.5 flex items-center gap-1">
+            <CheckCircle size={12} weight="fill" /> 这套配置正在使用中
+          </p>
+        )}
       </Field>
 
-      {isDeepSeek ? (
-        <>
-          <Field label="DeepSeek API Key" hint="在 platform.deepseek.com/api_keys 免费注册获取" error={!form.deepseek_api_key ? '请填写 API Key' : null}>
-            <Input type="password" value={form.deepseek_api_key} onChange={v => update('deepseek_api_key', v)} placeholder="sk-xxxxxxxxxxxxxxxx" />
-          </Field>
-          <Field label="API Base URL" hint="兼容 OpenAI 的转发地址；留默认值使用官方 API">
-            <Input value={form.deepseek_base_url} onChange={v => update('deepseek_base_url', v)} placeholder="https://api.deepseek.com" />
-          </Field>
-          <Field label="DeepSeek 模型选择">
-            <Select value={form.deepseek_model} onChange={v => update('deepseek_model', v)} options={[
-              { value: 'deepseek-v4-flash', desc: 'DeepSeek-V4-Flash', hint: '¥1 输入 · ¥2 输出 /M' },
-              { value: 'deepseek-v4-pro',   desc: 'DeepSeek-V4-Pro',   hint: '¥3 输入 · ¥6 输出 /M' },
-            ]} />
-          </Field>
-        </>
-      ) : isOpenAI ? (
-        <>
-          <Field label="OpenAI API Key" hint="OpenAI / GLM / Moonshot 等服务商的 API Key" error={!form.openai_api_key ? '请填写 API Key' : null}>
-            <Input type="password" value={form.openai_api_key} onChange={v => update('openai_api_key', v)} placeholder="sk-xxxxxxxxxxxxxxxx" />
-          </Field>
-          <Field label="API Base URL" hint="GLM 填 https://open.bigmodel.cn/api/paas/v4/；OpenAI 官方填 https://api.openai.com/v1">
-            <Input value={form.openai_base_url} onChange={v => update('openai_base_url', v)} placeholder="https://api.openai.com/v1" />
-          </Field>
-          <Field label="模型名" hint="填写服务商提供的模型名，如 glm-4-flash / gpt-4o-mini">
-            <Input value={form.openai_model} onChange={v => update('openai_model', v)} placeholder="gpt-4o-mini" />
-          </Field>
-        </>
-      ) : (
-        <>
-          <Field label="Anthropic API Key" hint="在 console.anthropic.com 获取" error={!form.anthropic_api_key ? '请填写 API Key' : null}>
-            <Input type="password" value={form.anthropic_api_key} onChange={v => update('anthropic_api_key', v)} placeholder="sk-ant-xxxxxxxxxxxxxxxx" />
-          </Field>
-          <Field label="API Base URL" hint="Anthropic API 地址；可填兼容代理或中转服务">
-            <Input value={form.anthropic_base_url} onChange={v => update('anthropic_base_url', v)} placeholder="https://api.anthropic.com" />
-          </Field>
-          <Field label="Claude 模型选择">
-            <Select value={form.summarize_model} onChange={v => update('summarize_model', v)} options={[
-              { value: 'claude-haiku-4-5-20251001', desc: 'Haiku 4.5', hint: '快速 · 低成本' },
-              { value: 'claude-sonnet-4-6', desc: 'Sonnet 4.6', hint: '高质量 · 推荐' },
-            ]} />
-          </Field>
-        </>
-      )}
+      {/* ── Service preset ──────────────────────────────────────── */}
+      <Field
+        label="服务商"
+        hint="选预设会自动填好 Base URL 与模型清单；选「自定义」可对接任意 OpenAI 兼容中转站"
+      >
+        <Select
+          value={draft.service || 'custom'}
+          onChange={v => edit({ service: v })}
+          options={presets.map(p => ({
+            value: p.id,
+            desc: p.label,
+            hint: p.backend === 'claude' ? 'Anthropic 原生协议' : 'OpenAI 兼容协议',
+          }))}
+        />
+      </Field>
 
+      <Field
+        label="配置名称"
+        hint="仅用于在列表里区分，可随意命名"
+      >
+        <Input
+          value={draft.name || ''}
+          onChange={v => edit({ name: v })}
+          placeholder={preset?.label || '例如：日常总结（便宜）'}
+        />
+      </Field>
+
+      <Field
+        label="API Key"
+        hint={draft.api_key && draft.api_key.includes('***')
+          ? '已保存密钥（显示为掩码）。不改动则保留原密钥，修改后保存即覆盖'
+          : (preset?.key_hint || '填写服务商提供的 API Key')}
+        error={!draft.api_key ? '请填写 API Key' : null}
+      >
+        <Input
+          type="password"
+          value={draft.api_key || ''}
+          onChange={v => edit({ api_key: v })}
+          placeholder="sk-xxxxxxxxxxxxxxxx"
+        />
+      </Field>
+
+      <Field
+        label="API Base URL"
+        hint={isCustomService
+          ? '填写完整地址；多数服务要求以 /v1 结尾（如 http://127.0.0.1:11434/v1）'
+          : '留预设值即可；使用中转/代理时改成对应的地址'}
+      >
+        <Input
+          value={draft.base_url || ''}
+          onChange={v => edit({ base_url: v })}
+          placeholder={preset?.base_url || 'https://api.example.com/v1'}
+        />
+      </Field>
+
+      <Field
+        label="模型名"
+        hint="可从下拉里点选，也能直接手填——服务商新出的模型或中转站自定义别名都可以"
+      >
+        <Combobox
+          value={draft.model || ''}
+          onChange={v => edit({ model: v })}
+          options={modelOptions}
+          placeholder={modelOptions[0]?.value || '例如：gpt-4o-mini'}
+        />
+      </Field>
+
+      <div className="flex items-center gap-2.5 mb-5 -mt-1">
+        <button
+          type="button"
+          onClick={handleFetchModels}
+          disabled={busy !== ''}
+          className="px-3.5 py-2 rounded-full text-[12px] font-semibold border border-border-main bg-bg-main
+                     hover:bg-bg-raised hover:border-text-muted/30 transition-all cursor-pointer
+                     flex items-center gap-1.5 disabled:opacity-50"
+        >
+          <ArrowClockwise size={13} className={busy === 'fetch' ? 'animate-spin' : ''} />
+          从服务商拉取模型清单
+        </button>
+        <span className="text-[11px] text-text-muted/80">
+          可选 · 需要有效密钥；失败时用上面的内置清单
+        </span>
+      </div>
+
+      <div className="flex items-center gap-3 pt-1">
+        <button
+          type="button"
+          onClick={handleSaveProfile}
+          disabled={busy !== ''}
+          className="px-5 py-2.5 rounded-full text-[13px] font-semibold
+                     bg-[#0d0d0d] dark:bg-white text-white dark:text-[#0d0d0d]
+                     border border-[#0d0d0d] dark:border-border-main
+                     hover:opacity-90 transition-all cursor-pointer flex items-center gap-1.5
+                     disabled:opacity-50"
+        >
+          {busy === 'save' ? <ArrowClockwise size={14} className="animate-spin" /> : <FloppyDisk size={14} />}
+          保存此配置
+        </button>
+        {note && (
+          <span className={`text-xs px-3.5 py-1.5 rounded-full border font-medium ${
+            note.kind === 'ok'
+              ? 'text-brand-green-hover dark:text-brand-green bg-brand-green-light border-brand-green/20'
+              : 'text-[#d45656] bg-[#d45656]/5 border-[#d45656]/20'
+          }`}>
+            {note.text}
+          </span>
+        )}
+      </div>
     </div>
   )
 }
@@ -2126,7 +2439,7 @@ export default function ConfigPanel({ activeSection, onNavigate }) {
             </div>
             <div className="bg-bg-card border border-border-main rounded-2xl shadow-[rgba(0,0,0,0.03)_0px_2px_4px] dark:shadow-none">
               <div className="p-7">
-                {activeSection === 'ai' && <AiSection form={form} update={update} />}
+                {activeSection === 'ai' && <AiSection update={update} />}
                 {activeSection === 'voice' && <VoiceSection form={form} update={update} />}
                 {activeSection === 'identity' && <IdentitySection form={form} update={update} />}
                 {activeSection === 'data' && <DataPathSection form={form} update={update} detectedDataDir={detectedDataDir} />}

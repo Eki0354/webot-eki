@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { motion } from 'framer-motion'
 import { CheckCircle, ArrowRight, Spinner, XCircle, Warning } from '@phosphor-icons/react'
-import { Field, Toggle, Select, Input, spring } from './SharedComponents'
+import { Field, Toggle, Select, Input, Combobox, spring } from './SharedComponents'
 
 const API = 'http://127.0.0.1:7327'
 
@@ -534,10 +534,31 @@ export function Step2WeChatConfig({ data, updateData, onDone }) {
 
 export function Step3AIConfig({ data, updateData, onDone }) {
   const [busy, setBusy] = useState(false)
+  const [presets, setPresets] = useState([])
   const isDeepSeek = data.ai_backend === 'deepseek'
   const isOpenAI = data.ai_backend === 'openai'
   const apiKey = isDeepSeek ? data.deepseek_api_key : isOpenAI ? data.openai_api_key : data.anthropic_api_key
   const valid = (apiKey || '').trim().length >= 10
+
+  // Model shortcuts come from the same preset table the settings page uses,
+  // so the two pages cannot drift apart as providers ship new models.
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const res = await fetch(`${API}/api/ai-presets`)
+        const body = await res.json()
+        if (!cancelled && body.ok) setPresets(body.presets || [])
+      } catch { /* offline: fall back to the hard-coded options below */ }
+    })()
+    return () => { cancelled = true }
+  }, [])
+
+  function modelOptions(serviceId, fallback) {
+    const preset = presets.find(p => p.id === serviceId)
+    const list = preset?.models || []
+    return list.length ? list.map(m => ({ value: m.id, desc: m.desc, hint: m.hint })) : fallback
+  }
 
   async function handleNext() {
     setBusy(true)
@@ -588,11 +609,15 @@ export function Step3AIConfig({ data, updateData, onDone }) {
             <Field label="API Base URL" hint="兼容 OpenAI 的转发地址；留默认值使用官方 API">
               <Input value={data.deepseek_base_url || 'https://api.deepseek.com'} onChange={v => updateData({ deepseek_base_url: v })} placeholder="https://api.deepseek.com" />
             </Field>
-            <Field label="模型选择">
-              <Select value={data.deepseek_model || 'deepseek-v4-flash'} onChange={v => updateData({ deepseek_model: v })} options={[
-                { value: 'deepseek-v4-flash', desc: 'V4 Flash', hint: '极速 · 极低费用' },
-                { value: 'deepseek-v4-pro', desc: 'V4 Pro', hint: '百万上下文 · 旗舰版' },
-              ]} />
+            <Field label="模型选择" hint="可从清单点选，也能直接手填服务商的新模型名">
+              <Combobox
+                value={data.deepseek_model || 'deepseek-v4-flash'}
+                onChange={v => updateData({ deepseek_model: v })}
+                options={modelOptions('deepseek', [
+                  { value: 'deepseek-v4-flash', desc: 'V4 Flash', hint: '极速 · 极低费用' },
+                  { value: 'deepseek-v4-pro', desc: 'V4 Pro', hint: '百万上下文 · 旗舰版' },
+                ])}
+              />
             </Field>
           </>
         ) : isOpenAI ? (
@@ -615,11 +640,15 @@ export function Step3AIConfig({ data, updateData, onDone }) {
             <Field label="API Base URL" hint="Anthropic API 地址；可填兼容代理或中转服务">
               <Input value={data.anthropic_base_url || 'https://api.anthropic.com'} onChange={v => updateData({ anthropic_base_url: v })} placeholder="https://api.anthropic.com" />
             </Field>
-            <Field label="模型选择">
-              <Select value={data.summarize_model || 'claude-haiku-4-5-20251001'} onChange={v => updateData({ summarize_model: v })} options={[
-                { value: 'claude-haiku-4-5-20251001', desc: 'Haiku 4.5', hint: '快速 · 低成本' },
-                { value: 'claude-sonnet-4-6', desc: 'Sonnet 4.6', hint: '高质量 · 推荐' },
-              ]} />
+            <Field label="模型选择" hint="可从清单点选，也能直接手填服务商的新模型名">
+              <Combobox
+                value={data.summarize_model || 'claude-haiku-4-5-20251001'}
+                onChange={v => updateData({ summarize_model: v })}
+                options={modelOptions('claude', [
+                  { value: 'claude-haiku-4-5-20251001', desc: 'Haiku 4.5', hint: '快速 · 低成本' },
+                  { value: 'claude-sonnet-4-6', desc: 'Sonnet 4.6', hint: '高质量 · 推荐' },
+                ])}
+              />
             </Field>
           </>
         )}

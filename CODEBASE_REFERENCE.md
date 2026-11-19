@@ -181,6 +181,11 @@ grep "文件名" CODEBASE_REFERENCE.md
 | `MIN_WINDOW_WIDTH` / `MIN_WINDOW_HEIGHT` | `int` | `200` | `src/wechat/window_controller.py` | 窗口最小尺寸验证 |
 | `MSG_TYPE_MAP` | `dict` | 见代码 | `src/wechat/helpers.py` | 消息类型映射表 |
 | `DEFAULT_NICKNAME_PATH` | `Path` | `data/nicknames.json` | `src/nickname.py` | 昵称映射文件路径 |
+| `DEFAULT_PROFILES_PATH` | `Path` | `data/ai_profiles.json` | `src/ai_profiles.py` | AI 服务商配置档案存储路径（含明文密钥，已被 .gitignore 忽略） |
+| `BACKENDS` | `tuple` | `("deepseek", "openai", "claude")` | `src/ai_profiles.py` | `AI_BACKEND` 允许的取值；档案里的 `backend` 不在其中时归一为 `openai` |
+| `SERVICE_PRESETS` | `list[dict]` | 见代码 | `src/ai_profiles.py` | 内置服务商预设（DeepSeek / OpenAI / GLM / Moonshot / Qwen / Ollama / Claude / 自定义），驱动 UI 的服务商下拉与离线模型清单 |
+| `PROVIDER_ENV_KEYS` | `dict` | 见代码 | `src/ai_profiles.py` | backend → `.env` 键名映射（`api_key`/`base_url`/`model` + 默认值），激活档案时据此写回 |
+| `MASK_MARK` | `str` | `"***"` | `src/ai_profiles.py` | 密钥掩码标记；回传含此标记表示"密钥未改动" |
 | `DEFAULT_WELCOME_CONFIG_PATH` | `Path` | `data/welcome_templates.json` | `src/welcome.py` | 欢迎模板文件路径 |
 | `HEX_KEY_LEN` | `int` | `64` | `src/wechat/mac_weflow_client.py` | WCDB 密钥长度 |
 | `_CACHE_MAX_ENTRIES` | `int` | `10000` | `src/voice/pipeline.py` | 语音缓存最大条目 |
@@ -641,6 +646,7 @@ todo_delete_keywords: list[str] = [
 | `_recv_exactly(sock, n)` | 精确接收 n 字节 | `sock, n: int` | `bytes \| None` |
 | `_find_or_create_env()` | 查找或创建 .env 文件(统一写到 resolve_env_file() 权威路径) | 无 | `Path` |
 | `_read_env_map(env_path)` | 把 .env 解析成 key→value 字典(忽略注释) | `env_path` | `dict[str, str]` |
+| `_fetch_model_ids(base_url, api_key, timeout=10.0)` | 向 OpenAI 兼容端点的 `GET /models` 拉模型 ID 列表并排序去重；供「从服务商拉取」按钮使用，Base URL 为空 / 无 key / 返回体无法识别 / 列表为空时抛 `ValueError` | `base_url: str, api_key: str, timeout: float` | `list[str]` |
 | `_reseed_onboarding_from_env(env_path)` | 密钥重提取后, 从现有 .env 回填非密钥引导字段(调用方须持有 `_onboarding_lock`) | `env_path` | `None` |
 | `_detect_wxid_and_db_path()` | 自动检测微信 wxid 和数据库路径 | 无 | `tuple[str \| None, str \| None]` |
 | `_set_env_key(env_path, key, value)` | 设置单个 .env 键值(经 `config.write_env_file()` 落盘, 兼容 UNC / 共享文件夹) | `env_path: Path, key: str, value: str` | `None` |
@@ -674,6 +680,8 @@ todo_delete_keywords: list[str] = [
 | `Dashboard.jsx` | `LiveIndicator` | 实时状态指示灯(脉冲动画) |
 | `Dashboard.jsx` | `KeyExtractionBanner` | 内联密钥提取横幅(单文件内组件); 按 `KEY_MISSING`/`KEY_INVALID` 区分标题, 轮询 step1-status |
 | `LogViewer.jsx` | `LogViewer` | 实时日志查看器(过滤/搜索/高亮) |
+| `ConfigPanel.jsx` | `AiSection` | AI 配置分栏: 多套 profile 选择/新建/保存/启用/删除、服务商预设联动、模型名 Combobox、从服务商拉取模型清单 |
+| `SharedComponents.jsx` | `Combobox` | 文本框 + 建议下拉: 允许自由输入, 列表只是快捷方式(服务商新模型 / 中转站自定义别名都能直接填) |
 
 `Dashboard.jsx` 内联辅助函数（非组件）：
 
@@ -801,6 +809,39 @@ todo_delete_keywords: list[str] = [
 | `LOCAL_TYPE_EMOJI` | `47` | 表情/贴纸 |
 | `LOCAL_TYPE_SYSTEM` | `10000` | 系统提示（加入/退出/撤回），直接丢弃 |
 
+### 2.36 `src/ai_profiles.py` (多套 AI 配置档案)
+
+模块级函数：
+
+| 函数 | 描述 | 参数 | 返回值 |
+|---|---|---|---|
+| `preset_for(service_id)` | 按 id 查内置服务商预设 | `service_id: str` | `dict \| None` |
+| `preset_for_base_url(base_url)` | 按 base URL 反查预设（容忍结尾斜杠），用于从 `.env` 迁移来的无 `service` 档案 | `base_url: str` | `dict \| None` |
+| `mask_key(value)` | 掩码密钥: 前 4 + `***` + 后 4；长度 ≤ 8 时整体 `***` | `value: str` | `str` |
+| `is_masked(value)` | 判断是否掩码值（含 `***`） | `value` | `bool` |
+| `_normalize_profile(raw)` | 归一化单条档案（非法 backend → `openai`，缺失 service/base_url/model 按预设补齐，生成 id） | `raw: dict` | `dict` |
+| `profile_from_env(env_raw)` | 用当前 `.env` 值构造 id 为 `default` 的档案（首次打开列表时播种） | `env_raw: dict[str, str]` | `dict` |
+| `_public(profile)` | 对外形状：`api_key` 掩码 + `has_api_key` 布尔 | `profile: dict` | `dict` |
+| `_read_env_map(env_path)` | 把 `.env` 解析成 key→value（忽略注释与空行） | `env_path` | `dict[str, str]` |
+| `_write_env_updates(env_path, updates)` | 只改写/追加指定键，经 `config.write_env_file()` 落盘（保留其他行） | `env_path: Path, updates: dict[str, str]` | `None` |
+| `get_ai_profile_store()` | 返回进程级单例 `AiProfileStore` | 无 | `AiProfileStore` |
+
+`AiProfileStore` 方法：
+
+| 方法 | 描述 | 参数 | 返回值 |
+|---|---|---|---|
+| `AiProfileStore(path=DEFAULT_PROFILES_PATH)` | 初始化（无缓存，每次读盘，避免"改了但界面还是旧值"） | `path: Path \| str` | `None` |
+| `_load_raw()` | 读盘并归一化；文件缺失/损坏时返回空结构并记日志 | 无 | `dict` |
+| `_save_raw(data)` | 原子写（先写 `.tmp` 再 replace） | `data: dict` | `None` |
+| `_seed_if_empty(data, env_raw)` | 空库时从 `.env` 播种 `default` 档案（内存内修改，调用方决定是否落盘） | `data: dict, env_raw: dict \| None` | `bool`（是否播种） |
+| `snapshot(env_raw=None)` | 返回 `{active, profiles(掩码), presets}`；空库时播种并落盘 | `env_raw: dict \| None` | `dict` |
+| `get(profile_id)` | 返回未掩码的单条档案 | `profile_id: str` | `dict \| None` |
+| `active_profile()` | 返回当前启用档案（未掩码） | 无 | `dict \| None` |
+| `upsert(payload)` | 新建或原地更新；`api_key` 为 None 或含 `***` 时保留已存密钥 | `payload: dict` | `dict`（掩码后的档案） |
+| `remove(profile_id)` | 删除档案；启用中的抛 `ValueError`，不存在返回 `False`；空库先播种再判定 | `profile_id: str` | `bool` |
+| `activate(profile_id, env_path)` | 写回 `.env`（`AI_BACKEND` + 该 backend 的三项键）→ `apply_env_file()`；档案不存在或无 `api_key` 时抛 `ValueError` | `profile_id: str, env_path: Path` | `dict`（掩码后的档案） |
+| `sync_active_from_env(env_raw)` | 设置页直接改 `.env` 后，把改动镜像进当前启用档案（含 backend 变更） | `env_raw: dict[str, str]` | `None` |
+
 ---
 
 ## 3. 模块间关系图
@@ -811,7 +852,8 @@ todo_delete_keywords: list[str] = [
 desktop.py  (桌面入口)
     │
     ├── src/web/server.py  (Web UI + API + WebSocket, 守护线程)
-    │       └── ui/dist/  (React 前端)
+    │       ├── ui/dist/  (React 前端)
+    │       └── src/ai_profiles.py  (多套 AI 配置档案: 服务商+密钥+模型 → 启用即写回 .env)
     │
     └── src/bot.py  (Bot 主控)
             │
@@ -898,6 +940,11 @@ _API 请求 → _UIHandler._handle_request()      # 全局异常兜底 → _send
   ├── /api/todos          → TodoStore
   ├── /api/todos/action   → TodoStore
   ├── /api/todos/counts   → TodoStore
+  ├── /api/ai-presets     → SERVICE_PRESETS (只读, 不落盘)
+  ├── /api/ai-profiles    → AiProfileStore.snapshot() / upsert()
+  ├── /api/ai-profiles/activate → AiProfileStore.activate() → write_env_file() → apply_env_file()
+  ├── /api/ai-profiles/delete   → AiProfileStore.remove()
+  ├── /api/ai-models/fetch      → _fetch_model_ids() (GET <base_url>/models)
   ├── /api/voice/model-status → 检查 HuggingFace 缓存
   ├── /api/voice/download-model → snapshot_download()
   ├── /api/lots           → load_lots_config() / save_lots_config()
@@ -1228,6 +1275,43 @@ MessageRouter.handle(msg)
 - 重试异常: `RateLimitError`, `APIConnectionError`, `APIStatusError`
 - 自由文本回退: 当 tool call 无响应时包装为 minimal SummaryResult
 
+#### 多套 AI 配置档案（服务商 / 模型选择）
+
+`.env` 只能描述**一套**生效配置，而用户常需要"便宜的日常总结"和"更强的深度总结"并存，
+或对接自建 OpenAI 兼容服务。`src/ai_profiles.py` 因此引入"命名档案"：
+
+```
+data/ai_profiles.json            多套档案 + active（唯一真相来源是这里）
+    │  点「启用此配置」
+    ▼
+AiProfileStore.activate(id, env_path)
+    ├── 校验档案存在、api_key 非空（否则抛 ValueError，避免启用后启动即失败）
+    ├── write_env_file(env_path, ...)      — 只改 AI_BACKEND / *_API_KEY / *_BASE_URL / *_MODEL
+    └── apply_env_file(env_path)           — 立即同步到 os.environ
+        │
+        └── 下游 config.load_config() / summarize / media.pipeline 照旧只读 .env
+```
+
+**设计要点**
+
+| 规则 | 原因 |
+|---|---|
+| `.env` 仍是唯一运行期真相 | 下游代码不需要知道"档案"的存在，避免两套真相互相漂移 |
+| 出口一律 `_public()` 掩码（`mask_key`：前4 + `***` + 后4） | 密钥不进浏览器 |
+| 回传值含 `***` 视为"未改动"，沿用已存密钥 | 否则每次保存都会把真密钥覆盖成 `sk-a***wxyz` |
+| 使用中的档案拒绝删除 | 删掉后 `.env` 的配置无主，且 `active` 会指向不存在的 id |
+| `snapshot()` / `remove()` 首次调用时从 `.env` 播种 `default` 档案 | 老用户升级后列表不为空，且"删除当前配置"能被正确拒绝 |
+| `/api/config` 保存后 `sync_active_from_env()` | 设置页直接写 `.env`，启用档案必须跟着变，否则切走再切回会回退用户的修改 |
+| `/api/ai-presets` 只读、不落盘 | 引导页在还没有任何档案时就要拿到模型清单 |
+
+**内置服务商预设**（`SERVICE_PRESETS`）：DeepSeek / OpenAI / 智谱 GLM / Moonshot / 通义千问 /
+本地 Ollama·vLLM / Claude / 自定义。每项含 `backend`（决定写入 `AI_BACKEND` 的值，
+所有 OpenAI 兼容服务共用 `openai`）、规范 `base_url` 与候选模型清单。
+
+**模型名的两种来源**：前端 `Combobox` 始终允许手填（服务商新模型、中转站私有别名都写不进内置表），
+内置清单只是快捷方式；「从服务商拉取模型清单」按钮走 `_fetch_model_ids()` →
+`GET <base_url>/models`，需要有效密钥，失败时回退内置清单。
+
 ---
 
 ### 功能C: 主动发言
@@ -1323,6 +1407,12 @@ MessageRouter.handle(msg) → [无 @mention]
 | `GET` | `/api/todos?status=active&chat_id=xxx` | 获取待办列表 | 无 |
 | `GET` | `/api/todos/counts?chat_id=xxx` | 获取各状态待办计数 | 无 |
 | `POST` | `/api/todos/action` | 执行待办操作 (complete/delete/restore/clear) | 无 |
+| `GET` | `/api/ai-presets` | 内置服务商预设清单 (只读，不落盘) | 无 |
+| `GET` | `/api/ai-profiles` | 列出全部 AI 配置档案 (密钥掩码) + 当前启用项 | 无 |
+| `POST` | `/api/ai-profiles` | 新建/更新一套 AI 配置档案 | 无 |
+| `POST` | `/api/ai-profiles/activate` | 启用某套档案: 写回 `.env` 并 `apply_env_file()` | 无 |
+| `POST` | `/api/ai-profiles/delete` | 删除某套档案 (使用中的拒绝删除) | 无 |
+| `POST` | `/api/ai-models/fetch` | 向服务商 `GET /models` 拉模型清单 | 无 |
 | `GET` | `/api/logs` | 获取最近 500 行日志 | 无 |
 | `POST` | `/api/sandbox/test` | AI 沙盒测试 (不发送) | 无 |
 | `GET` | `/api/lots` | 获取抽签配置 | 无 |
@@ -2098,6 +2188,7 @@ EXE 增大约 100 MB；不带时这类图片降级为 `[图片]` 占位符，其
 | `data/bot.log` | `src/utils/logging_config.py` | 运行日志 |
 | `data/bot_status.json` | `src/bot.py:HealthMonitor` | 状态 JSON (外部监控) |
 | `data/nicknames.json` | `src/nickname.py` | wxid → 昵称映射 |
+| `data/ai_profiles.json` | `src/ai_profiles.py:AiProfileStore` | 多套 AI 配置档案（服务商/密钥/Base URL/模型）+ 当前启用项；含明文密钥，已 .gitignore |
 | `data/group_names.json` | `src/wechat/wcdb_backend.py` | chat_id → {name, member_count} |
 | `data/group_members.json` | `src/wechat/wcdb_backend.py` | chat_id → {wxid: display_name} |
 | `data/welcome_templates.json` | `src/welcome.py` | 欢迎模板 + 群映射 |

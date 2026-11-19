@@ -72,6 +72,10 @@ data/image_cache/
 # Per-machine image keys pasted from an extractor (IMAGE_KEY_PROVIDER=file)
 data/image_keys.json
 
+# AI service profiles — plaintext API keys, same sensitivity as .env
+data/ai_profiles.json
+data/ai_profiles.tmp
+
 # Runtime group name resolution (contains private chatroom IDs)
 data/group_names.json
 data/group_members.json

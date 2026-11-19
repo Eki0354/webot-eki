@@ -145,3 +145,85 @@ export function Input({ type = 'text', value, onChange, placeholder }) {
     </div>
   )
 }
+
+/**
+ * Combobox — a text field with a suggestion dropdown.
+ *
+ * Why not <Select>: model IDs are a moving target.  A closed list goes stale
+ * the moment a provider ships a new model, and relay services use private
+ * aliases that no built-in list can know.  Typing is therefore always
+ * allowed; the list is a shortcut, not a constraint.
+ *
+ * options: [{ value, desc?, hint? }]
+ */
+export function Combobox({ value, onChange, options = [], placeholder, freeLabel = '自定义输入…' }) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef(null)
+
+  useEffect(() => {
+    function handleClick(e) { if (ref.current && !ref.current.contains(e.target)) setOpen(false) }
+    document.addEventListener('mousedown', handleClick)
+    return () => document.removeEventListener('mousedown', handleClick)
+  }, [])
+
+  const known = options.some(o => o.value === value)
+
+  return (
+    <div ref={ref} className="relative">
+      <div className="relative flex items-center">
+        <input
+          value={value || ''}
+          onChange={e => onChange(e.target.value)}
+          onFocus={() => setOpen(true)}
+          placeholder={placeholder}
+          className="w-full bg-bg-raised border border-border-main rounded-full pl-5 pr-12 py-2.5 text-[14px] text-text-main
+                     placeholder:text-text-muted/65 font-mono
+                     focus:outline-none focus:border-brand-green focus:ring-2 focus:ring-brand-green/15
+                     transition-all duration-200
+                     hover:border-text-muted/30 dark:hover:border-text-muted/40"
+        />
+        <button
+          type="button"
+          onClick={() => setOpen(!open)}
+          aria-label="展开模型列表"
+          className="absolute right-4 text-text-muted hover:text-text-main focus:outline-none transition-all cursor-pointer"
+          style={{ transform: open ? 'rotate(90deg)' : 'rotate(0deg)' }}
+        >&#8250;</button>
+      </div>
+
+      {!known && (value || '').trim() !== '' && (
+        <p className="text-xs text-text-muted mt-1.5">
+          自定义模型名（不在内置清单中），将按原样提交给服务商
+        </p>
+      )}
+
+      <AnimatePresence>
+        {open && options.length > 0 && (
+          <motion.div
+            initial={{ opacity: 0, y: -4 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -4 }}
+            className="absolute z-50 left-0 right-0 mt-1.5 bg-bg-card border border-border-main rounded-2xl shadow-xl overflow-hidden max-h-72 overflow-y-auto"
+          >
+            {options.map(opt => (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={() => { onChange(opt.value); setOpen(false) }}
+                className={`w-full text-left px-5 py-2.5 text-[13px] transition-colors flex items-center gap-3 cursor-pointer
+                  ${value === opt.value ? 'bg-brand-green-light text-brand-green-hover dark:text-brand-green font-semibold' : 'text-text-main hover:bg-bg-raised'}`}
+              >
+                <span className="font-mono whitespace-normal break-all leading-snug">{opt.value}</span>
+                {opt.desc && <span className="text-text-muted shrink-0">{opt.desc}</span>}
+                {opt.hint && <span className="flex-1 min-w-0 text-right text-text-muted/80 whitespace-normal break-words">{opt.hint}</span>}
+              </button>
+            ))}
+            <div className="px-5 py-2 text-[11px] text-text-muted/70 border-t border-border-main/60">
+              {freeLabel} — 也可以直接在输入框里改
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  )
+}

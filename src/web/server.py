@@ -393,6 +393,51 @@ def _read_env_map(env_path) -> dict[str, str]:
     return raw
 
 
+def _fetch_model_ids(base_url: str, api_key: str, timeout: float = 10.0) -> list[str]:
+    """Ask an OpenAI-compatible endpoint for its model IDs (``GET /models``).
+
+    Only used by the optional "从服务商拉取" button: the offline preset list
+    is the primary source, because a fetch needs a working key, a reachable
+    endpoint, and a provider that implements ``/models`` at all.  Returns the
+    raw IDs sorted for display; raises on transport/HTTP errors so the UI can
+    say why the fetch failed.
+    """
+    import urllib.error
+    import urllib.request
+
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        raise ValueError("请先填写 API Base URL")
+    if not api_key:
+        raise ValueError("请先填写 API Key")
+
+    request = urllib.request.Request(
+        f"{base}/models",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8", errors="replace"))
+
+    items = payload.get("data") if isinstance(payload, dict) else payload
+    if not isinstance(items, list):
+        raise ValueError("服务商返回的格式无法识别")
+
+    ids: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            model_id = item.get("id") or item.get("name")
+        else:
+            model_id = item
+        if isinstance(model_id, str) and model_id.strip():
+            ids.append(model_id.strip())
+    if not ids:
+        raise ValueError("服务商没有返回任何模型")
+    return sorted(set(ids))
+
+
 # .env key → _onboarding_data field, for fields that survive a key re-extraction.
 _ENV_TO_ONBOARDING = {
     "AI_BACKEND": ("ai_backend", str),
@@ -1147,6 +1192,10 @@ class _UIHandler(SimpleHTTPRequestHandler):
                          "/api/todos/action",
                          "/api/voice/download-model",
                          "/api/wechat-data-dir/detect",
+                         "/api/ai-profiles",
+                         "/api/ai-profiles/activate",
+                         "/api/ai-profiles/delete",
+                         "/api/ai-models/fetch",
                          "/api/image-keys/refresh"):
             self.do_GET()
         else:
@@ -1251,6 +1300,107 @@ class _UIHandler(SimpleHTTPRequestHandler):
         if self.path == "/api/stop":
             _stop_bot()
             self.send_json({"ok": True})
+            return
+
+        # ── API: Built-in AI service presets (read-only) ──────────────
+        # The onboarding page needs the preset list before any profile
+        # exists, and it must not seed a profile as a side effect.
+        if self.path == "/api/ai-presets":
+            try:
+                from src.ai_profiles import SERVICE_PRESETS
+                self.send_json({"ok": True, "presets": SERVICE_PRESETS})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)})
+            return
+
+        # ── API: AI service profiles (named key/base/model sets) ────────
+        # GET  → list profiles (keys masked) + built-in presets
+        # POST → create or update one profile
+        if self.path == "/api/ai-profiles":
+            try:
+                from src.ai_profiles import get_ai_profile_store
+                store = get_ai_profile_store()
+                if self.command == "POST":
+                    content_len = int(self.headers.get("Content-Length", 0))
+                    body = self.rfile.read(content_len) if content_len else b"{}"
+                    payload = json.loads(body or b"{}")
+                    if not isinstance(payload, dict):
+                        raise ValueError("请求体必须是 JSON 对象")
+                    saved = store.upsert(payload)
+                    self.send_json({"ok": True, "profile": saved})
+                else:
+                    self.send_json({
+                        "ok": True,
+                        **store.snapshot(_read_env_map(_find_or_create_env())),
+                    })
+            except Exception as e:
+                logger.exception("Failed to handle AI profiles")
+                self.send_json({"ok": False, "error": str(e)})
+            return
+
+        # ── API: Activate an AI profile (writes .env) ─────────────────
+        if self.path == "/api/ai-profiles/activate":
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_len) if content_len else b"{}"
+            try:
+                from src.ai_profiles import get_ai_profile_store
+                payload = json.loads(body or b"{}")
+                profile_id = str(payload.get("id") or "").strip()
+                if not profile_id:
+                    raise ValueError("缺少配置 id")
+                env_path = _find_or_create_env()
+                active = get_ai_profile_store().activate(profile_id, env_path)
+                self.send_json({
+                    "ok": True,
+                    "active": profile_id,
+                    "profile": active,
+                    "requires_restart": True,
+                })
+            except Exception as e:
+                logger.exception("Failed to activate AI profile")
+                self.send_json({"ok": False, "error": str(e)})
+            return
+
+        # ── API: Delete an AI profile ─────────────────────────────────
+        if self.path == "/api/ai-profiles/delete":
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_len) if content_len else b"{}"
+            try:
+                from src.ai_profiles import get_ai_profile_store
+                payload = json.loads(body or b"{}")
+                profile_id = str(payload.get("id") or "").strip()
+                if not profile_id:
+                    raise ValueError("缺少配置 id")
+                removed = get_ai_profile_store().remove(profile_id)
+                self.send_json({"ok": True, "removed": removed})
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)})
+            return
+
+        # ── API: Fetch the model list from the provider ───────────────
+        if self.path == "/api/ai-models/fetch":
+            content_len = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_len) if content_len else b"{}"
+            try:
+                from src.ai_profiles import get_ai_profile_store
+                payload = json.loads(body or b"{}")
+                base_url = str(payload.get("base_url") or "").strip()
+                api_key = str(payload.get("api_key") or "").strip()
+                # A masked key is what the form holds when the user never
+                # retyped it — resolve it from the stored profile.
+                if not api_key or "***" in api_key:
+                    profile_id = str(payload.get("id") or "").strip()
+                    stored = (
+                        get_ai_profile_store().get(profile_id) if profile_id else None
+                    )
+                    if stored:
+                        api_key = stored.get("api_key", "")
+                        base_url = base_url or stored.get("base_url", "")
+                models = _fetch_model_ids(base_url, api_key)
+                self.send_json({"ok": True, "models": models})
+            except Exception as e:
+                logger.warning("Model list fetch failed: %s", e)
+                self.send_json({"ok": False, "error": str(e)})
             return
 
         # ── API: Load config ───────────────────────────────────────────
@@ -1453,6 +1603,16 @@ class _UIHandler(SimpleHTTPRequestHandler):
                 # file in step, including secrets we deliberately skipped.
                 from src.config import apply_env_file
                 apply_env_file(env_path)
+                # The settings page writes .env directly, bypassing the
+                # profile store.  Mirror the change into the active profile,
+                # or switching away and back would silently revert the edit.
+                try:
+                    from src.ai_profiles import get_ai_profile_store
+                    get_ai_profile_store().sync_active_from_env(
+                        _read_env_map(env_path)
+                    )
+                except Exception:
+                    logger.warning("Could not sync AI profiles from .env", exc_info=True)
                 self.send_json({
                     "ok": True,
                     "saved": list(seen),
