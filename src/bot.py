@@ -346,11 +346,23 @@ class Bot:
         # "off" alone cannot be diagnosed: it is the default, so it looks
         # the same whether the file says false, sits elsewhere, or was
         # never read.  These two lines separate those cases.
+        canonical_env = resolve_env_file()
         logger.info(
             "Config root: %s | env: %s",
             PROJECT_ROOT,
-            ENV_FILE_USED or "<none> (canonical: %s)" % resolve_env_file(),
+            ENV_FILE_USED or "<none> (canonical: %s)" % canonical_env,
         )
+        if ENV_FILE_USED and ENV_FILE_USED != canonical_env:
+            # Running from a UNC / shared folder can make the .env beside
+            # the EXE unreadable, and the process then silently falls back
+            # to a CWD copy — a different file with different settings.
+            # Say so loudly instead of leaving the user to guess.
+            logger.warning(
+                "Config: reading %s, NOT %s — the .env next to the EXE is "
+                "missing or unreadable (shared folders/UNC can hide it). "
+                "Copy .env beside the EXE or run from a local folder.",
+                ENV_FILE_USED, canonical_env,
+            )
         logger.info(
             "Raw env: MEDIA_VISION_ENABLED=%r IMAGE_KEY_PROVIDER=%r",
             os.environ.get("MEDIA_VISION_ENABLED"),

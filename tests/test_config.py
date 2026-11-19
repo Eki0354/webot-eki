@@ -330,7 +330,7 @@ class FindEnvFileTests(unittest.TestCase):
         """Should return None when .env does not exist at any location."""
         from src.config import find_env_file
 
-        with patch.object(Path, "exists", return_value=False):
+        with patch("src.config._is_readable_file", return_value=False):
             result = find_env_file()
             self.assertIsNone(result)
 
@@ -353,7 +353,7 @@ class FindEnvFileTests(unittest.TestCase):
 
         with (
             patch.object(sys, "frozen", True, create=True),
-            patch.object(Path, "exists", return_value=False),
+            patch("src.config._is_readable_file", return_value=False),
         ):
             result = find_env_file()
             self.assertIsNone(result)

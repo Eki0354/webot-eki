@@ -140,6 +140,26 @@ def resolve_wechat_data_dir(config) -> str:
     return detect_wechat_data_dir()
 
 
+def _is_readable_file(path: Path) -> bool:
+    """True when *path* is a readable regular file.
+
+    ``Path.exists()`` can answer False for a file that really is there on a
+    UNC / shared-folder path (VMware HGFS), so an actual ``open`` is tried
+    before giving up.  This matters more than it looks: a false negative
+    here silently sends the process to a different ``.env`` entirely.
+    """
+    try:
+        if path.is_file():
+            return True
+    except OSError:
+        pass
+    try:
+        with open(path, "rb"):
+            return True
+    except OSError:
+        return False
+
+
 def find_env_file() -> Path | None:
     """Return the .env path that actually exists, or None.
 
@@ -149,11 +169,11 @@ def find_env_file() -> Path | None:
     go to resolve_env_file().
     """
     canonical = resolve_env_file()
-    if canonical.exists():
+    if _is_readable_file(canonical):
         return canonical
 
     legacy = Path.cwd() / ".env"
-    if legacy != canonical and legacy.exists():
+    if legacy != canonical and _is_readable_file(legacy):
         return legacy
 
     return None
