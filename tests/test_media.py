@@ -791,6 +791,52 @@ class ImageStoreTests(unittest.TestCase):
             self.assertIsNone(store.fetch(self._msg(md5, 500)))
             self.assertFalse((root / "cache" / f"{md5}.jpg").exists())
 
+    def test_wxgf_falls_back_to_plain_sibling(self):
+        """An HEVC container must borrow the ``_h`` JPEG of the same image.
+
+        The packaged build excludes PyAV, so a ``wxgf`` payload cannot be
+        decoded there.  WeChat stores the same picture again as a plain JPEG
+        sibling, and without this fallback *every* such image degraded to
+        ``[图片]`` — measured 1683/1683 images on a real account.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            img = self._img_dir(root)
+            md5 = "a" * 32
+            jpeg = b"\xff\xd8\xff\xe0" + b"J" * 2000 + b"\xff\xd9"
+
+            # The container cannot be decoded without a codec...
+            vps = b"\x00\x00\x00\x01" + bytes([32 << 1]) + b"\x01\x02"
+            idr = b"\x00\x00\x00\x01" + bytes([19 << 1]) + b"\x03\x04"
+            (img / f"{md5}.dat").write_bytes(
+                _v2(b"wxgf" + b"\x00" * 12 + vps + idr)
+            )
+            # ...but the plain sibling can.
+            (img / f"{md5}_h.dat").write_bytes(_v2(jpeg))
+
+            store = self._store(root)
+            with patch.dict(sys.modules, {"av": None}):
+                out = store.fetch(self._msg(md5, 2000))
+            self.assertIsNotNone(out)
+            self.assertEqual(out.read_bytes(), jpeg)
+
+    def test_wxgf_without_sibling_stays_placeholder(self):
+        """No codec and no sibling means the placeholder, never a fake image."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            img = self._img_dir(root)
+            md5 = "b" * 32
+            vps = b"\x00\x00\x00\x01" + bytes([32 << 1]) + b"\x01\x02"
+            idr = b"\x00\x00\x00\x01" + bytes([19 << 1]) + b"\x03\x04"
+            (img / f"{md5}.dat").write_bytes(
+                _v2(b"wxgf" + b"\x00" * 12 + vps + idr)
+            )
+
+            store = self._store(root)
+            with patch.dict(sys.modules, {"av": None}):
+                self.assertIsNone(store.fetch(self._msg(md5, 2000)))
+            self.assertFalse((root / "cache" / f"{md5}.jpg").exists())
+
 
 class MediaPipelineImageTests(unittest.TestCase):
     """The pipeline must keep ``[图片]`` unless keys *and* vision are ready."""

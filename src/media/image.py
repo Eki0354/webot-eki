@@ -266,17 +266,53 @@ class ImageStore:
     # -- Decrypting --------------------------------------------------------
 
     def _decrypt(self, dat: Path) -> Optional[bytes]:
-        """Decrypt *dat* and unwrap a ``wxgf`` container if present."""
+        """Decrypt *dat*, falling back to a plain-JPEG sibling when needed.
+
+        WeChat usually stores an image twice: the original ``.dat`` holds an
+        HEVC stream in a ``wxgf`` container, while a ``_h`` / ``_b`` / ``_t``
+        sibling holds plain JPEG.  Decoding HEVC needs PyAV, which the
+        packaged build excludes to keep the EXE small — without a fallback
+        that exclusion turned *every* image into ``[图片]`` (measured: 1651
+        such downgrades in one session's log).
+
+        So when the container cannot be decoded, try the siblings.  Measured
+        on real data: 1019 of 1019 ``wxgf`` images had a plain sibling, and
+        ``_h`` is the full-size JPEG, so the fallback costs no quality to
+        speak of and no bytes in the EXE.
+        """
+        plain, needs_codec = self._decrypt_one(dat)
+        if plain or not needs_codec:
+            return plain
+
+        for sibling in self._plain_siblings(dat):
+            plain, _ = self._decrypt_one(sibling)
+            if plain:
+                logger.debug(
+                    "%s needs a codec — used plain sibling %s",
+                    dat.name, sibling.name,
+                )
+                return plain
+        return None
+
+    def _decrypt_one(self, dat: Path) -> tuple[Optional[bytes], bool]:
+        """Decrypt a single file.
+
+        Returns:
+            ``(image_bytes, needs_codec)``.  ``needs_codec`` is True when the
+            payload decrypted fine but is a ``wxgf`` container that could not
+            be unwrapped here — the caller should then try a JPEG sibling
+            rather than give up on the message.
+        """
         size = _size(dat)
         if not size or size > _MAX_DAT_BYTES:
             logger.debug("Skipping %s (%s bytes)", dat, size)
-            return None
+            return None, False
 
         try:
             data = dat.read_bytes()
         except OSError:
             logger.debug("Cannot read %s", dat, exc_info=True)
-            return None
+            return None, False
 
         wxid = self._owner_wxid(dat)
         xor_key, aes_key_text = self._keys_for(wxid)
@@ -289,20 +325,40 @@ class ImageStore:
             if derived is not None and derived != xor_key:
                 plain = decrypt_dat(data, derived, aes_key_text)
         if not plain:
-            return None
+            return None, False
 
         if sniff_format(plain) == "wxgf":
             plain = unwrap_wxgf(plain)
             if not plain:
                 logger.debug("wxgf container could not be decoded: %s", dat)
-                return None
+                return None, True
 
         if not sniff_format(plain):
             # A wrong key yields random bytes that still pass the header
             # checks; refusing them here keeps garbage out of the cache.
             logger.debug("Decrypted %s is not an image — key wrong?", dat)
-            return None
-        return plain
+            return None, False
+        return plain, False
+
+    @staticmethod
+    def _plain_siblings(dat: Path) -> list[Path]:
+        """Other ``.dat`` variants of the same image, best picture first.
+
+        WeChat appends a size suffix to the same base md5, so the group is
+        found by stripping it.  ``_h`` (full size) ranks above ``_b`` and
+        ``_t``, which keeps the fallback as close to the original as the
+        stored variants allow.
+        """
+        base = strip_variant(dat.stem)
+        try:
+            siblings = [
+                f for f in dat.parent.glob(base + "*.dat")
+                if f.is_file() and f != dat and strip_variant(f.stem) == base
+            ]
+        except OSError:
+            return []
+        siblings.sort(key=lambda f: variant_rank(f.stem), reverse=True)
+        return siblings
 
     # -- Choosing keys per account -----------------------------------------
 

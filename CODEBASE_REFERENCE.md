@@ -771,6 +771,7 @@ todo_delete_keywords: list[str] = [
 | `ImageStore.can_decrypt` (property) | 是否值得尝试解密（有密钥或允许推导） | 无 | `bool` |
 | `ImageStore.fetch(msg)` | 定位 → 解密 → wxgf 解包 → 缓存，返回图片路径 | `msg: dict` | `Path \| None` |
 | `ImageStore._resolve_xor_key()` | 返回配置的 XOR 密钥，未配置时从文件投票推导（只跑一次，结果含失败都缓存） | 无 | `int \| None` |
+| `ImageStore._plain_siblings(dat)` | 同基名的其他 `.dat` 变体（`_h` 优先），用于 wxgf 无 codec 时兜底 | `dat: Path` | `list[Path]` |
 | `ImageStore._sample_tails()` | 逐个读出 V2 容器的掩码尾段（只读末尾 16 字节，上限 400 个） | 无 | `Iterator[bytes]` |
 
 `src/media/pipeline.py` — 统一入口：
@@ -1873,7 +1874,7 @@ WcdbBackend._standardize(msg)
 
 1. **AES 密钥** — 每台机器不同，不在消息 XML 里、也无法推导，必须 `IMAGE_AES_KEY` 手动填（XOR 密钥可自动推导，见下）
 2. **容器结构** — `.dat` 是四段拼接，不是整段 AES：只有头部一段是 AES-128-ECB，中段明文，尾段单字节 XOR
-3. **codec** — `wxgf` 载荷是 HEVC；打包版为控制体积不含 PyAV，这类图片降级 `[图片]`
+3. **codec** — `wxgf` 载荷是 HEVC；打包版为控制体积不含 PyAV，这类图片改走**同图 JPEG 副本兜底**（`_h`/`_b`/`_t` 同基名 `.dat`），实测 1683 组真实图片 0 失败（其中 587 组靠兜底救回）。兜底也没有时才降级 `[图片]`
 
 **XOR 密钥不需要提取。** 尾段是单字节 XOR，而图片有固定结尾符（JPEG `FF D9`、PNG `IEND®B\`\x82`），所以密钥可以从文件本身反推。`ImageStore._resolve_xor_key()` 在未配置时遍历附件目录、对每个 V2 文件的尾段投票，选出唯一能让最多文件正确收尾的字节。实测本机 3807 个文件：真值 `0xED` 得 2650 票，次高仅 1 票，前 10 个文件即可稳定得出，耗时 0.15s，结果（含推导失败）每次运行只算一次。
 
