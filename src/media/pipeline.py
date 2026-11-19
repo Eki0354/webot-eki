@@ -32,7 +32,13 @@ from typing import Optional
 
 from src.config import PROJECT_ROOT, resolve_wechat_data_dir
 
-from .appmsg import looks_like_xml, reduce_appmsg, strip_sender_prefix
+from .appmsg import (
+    appmsg_title,
+    extract_refermsg,
+    looks_like_xml,
+    reduce_appmsg,
+    strip_sender_prefix,
+)
 from .blob import decode_blob, is_binary
 from .emoji import EmojiStore
 from .image import ImageStore
@@ -116,6 +122,13 @@ class MediaPipeline:
             return self._describe_emoji(msg)
 
         if is_binary(msg) or local_type >= LOCAL_TYPE_SYSTEM:
+            # A reply carries the quoted message inside <refermsg>.  For an
+            # image that is the only place its payload appears, so it has to
+            # be tried before the generic appmsg reduction — otherwise the
+            # whole message reduces to "[直播]" and the picture is lost.
+            quoted = self._describe_quoted(msg, chat_id)
+            if quoted:
+                return quoted
             return self._reduce_binary(msg, local_type)
 
         return None
@@ -220,6 +233,55 @@ class MediaPipeline:
             image.name, getattr(self._vision, "_model", "?"),
         )
         return None
+
+    def _describe_quoted(self, msg: dict, chat_id: str) -> Optional[str]:
+        """Describe an image this message quotes, if it quotes one.
+
+        WeChat 4.x sends a reply as an appmsg whose ``<refermsg>`` block
+        holds the original message.  For an image, that block is the only
+        place the picture's payload appears — the reply's own body carries
+        just the sender's wording.  So the quoted ``<img>`` XML is fed back
+        through the normal locate → decrypt → describe path.
+
+        Returns:
+            The sender's wording plus the picture's content, or None when
+            this message quotes no image.
+        """
+        if not self._image or not self._vision or not self._vision.available:
+            return None
+
+        xml = self._body_xml(msg)
+        if not xml:
+            return None
+        body = strip_sender_prefix(xml)
+        refer = extract_refermsg(body)
+        if not refer or refer.get("type") != LOCAL_TYPE_IMAGE:
+            return None
+        quoted_xml = refer.get("content") or ""
+        if not quoted_xml:
+            return None
+
+        # Present the quoted picture as if it were its own message.  The
+        # session and timestamp still come from the reply, which is what
+        # names the account folder and month directory.
+        proxy = dict(msg)
+        proxy["message_content"] = quoted_xml
+        proxy["content_kind"] = "text"
+        proxy.pop("content", None)
+
+        title = appmsg_title(body)
+        description = self._describe_image(proxy, chat_id)
+        if not description:
+            logger.warning(
+                "MediaPipeline: quoted image not described (chat=%s, msg=%s)",
+                chat_id or "?", msg.get("message_id", "?"),
+            )
+            return f"{title}（引用的图片没能解析，看不到内容）".strip()
+
+        detail = description
+        if detail.startswith("[图片] "):
+            detail = detail[len("[图片] "):]
+        return f"{title}（引用的图片：{detail}）".strip()
 
     def _describe_emoji(self, msg: dict) -> Optional[str]:
         """Download/locate the emoji image and describe it."""

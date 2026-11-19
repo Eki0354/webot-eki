@@ -707,7 +707,9 @@ todo_delete_keywords: list[str] = [
 |---|---|---|---|
 | `strip_sender_prefix(text)` | 去掉正文前的 `wxid_xxx:` / `xxx@chatroom:` 前缀 | `text: str` | `str` |
 | `looks_like_xml(text)` | 判断内容是否为标记而非聊天文本 | `text: str` | `bool` |
-| `reduce_appmsg(xml)` | appmsg → `"[链接] 标题"`；sysmsg → `None` | `xml: str` | `str \| None` |
+| `extract_refermsg(xml)` | 解析 `<refermsg>`：返回 `{type, content, displayname}`，content 做 HTML 反转义（引用图片的 `<img>` 载荷就在里面） | `xml: str` | `dict \| None` |
+| `appmsg_title(xml)` | 取 appmsg `<title>`（引用时即用户自己的提问） | `xml: str` | `str` |
+| `reduce_appmsg(xml)` | appmsg → `"[链接] 标题"`；含 `<refermsg>` → `"[引用] 标题"`（不再误标 `[直播]`）；sysmsg → `None` | `xml: str` | `str \| None` |
 
 `src/media/emoji.py` — 表情图片定位与下载：
 
@@ -787,7 +789,8 @@ todo_delete_keywords: list[str] = [
 | 函数 | 描述 | 参数 | 返回值 |
 |---|---|---|---|
 | `MediaPipeline.__init__(config)` | 初始化媒体管道 | `config` | `None` |
-| `MediaPipeline.process(msg, chat_id="")` | 媒体消息 → 文本（占位符由调用方兜底）；图片需 `chat_id` 定位目录 | `msg: dict, chat_id: str` | `str \| None` |
+| `MediaPipeline.process(msg, chat_id="")` | 媒体消息 → 文本（占位符由调用方兜底）；图片需 `chat_id` 定位目录；引用图片走 `_describe_quoted()` | `msg: dict, chat_id: str` | `str \| None` |
+| `MediaPipeline._describe_quoted(msg, chat_id)` | 引用消息（`<refermsg>`）里被引用的图片：用其 `<img>` 载荷复用解密+视觉，输出「用户提问（引用的图片：…）」；非图片引用返回 None | `msg: dict, chat_id: str` | `str \| None` |
 | `MediaPipeline.stats()` | 计数器快照（`emoji`/`image`/`described`/`failed`） | 无 | `dict` |
 
 模块级常量：
@@ -1865,9 +1868,12 @@ WcdbBackend._standardize(msg)
   │           │     └── VisionClient.describe(image) → "[表情] 猫在摇头"
   │           └── 其他        → "[视频]" / "[链接]" 等占位符
   │
-  └── 其他 BLOB（localType=1 文本、10000 系统、49-family appmsg）
+  └── 其他 BLOB（localType=1 文本、10000 系统、49-family appmsg、复合 localType）
         └── _try_media(msg) or _blob_text(msg)
-              ├── appmsg XML  → "[链接] 标题"（reduce_appmsg）
+              ├── 引用消息（appmsg 含 <refermsg>，localType 如 244813135921 = 57<<32|49）
+              │     └── _describe_quoted()：refermsg.type==3 时用其 <img> 载荷
+              │           → "[图片] …" → 输出「用户提问（引用的图片：…）」
+              ├── appmsg XML  → "[链接] 标题"（reduce_appmsg；引用则为 "[引用] 标题"）
               ├── sysmsg XML  → None（丢弃）
               └── 纯文本      → 原文（"哈哈哈哈哈哈哈"）
 ```
