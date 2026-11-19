@@ -77,6 +77,12 @@ _ARRIVAL_GRACE_SEC = 30.0
 _ARRIVAL_WAIT_SEC = 5.0
 _ARRIVAL_POLL_SEC = 0.5
 
+#: How close a ``.dat`` must have been written to its message to be the
+#: picture that message carries.  WeChat writes the picture within about a
+#: second of the message row (measured), so a day is generous and still
+#: rejects a same-sized file from another session entirely.
+_SIBLING_TIME_WINDOW_SEC = 86400.0
+
 
 def strip_variant(stem: str) -> str:
     """Return the base md5 of a ``.dat`` stem, dropping its size suffix.
@@ -223,17 +229,20 @@ class ImageStore:
             return None
 
         md5 = _xml_attr(xml, "md5")
-        length = _as_int(_xml_attr(xml, "length"))
+        lengths = _media_lengths(xml)
+        created = _as_int(
+            _first_attr(msg, ("create_time", "createTime", "timestamp"))
+        )
 
         # The message timestamp names the month directory; scanning only that
         # one keeps a busy group (thousands of files) cheap.  A wrong guess
         # falls through to the full scan below.
-        month = _month_dir(_first_attr(msg, ("create_time", "createTime", "timestamp")))
+        month = _month_dir(created)
         if month:
-            hit = self._search(session_dir / month / "Img", md5, length)
+            hit = self._search(session_dir / month / "Img", md5, lengths, created)
             if hit is not None:
                 return hit
-        return self._search_all(session_dir, md5, length)
+        return self._search_all(session_dir, md5, lengths, created)
 
     def _session_dir(self, chat_id: str) -> Optional[Path]:
         """Return ``msg/attach/{md5(chat_id)}`` for the account holding it."""
@@ -270,25 +279,29 @@ class ImageStore:
         return [p / "msg" / "attach" for p in accounts
                 if (p / "msg" / "attach").is_dir()]
 
-    def _search_all(self, session_dir: Path, md5, length) -> Optional[Path]:
-        """Search every month directory under one session."""
+    def _search_all(self, session_dir: Path, md5, lengths, created=None) -> Optional[Path]:
+        """Search every month directory under one session, newest first."""
         try:
-            img_dirs = sorted(session_dir.glob("*/Img"))
+            img_dirs = sorted(session_dir.glob("*/Img"), reverse=True)
         except OSError:
             return None
         for img_dir in img_dirs:
-            hit = self._search(img_dir, md5, length)
+            hit = self._search(img_dir, md5, lengths, created)
             if hit is not None:
                 return hit
         return None
 
-    def _search(self, img_dir: Path, md5, length) -> Optional[Path]:
+    def _search(self, img_dir: Path, md5, lengths, created=None) -> Optional[Path]:
         """Pick the best ``.dat`` in *img_dir* for this message.
 
-        Two independent keys, because neither is reliable alone: the base
-        name matches only sometimes, and the size rule only when the file is
-        a full-size original (a ``_h`` variant has extra plaintext, so its
-        size is *not* ``length + 31``).
+        Two independent keys are tried.  The base name works on the builds
+        that name the file after the message's own MD5.  The payload length
+        works everywhere else: every size the XML records (``length``,
+        ``hevc_mid_size``, ``cdnthumblength`` …) is a plaintext length, and
+        a container is exactly that plus 31 bytes — irrespective of which
+        size variant it holds.  Measured on 13 real messages: the XML ``md5``
+        matched 0 file names, the lengths matched 13, so the size rule is the
+        one actually carrying this.
         """
         try:
             files = [f for f in img_dir.glob("*.dat") if f.is_file()]
@@ -302,13 +315,58 @@ class ImageStore:
             if named:
                 return max(named, key=lambda f: variant_rank(f.stem))
 
-        if length:
-            target = expected_dat_size(length)
+        for target in lengths or ():
             sized = [f for f in files if _size(f) == target]
-            if sized:
-                return max(sized, key=lambda f: variant_rank(f.stem))
-
+            if not sized:
+                continue
+            hit = self._pick_variant(files, sized, created)
+            if hit is not None:
+                return hit
+            # The copies at this size cannot be told apart — a later length
+            # (typically the thumbnail) may still match one unambiguously.
         return None
+
+    @staticmethod
+    def _pick_variant(files, sized, created) -> Optional[Path]:
+        """Return the best file of the picture that *sized* belongs to.
+
+        Different pictures can be stored at the same byte size, and each has
+        its own group of variants (``_h`` / ``_t`` …) sharing one base name.
+        Returning a whole group matters: the copy matching by size is often
+        the ``wxgf`` original, while a sibling of the group is the plain JPEG
+        that can be decoded and described.
+        """
+        groups: dict = {}
+        for path in files:
+            groups.setdefault(strip_variant(path.stem), []).append(path)
+
+        bases = {strip_variant(path.stem) for path in sized}
+        base = bases.pop() if len(bases) == 1 else ImageStore._closest_group(
+            groups, bases, created
+        )
+        if base is None:
+            return None
+        return max(groups[base], key=lambda f: variant_rank(f.stem))
+
+    @staticmethod
+    def _closest_group(groups, bases, created) -> Optional[str]:
+        """The base name whose files were written closest to the message.
+
+        WeChat writes a picture when the message arrives, so the copy's write
+        time pins it to its message (measured: within one second).  Without a
+        timestamp the copies cannot be told apart, and describing the wrong
+        picture would be worse than the ``[图片]`` placeholder — hence None.
+        """
+        if not created:
+            return None
+        best, best_gap = None, None
+        for base in bases:
+            gap = min(abs(_mtime(path) - created) for path in groups[base])
+            if best_gap is None or gap < best_gap:
+                best, best_gap = base, gap
+        if best_gap is None or best_gap > _SIBLING_TIME_WINDOW_SEC:
+            return None
+        return best
 
     # -- Decrypting --------------------------------------------------------
 
@@ -580,3 +638,35 @@ def _size(path: Path) -> int:
         return path.stat().st_size
     except OSError:
         return 0
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _media_lengths(xml: str) -> list:
+    """Container sizes this message's picture can have on disk, best first.
+
+    Every size the message XML records is a *plaintext* length, and a
+    container is that plus a fixed overhead regardless of the size variant
+    it holds (see :func:`src.media.dat_decrypt.expected_dat_size`).  Several
+    are read because they describe different copies: ``hevc_mid_size`` the
+    original, ``cdnthumblength`` the thumbnail WeChat always stores, and
+    ``length`` / ``hdlength`` whichever copy the sender uploaded.
+
+    Ordering matters only when two candidates match; the first is the most
+    specific one, so a message whose original is present finds it directly
+    instead of being pinned to its thumbnail by a size both share.
+    """
+    lengths = []
+    for attr in ("hevc_mid_size", "length", "hdlength", "cdnthumblength"):
+        value = _as_int(_xml_attr(xml, attr))
+        if not value:
+            continue
+        expected = expected_dat_size(value)
+        if expected not in lengths:
+            lengths.append(expected)
+    return lengths

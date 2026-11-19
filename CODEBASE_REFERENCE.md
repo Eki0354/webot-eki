@@ -774,7 +774,12 @@ todo_delete_keywords: list[str] = [
 | `ImageStore._arrival_deadline(msg)` | 新消息返回重试截止时刻，旧消息返回 None（旧图没有文件也不会再有） | `msg: dict` | `float \| None` |
 | `ImageStore._resolve_xor_key()` | 返回配置的 XOR 密钥，未配置时从文件投票推导（只跑一次，结果含失败都缓存） | 无 | `int \| None` |
 | `ImageStore._plain_siblings(dat)` | 同基名的其他 `.dat` 变体（`_h` 优先），用于 wxgf 无 codec 时兜底 | `dat: Path` | `list[Path]` |
+| `ImageStore._search(img_dir, md5, lengths, created=None)` | 在 `Img/` 内挑文件：先按基名，再按 XML 记录的多个长度（`hevc_mid_size`/`length`/`hdlength`/`cdnthumblength` + 31） | `img_dir: Path, md5: str\|None, lengths: list[int], created: int\|None` | `Path \| None` |
+| `ImageStore._pick_variant(files, sized, created)` | 从命中尺寸的文件归组，返回该图组内 rank 最高的变体 | `files: list[Path], sized: list[Path], created: int\|None` | `Path \| None` |
+| `ImageStore._closest_group(groups, bases, created)` | 同尺寸多图时按写入时间选最接近消息时间的一组（一天窗口内） | `groups: dict, bases: set, created: int\|None` | `str \| None` |
 | `ImageStore._sample_tails()` | 逐个读出 V2 容器的掩码尾段（只读末尾 16 字节，上限 400 个） | 无 | `Iterator[bytes]` |
+| `_media_lengths(xml)` | 按优先级返回 XML 各长度字段换算出的容器尺寸（去重） | `xml: str` | `list[int]` |
+| `_mtime(path)` | 文件写入时间，失败返回 `0.0` | `path: Path` | `float` |
 
 `src/media/pipeline.py` — 统一入口：
 
@@ -1843,7 +1848,9 @@ WcdbBackend._standardize(msg)
   │           │     ├── ImageStore.fetch(msg)
   │           │     │     ├── _arrival_deadline(msg) — 新消息给 5s 重试窗口
   │           │     │     ├── 定位 msg/attach/{md5(chat_id)}/{yyyy-MM}/Img/*.dat
-  │           │     │     │     匹配键: 基名（剥 _h/_hd/_t 后缀）+ file_size == length + 31
+  │           │     │     │     匹配键: 基名（剥 _h/_hd/_t 后缀）
+  │           │     │     │             file_size == hevc_mid_size/length/cdnthumblength + 31
+  │           │     │     │     同尺寸多图: 取写入时间最接近消息的图组（_media_lengths/_closest_group）
   │           │     │     ├── decrypt_dat(data, xor_key, aes_key_text)
   │           │     │     │     [15B header][AES-128-ECB 头段][明文段][XOR 尾段]
   │           │     │     ├── unwrap_wxgf(data)  → HEVC → JPEG（无 PyAV 则 None）

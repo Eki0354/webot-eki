@@ -696,6 +696,78 @@ class ImageStoreTests(unittest.TestCase):
             xml = self._msg("b" * 32, length)["message_content"]
             self.assertEqual(store._locate(self._msg("b" * 32, length), xml), dat)
 
+    def test_locate_by_hevc_mid_size_when_md5_differs(self):
+        """Real data: the XML ``md5`` names no file, ``hevc_mid_size`` names it.
+
+        Measured on 13 consecutive images in one group — the XML md5 matched
+        0 on-disk base names, while ``hevc_mid_size + 31`` matched 13.  The
+        original is a ``wxgf`` container, so this rule is what carries image
+        description; without it every picture stayed ``[图片]``.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            img = self._img_dir(root)
+            payload = b"wxgf" + b"\x00" * 8 + b"\xff\xd8\xff" + b"x" * 1000
+            dat = img / f"{'c' * 32}.dat"
+            dat.write_bytes(_v2(payload, aes_size=1024))
+            plain_len = dat.stat().st_size - 31
+
+            msg = {
+                "chat_id": self.CHAT,
+                "localType": 3,
+                "create_time": 1772000000,
+                "content_kind": "text",
+                # The md5 below appears in no filename, exactly as in real data.
+                "message_content": (
+                    f'<msg><img md5="{"d" * 32}" hevc_mid_size="{plain_len}" '
+                    f'cdnthumblength="20" length="{plain_len + 500}" /></msg>'
+                ),
+            }
+            store = self._store(root)
+            self.assertEqual(store._locate(msg, msg["message_content"]), dat)
+
+    def test_locate_prefers_whole_group_of_the_matching_picture(self):
+        """Same-size pictures are told apart by write time, not by rank.
+
+        Two different pictures can be stored at the same byte size.  Picking
+        by file name alone cannot tell them apart, and picking a wrong one
+        would describe someone else's image, which is worse than ``[图片]``.
+        A picture's variants are written together, so the group closest to
+        the message is the right one and every variant in it is fair game.
+        """
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            img = self._img_dir(root)
+            body = b"\xff\xd8\xff" + b"x" * 1000
+
+            older_a = img / f"{'a' * 32}.dat"
+            older_a.write_bytes(_v2(body, aes_size=1024))
+            newer_b = img / f"{'b' * 32}.dat"
+            newer_b.write_bytes(_v2(body, aes_size=1024))
+            # Same size, one day apart: only time can separate them.
+            os.utime(older_a, (1771900000, 1771900000))
+            os.utime(newer_b, (1772000000, 1772000000))
+
+            thumb_b = img / f"{'b' * 32}_t.dat"
+            thumb_b.write_bytes(_v2(b"\xff\xd8\xff" + b"y" * 40, aes_size=1024))
+
+            msg = {
+                "chat_id": self.CHAT,
+                "localType": 3,
+                "create_time": 1772000000,
+                "content_kind": "text",
+                "message_content": (
+                    f'<msg><img md5="{"e" * 32}" '
+                    f'hevc_mid_size="{newer_b.stat().st_size - 31}" /></msg>'
+                ),
+            }
+            store = self._store(root)
+            found = store._locate(msg, msg["message_content"])
+            # The full-size copy of the newer picture, not the older one.
+            self.assertEqual(found, newer_b)
+
     def test_locate_without_chat_id_gives_up(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
