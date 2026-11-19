@@ -752,7 +752,12 @@ todo_delete_keywords: list[str] = [
 | 函数 | 描述 | 参数 | 返回值 |
 |---|---|---|---|
 | `resolve_image_keys(config, data_dir=None)` | 按 `IMAGE_KEY_PROVIDER` 取密钥；`.env` 显式值优先于文件 | `config, data_dir: Path` | `ImageKeys` |
+| `resolve_image_key_table(config, data_dir=None)` | 同上但按账号分组；只有 `auto` 会产出真正的 per-account 表 | `config, data_dir: Path` | `ImageKeyTable` |
+| `read_key_file_table(data_dir=None)` | 读 `image_keys.json` 的 `accounts` 形状；扁平旧格式返回空表 | `data_dir: Path` | `Dict[str, ImageKeys]` |
+| `save_image_keys(keys, data_dir=None)` | 把 `{wxid: ImageKey}` 写成 `accounts` 形状（git-ignored） | `keys: dict` | `Path` |
 | `ImageKeys.usable` (property) | 至少一个密钥可用 | 无 | `bool` |
+| `ImageKeyTable.for_wxid(wxid)` | 取该账号的密钥；未知账号回退 `shared`，多账号时**不**借用 | `wxid: str \| None` | `ImageKeys` |
+| `ImageKeyTable.usable` (property) | 任一账号的密钥可用 | 无 | `bool` |
 
 `src/media/image.py` — 图片消息定位/解密/缓存：
 
@@ -1874,7 +1879,7 @@ WcdbBackend._standardize(msg)
 | `media_vision_model` | `""` | 视觉模型覆盖；空 = 复用 `AI_BACKEND` 的模型 |
 | `image_xor_key` | `""` | 单字节 XOR 密钥；接受 `0x37` / `55`。**留空则自动从本地文件推导** |
 | `image_aes_key` | `""` | AES 密钥取字符串**前 16 个 ASCII 字符**（非 hex 解码） |
-| `image_key_provider` | `"env"` | `env` 读 `.env`；`file` 读 `data/image_keys.json`；`.env` 已填时始终优先 |
+| `image_key_provider` | `"env"` | `env` 读 `.env`；`file` 读 `data/image_keys.json`；`auto` 在微信运行时读 `GetImageKey`（按账号，结果另存 `data/image_keys.json`）。`.env` 已填时始终优先 |
 
 #### 视觉后端支持
 

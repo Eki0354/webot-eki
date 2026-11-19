@@ -484,6 +484,143 @@ class ImageKeyTests(unittest.TestCase):
         self.assertEqual(keys.xor_key, 1)
 
 
+class ImageKeyTableTests(unittest.TestCase):
+    """The per-account key table, which multi-account machines need.
+
+    WeChat issues a different AES key per account and the wrong one decrypts
+    nothing (measured 0/1 against 3808/3808), so "one pair for everybody" is
+    only safe when there is exactly one account to pair it with.
+    """
+
+    def _config(self, **kwargs):
+        from src.config import BotConfig
+
+        return BotConfig(**kwargs)
+
+    def _key(self, wxid, xor_key=0x37, aes="0123456789abcdef"):
+        from src.wechat.extract_key import ImageKey
+
+        return ImageKey(wxid, xor_key, aes)
+
+    # -- ImageKeyTable ---------------------------------------------------
+
+    def test_for_wxid_returns_that_accounts_pair(self):
+        from src.media.keys import ImageKeyTable, ImageKeys
+
+        table = ImageKeyTable(by_wxid={
+            "wxid_a": ImageKeys(0x11, "aaaaaaaaaaaaaaaa"),
+            "wxid_b": ImageKeys(0x22, "bbbbbbbbbbbbbbbb"),
+        })
+        self.assertEqual(table.for_wxid("wxid_b").xor_key, 0x22)
+        self.assertEqual(table.for_wxid("wxid_b").aes_key_text, "b" * 16)
+
+    def test_unknown_account_does_not_borrow_from_several(self):
+        """With several accounts, guessing would decrypt with the wrong key."""
+        from src.media.keys import ImageKeyTable, ImageKeys
+
+        shared = ImageKeys(None, "")
+        table = ImageKeyTable(shared=shared, by_wxid={
+            "wxid_a": ImageKeys(0x11, "aaaaaaaaaaaaaaaa"),
+            "wxid_b": ImageKeys(0x22, "bbbbbbbbbbbbbbbb"),
+        })
+        self.assertIs(table.for_wxid(None), shared)
+        self.assertIs(table.for_wxid("wxid_unknown"), shared)
+
+    def test_single_account_is_used_for_unknown_owner(self):
+        """A custom data dir need not contain a wxid folder to name it."""
+        from src.media.keys import ImageKeyTable, ImageKeys
+
+        only = ImageKeys(0x33, "cccccccccccccccc")
+        table = ImageKeyTable(by_wxid={"wxid_only": only})
+        self.assertIs(table.for_wxid(None), only)
+        self.assertIs(table.for_wxid("wxid_other"), only)
+
+    def test_empty_table_is_not_usable(self):
+        from src.media.keys import ImageKeyTable
+
+        table = ImageKeyTable()
+        self.assertFalse(table.usable)
+        self.assertEqual(len(table), 0)
+
+    # -- save / load round trip ------------------------------------------
+
+    def test_saved_keys_are_read_back_per_account(self):
+        from src.media.keys import read_key_file_table, save_image_keys
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            save_image_keys(
+                {"wxid_a": self._key("wxid_a"),
+                 "wxid_b": self._key("wxid_b", 0x22, "bbbbbbbbbbbbbbbb")},
+                data_dir=root,
+            )
+            table = read_key_file_table(root)
+            self.assertEqual(sorted(table), ["wxid_a", "wxid_b"])
+            self.assertEqual(table["wxid_b"].xor_key, 0x22)
+            self.assertEqual(table["wxid_b"].aes_key_text, "b" * 16)
+
+    def test_flat_key_file_yields_no_table(self):
+        """The older single-pair file still works for the ``file`` provider."""
+        import json
+
+        from src.media.keys import read_key_file_table
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "image_keys.json").write_text(
+                json.dumps({"xor_key": "55", "aes_key": "abcdefghijklmnop"}),
+                encoding="utf-8",
+            )
+            self.assertEqual(read_key_file_table(root), {})
+
+    # -- resolve_image_key_table ----------------------------------------
+
+    def test_non_auto_provider_yields_one_shared_pair(self):
+        from src.media.keys import resolve_image_key_table
+
+        table = resolve_image_key_table(self._config(
+            image_xor_key="0x37", image_aes_key="0123456789abcdef",
+        ))
+        self.assertEqual(len(table), 0)
+        self.assertEqual(table.for_wxid(None).xor_key, 0x37)
+
+    def test_auto_provider_builds_the_table(self):
+        from src.media.keys import resolve_image_key_table
+
+        with patch("src.media.keys._extract_auto_table", return_value={
+            "wxid_a": self._key("wxid_a"),
+            "wxid_b": self._key("wxid_b", 0x22, "bbbbbbbbbbbbbbbb"),
+        }):
+            table = resolve_image_key_table(self._config(image_key_provider="auto"))
+
+        self.assertEqual(sorted(table.by_wxid), ["wxid_a", "wxid_b"])
+        self.assertEqual(table.for_wxid("wxid_b").xor_key, 0x22)
+
+    def test_auto_provider_prefers_saved_keys_when_wechat_is_closed(self):
+        """GetImageKey only answers while the client runs."""
+        from src.media.keys import resolve_image_key_table, save_image_keys
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            save_image_keys({"wxid_saved": self._key("wxid_saved", 0x44)},
+                            data_dir=root)
+            with patch("src.media.keys._extract_auto_table", return_value={}):
+                table = resolve_image_key_table(
+                    self._config(image_key_provider="auto"), data_dir=root
+                )
+        self.assertEqual(table.for_wxid("wxid_saved").xor_key, 0x44)
+
+    def test_auto_provider_without_anything_is_empty(self):
+        from src.media.keys import resolve_image_key_table
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("src.media.keys._extract_auto_table", return_value={}):
+                table = resolve_image_key_table(
+                    self._config(image_key_provider="auto"), data_dir=Path(tmp)
+                )
+        self.assertFalse(table.usable)
+
+
 class ImageStoreTests(unittest.TestCase):
     """Locating a ``.dat`` for a message, then decrypting it."""
 

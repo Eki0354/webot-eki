@@ -1,23 +1,49 @@
-"""Extract WCDB decrypt key from WeChat using wx_key.dll.
+"""Extract WCDB and image keys from WeChat using wx_key.dll.
 
 Zero external dependencies — wx_key.dll is bundled with the EXE.
-Asks user to re-login to WeChat for reliable capture.
+
+Two independent exports of the same DLL are used:
+
+* ``InitializeHook`` / ``PollKeyData`` — the WCDB key, which requires the
+  user to re-login so the key can be captured as WeChat loads it.
+* ``GetImageKey`` — the per-account image keys, which need neither a hook
+  nor a restart: the client keeps them readable while it runs.
 
 Usage:
     python -m src.wechat.extract_key
 """
 import ctypes as ct
 from ctypes import wintypes
+import json
 import logging
 import os
 import sys
 import time
 from pathlib import Path
+from typing import NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
 
 TH32CS_SNAPPROCESS = 0x00000002
 kernel32 = ct.WinDLL("kernel32", use_last_error=True)
+
+#: Buffer handed to ``GetImageKey``.  The real answer is ~200 bytes for two
+#: accounts; the export rejects anything smaller than 0x100, and a generous
+#: cap costs nothing but keeps a large account list from truncating.
+IMAGE_KEY_BUFFER = 64 * 1024
+
+
+class ImageKey(NamedTuple):
+    """One account's image keys, as reported by ``GetImageKey``.
+
+    ``aes_key_text`` is kept as the hex *text* WeChat returns, because that is
+    what :func:`src.media.dat_decrypt.aes_key_from_text` expects — the first
+    16 ASCII characters are the AES key, not the hex-decoded bytes.
+    """
+
+    wxid: str
+    xor_key: Optional[int]
+    aes_key_text: str
 
 
 def _find_wechat_pid():
@@ -273,6 +299,130 @@ def _hook_and_poll(pid: int, dll_path: str, timeout=180):
         except Exception:
             pass
         return None
+
+
+# ── Image keys: the GetImageKey export ───────────────────────────────
+
+def extract_image_keys(timeout: float = 5.0) -> dict:
+    """Return the per-account image keys reported by ``wx_key.dll``.
+
+    ``GetImageKey`` is a second, independent export of the same DLL that
+    already provides the WCDB key.  Unlike ``InitializeHook``/``PollKeyData``
+    it needs no injection and no WeChat restart: it reads the running
+    client's memory and returns a JSON document::
+
+        {"accounts": [
+            {"wxid": "wxid_abc", "keys": [
+                {"code": 48897517, "xorKey": 237, "aesKey": "36a9357e83ccf4e9"}]}]}
+
+    The keys are **per account**, so the caller must pick the entry matching
+    the account that owns the ``.dat`` file — one account's ``aesKey`` cannot
+    decrypt another's images (measured: 3808/3808 for the right pair, 0/1 for
+    the wrong one).
+
+    Args:
+        timeout: Seconds to keep retrying.  WeChat loads its keys shortly
+            after login, so a client that just started may answer with an
+            empty account list for a moment.
+
+    Returns:
+        ``{wxid: ImageKey}``; empty when no key could be read (WeChat not
+        running, or not logged in yet).
+
+    Raises:
+        RuntimeError: ``wx_key.dll`` is missing or cannot be loaded — a
+            setup problem the caller should show to the user verbatim.
+    """
+    dll_path = _find_wx_key_dll()
+    if not dll_path:
+        raise RuntimeError("未找到 wx_key.dll，无法读取图片密钥")
+
+    dll_err = _verify_dll_loadable(dll_path)
+    if dll_err:
+        raise RuntimeError(dll_err)
+
+    lib = _load_wx_key_lib(dll_path)
+    lib.GetImageKey.argtypes = [ct.c_char_p, ct.c_int]
+    lib.GetImageKey.restype = wintypes.BOOL
+
+    buf = ct.create_string_buffer(IMAGE_KEY_BUFFER)
+    deadline = time.monotonic() + max(timeout, 0)
+
+    while True:
+        # Clear the buffer: a shorter answer than last time must not leave
+        # the previous JSON tail behind and break parsing.
+        ct.memset(buf, 0, IMAGE_KEY_BUFFER)
+        ok = lib.GetImageKey(buf, IMAGE_KEY_BUFFER)
+        raw = bytes(buf).split(b"\0", 1)[0]
+        if ok and raw:
+            keys = _parse_image_keys(raw)
+            if keys:
+                logger.info("读取到 %d 个账号的图片密钥", len(keys))
+                return keys
+
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.5)
+
+    logger.warning(
+        "未读取到图片密钥 — 请确认微信已登录（需要微信正在运行）"
+    )
+    return {}
+
+
+def _load_wx_key_lib(dll_path: str):
+    """Load ``wx_key.dll`` with its bundled dependencies on the search path."""
+    dll_dir = os.path.dirname(dll_path)
+    if dll_dir:
+        try:
+            os.add_dll_directory(dll_dir)
+        except AttributeError:
+            k32 = ct.WinDLL("kernel32", use_last_error=True)
+            k32.SetDllDirectoryW(dll_dir)
+    try:
+        return ct.WinDLL(dll_path)
+    except OSError as e:
+        raise RuntimeError(
+            f"无法加载 wx_key.dll: {e}（错误码: {ct.get_last_error()}）"
+        ) from e
+
+
+def _parse_image_keys(raw: bytes) -> dict:
+    """Parse ``GetImageKey``'s JSON into ``{wxid: ImageKey}``.
+
+    A malformed document is not an error worth raising: the caller retries
+    and eventually reports "no keys", which is what the user needs to see.
+    """
+    try:
+        payload = json.loads(raw.decode("utf-8", errors="replace"))
+    except ValueError:
+        logger.warning("GetImageKey 返回了无法解析的内容: %r", raw[:120])
+        return {}
+
+    accounts = payload.get("accounts") if isinstance(payload, dict) else None
+    if not isinstance(accounts, list):
+        return {}
+
+    keys: dict = {}
+    for account in accounts:
+        if not isinstance(account, dict):
+            continue
+        wxid = str(account.get("wxid") or "").strip()
+        entries = account.get("keys")
+        if not wxid or not isinstance(entries, list):
+            continue
+        # Several key generations can be listed; the first is the current one.
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            aes_key = str(entry.get("aesKey") or "").strip()
+            xor_key = entry.get("xorKey")
+            if isinstance(xor_key, bool) or not isinstance(xor_key, int):
+                xor_key = None
+            if aes_key or xor_key is not None:
+                keys[wxid] = ImageKey(wxid, xor_key, aes_key)
+                break
+    return keys
 
 
 # ── Compatibility API ────────────────────────────────────────────────

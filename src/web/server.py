@@ -112,6 +112,51 @@ def _detect_default_data_dir() -> str:
     return ""
 
 
+def _refresh_image_keys() -> dict:
+    """Read the image keys from the running WeChat client and persist them.
+
+    ``GetImageKey`` only answers while WeChat runs, so the answer is saved to
+    ``data/image_keys.json`` as well: the bot may well start before the client
+    does, and a saved table keeps images decrypting across that gap.
+
+    ``IMAGE_KEY_PROVIDER`` is switched to ``auto`` as part of this, because a
+    key that is merely saved is never consulted under the default ``env``
+    provider.  Explicit ``IMAGE_XOR_KEY`` / ``IMAGE_AES_KEY`` entries still
+    win inside the provider, so nothing the user typed by hand is lost.
+    """
+    from src.media.keys import save_image_keys
+    from src.wechat.extract_key import extract_image_keys
+
+    keys = extract_image_keys()
+    if not keys:
+        return {
+            "ok": False,
+            "error": (
+                "未读取到图片密钥。请确认微信正在运行且已登录，"
+                "然后重试。"
+            ),
+        }
+
+    save_image_keys(keys)
+    env_path = _find_or_create_env()
+    _set_env_key(env_path, "IMAGE_KEY_PROVIDER", "auto")
+
+    accounts = []
+    for wxid, key in keys.items():
+        accounts.append({
+            "wxid": wxid,
+            "xor_key": None if key.xor_key is None else f"0x{key.xor_key:02X}",
+            "aes_key": _mask_key(key.aes_key_text),
+        })
+    logger.info("已获取 %d 个账号的图片密钥并保存", len(accounts))
+    return {
+        "ok": True,
+        "accounts": accounts,
+        "message": f"已获取 {len(accounts)} 个账号的图片密钥",
+        "requires_restart": True,
+    }
+
+
 _DEFAULT_FEISHU_TRIGGER_KEYWORDS = "同步到飞书,导出到飞书,写到飞书,沉淀到飞书"
 
 
@@ -1115,7 +1160,8 @@ class _UIHandler(SimpleHTTPRequestHandler):
                          "/api/lots",
                          "/api/todos/action",
                          "/api/voice/download-model",
-                         "/api/wechat-data-dir/detect"):
+                         "/api/wechat-data-dir/detect",
+                         "/api/image-keys/refresh"):
             self.do_GET()
         else:
             self.send_response(405)
@@ -2275,6 +2321,15 @@ class _UIHandler(SimpleHTTPRequestHandler):
             except PermissionError:
                 self.send_json({"ok": False, "error": "没有权限访问该目录"})
             except Exception as e:
+                self.send_json({"ok": False, "error": str(e)})
+            return
+
+        # ── API: Read the image keys from the running WeChat client ──
+        if self.path == "/api/image-keys/refresh":
+            try:
+                self.send_json(_refresh_image_keys())
+            except Exception as e:
+                logger.exception("Failed to read image keys")
                 self.send_json({"ok": False, "error": str(e)})
             return
 

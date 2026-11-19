@@ -1770,6 +1770,64 @@ class SetEnvKeyTests(unittest.TestCase):
             tmp_dir.rmdir()
 
 
+class ImageKeyRefreshEndpointTests(unittest.TestCase):
+    """Tests for POST /api/image-keys/refresh.
+
+    The endpoint exists because the keys can be read straight from the
+    running client: requiring a third-party extractor was never necessary.
+    """
+
+    def _post(self):
+        handler, sock = _build_handler("/api/image-keys/refresh", method="POST")
+        parts = sock.get_response_text().split("\r\n\r\n", 1)
+        return json.loads(parts[1])
+
+    def test_keys_are_saved_and_provider_switched_to_auto(self):
+        from src.wechat.extract_key import ImageKey
+
+        tmp_dir = Path(tempfile.mkdtemp())
+        tmp_env = tmp_dir / ".env"
+        tmp_env.write_text("IMAGE_KEY_PROVIDER=env\nOTHER=keep\n",
+                           encoding="utf-8")
+        try:
+            with (
+                patch("src.wechat.extract_key.extract_image_keys",
+                      return_value={"wxid_a": ImageKey("wxid_a", 0x37,
+                                                       "0123456789abcdef")}),
+                patch("src.media.keys.save_image_keys") as mock_save,
+                patch("src.web.server._find_or_create_env", return_value=tmp_env),
+            ):
+                body = self._post()
+
+            self.assertTrue(body["ok"])
+            self.assertEqual(len(body["accounts"]), 1)
+            # The AES key is a secret: it must come back masked.
+            self.assertNotIn("0123456789abcdef", json.dumps(body))
+            self.assertEqual(body["accounts"][0]["xor_key"], "0x37")
+            mock_save.assert_called_once()
+            # Saving alone is useless: the default provider never reads it.
+            content = tmp_env.read_text(encoding="utf-8")
+            self.assertIn("IMAGE_KEY_PROVIDER=auto", content)
+            self.assertIn("OTHER=keep", content)
+        finally:
+            tmp_env.unlink(missing_ok=True)
+            tmp_dir.rmdir()
+
+    def test_no_keys_reports_a_setup_error(self):
+        """WeChat not running is a user-visible condition, not a crash."""
+        with patch("src.wechat.extract_key.extract_image_keys", return_value={}):
+            body = self._post()
+        self.assertFalse(body["ok"])
+        self.assertIn("微信", body["error"])
+
+    def test_dll_problem_surfaces_verbatim(self):
+        with patch("src.wechat.extract_key.extract_image_keys",
+                   side_effect=RuntimeError("未找到 wx_key.dll，无法读取图片密钥")):
+            body = self._post()
+        self.assertFalse(body["ok"])
+        self.assertIn("wx_key.dll", body["error"])
+
+
 # ---------------------------------------------------------------------------
 # .env → os.environ synchronisation (config actually reaching the process)
 # ---------------------------------------------------------------------------

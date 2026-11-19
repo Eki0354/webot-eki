@@ -36,7 +36,7 @@ from .appmsg import looks_like_xml, reduce_appmsg, strip_sender_prefix
 from .blob import decode_blob, is_binary
 from .emoji import EmojiStore
 from .image import ImageStore
-from .keys import resolve_image_keys
+from .keys import resolve_image_key_table, resolve_image_keys
 from .vision import VisionClient
 
 logger = logging.getLogger(__name__)
@@ -160,14 +160,24 @@ class MediaPipeline:
         the ``.dat`` files themselves, so a store is still worth building
         when only the AES key is present.  With neither key, a V2 container
         cannot be opened at all, so scanning the tree would be pure cost.
+
+        The key table is passed through even when it looks empty: with
+        ``IMAGE_KEY_PROVIDER=auto`` the keys are read from the running WeChat
+        client and a per-account table is the only correct form on a machine
+        with several accounts.
         """
-        keys = resolve_image_keys(config)
-        if not keys.usable:
+        table = resolve_image_key_table(config)
+        keys = table.for_wxid(None)
+        if not table.usable and not keys.usable:
             logger.info(
                 "MediaPipeline: no image keys — images stay [图片]. "
-                "IMAGE_AES_KEY is the one that must be supplied."
+                "Set IMAGE_KEY_PROVIDER=auto, or fill IMAGE_AES_KEY."
             )
             return None
+        if len(table):
+            logger.info(
+                "MediaPipeline: image keys loaded for %d account(s)", len(table)
+            )
         return ImageStore(
             getattr(config, "wechat_data_dir", ""),
             PROJECT_ROOT / "data" / "image_cache",
@@ -175,6 +185,7 @@ class MediaPipeline:
             keys.aes_key_text,
             # Only worth deriving when the user did not already pin it down.
             allow_derive_xor=keys.xor_key is None,
+            key_table=table,
         )
 
     def _describe_image(self, msg: dict, chat_id: str) -> Optional[str]:

@@ -98,6 +98,7 @@ class ImageStore:
         xor_key: Optional[int] = None,
         aes_key_text: str = "",
         allow_derive_xor: bool = True,
+        key_table=None,
     ) -> None:
         """
         Args:
@@ -109,20 +110,28 @@ class ImageStore:
             allow_derive_xor: Recover the XOR key from the files themselves
                 when it is not configured.  The key is not a secret that has
                 to be extracted — see :func:`dat_decrypt.derive_xor_key`.
+            key_table:       Optional :class:`src.media.keys.ImageKeyTable`.
+                When it holds per-account keys they win over *xor_key* /
+                *aes_key_text*, because WeChat issues a different AES key per
+                account and the wrong one decrypts nothing (measured 0/1 vs
+                3808/3808 on a two-account machine).
         """
         self._data_dir = Path(wechat_data_dir) if wechat_data_dir else None
         self._cache_dir = Path(cache_dir)
         self._xor_key = xor_key
         self._aes_key_text = aes_key_text or ""
         self._allow_derive_xor = allow_derive_xor
-        # Deriving scans the attachment tree, so it runs at most once and the
-        # answer (including "could not tell") is kept.
-        self._xor_derive_done = False
-        self._derived_xor: Optional[int] = None
+        self._key_table = key_table
+        # Deriving scans the attachment tree, so it runs at most once per
+        # account and the answer (including "could not tell") is kept.
+        self._xor_derive_done: set = set()
+        self._derived_xor: dict = {}
 
     @property
     def can_decrypt(self) -> bool:
         """True when decryption is worth attempting."""
+        if self._key_table is not None and self._key_table.usable:
+            return True
         return (
             self._xor_key is not None
             or bool(self._aes_key_text)
@@ -188,17 +197,29 @@ class ImageStore:
                 return candidate
         return None
 
-    def _attach_dirs(self) -> list[Path]:
-        """Every ``msg/attach`` directory we can see."""
+    def _attach_dirs(self, wxid: Optional[str] = None) -> list[Path]:
+        """Every ``msg/attach`` directory we can see, optionally one account's.
+
+        Args:
+            wxid: Restrict the answer to the folder belonging to this account.
+                Account folders are named ``wxid_<id>_<4 hex>``, so a prefix
+                match is needed rather than equality.
+        """
         if self._data_dir is None or not self._data_dir.is_dir():
             return []
         direct = self._data_dir / "msg" / "attach"
         if direct.is_dir():
+            # A single-account data dir has no wxid folders to filter on.
             return [direct]
         try:
             accounts = sorted(self._data_dir.glob("wxid_*"))
         except OSError:
             return []
+        if wxid:
+            matching = [p for p in accounts
+                        if p.name == wxid or p.name.startswith(wxid + "_")]
+            if matching:
+                accounts = matching
         return [p / "msg" / "attach" for p in accounts
                 if (p / "msg" / "attach").is_dir()]
 
@@ -257,13 +278,16 @@ class ImageStore:
             logger.debug("Cannot read %s", dat, exc_info=True)
             return None
 
-        plain = decrypt_dat(data, self._xor_key, self._aes_key_text)
+        wxid = self._owner_wxid(dat)
+        xor_key, aes_key_text = self._keys_for(wxid)
+
+        plain = decrypt_dat(data, xor_key, aes_key_text)
         if not plain:
             # The XOR key is recoverable from the files, so a missing one is
             # not fatal — try once, then reuse the answer for every message.
-            derived = self._resolve_xor_key()
-            if derived is not None and derived != self._xor_key:
-                plain = decrypt_dat(data, derived, self._aes_key_text)
+            derived = self._resolve_xor_key(wxid)
+            if derived is not None and derived != xor_key:
+                plain = decrypt_dat(data, derived, aes_key_text)
         if not plain:
             return None
 
@@ -280,43 +304,85 @@ class ImageStore:
             return None
         return plain
 
+    # -- Choosing keys per account -----------------------------------------
+
+    def _owner_wxid(self, dat: Path) -> Optional[str]:
+        """Return the ``wxid`` whose account folder holds *dat*, or None.
+
+        WeChat names the account folder ``wxid_<id>_<4 hex>`` while
+        ``GetImageKey`` reports the bare ``wxid_<id>``, so the folder is
+        matched by prefix.  The longest match wins, otherwise one account
+        whose id happens to prefix another would take its files.
+        """
+        for parent in dat.parents:
+            name = parent.name
+            if not name.startswith("wxid_"):
+                continue
+            table = self._key_table
+            if table is not None and len(table):
+                matches = [w for w in table.by_wxid
+                           if name == w or name.startswith(w + "_")]
+                if matches:
+                    return max(matches, key=len)
+            # Strip the 4-hex suffix WeChat appends to the account folder.
+            head, _, tail = name.rpartition("_")
+            if head.startswith("wxid_") and len(tail) == 4:
+                return head
+            return name
+        return None
+
+    def _keys_for(self, wxid: Optional[str]):
+        """Return ``(xor_key, aes_key_text)`` to use for *wxid*."""
+        table = self._key_table
+        if table is not None and len(table):
+            keys = table.for_wxid(wxid)
+            if keys.usable:
+                return keys.xor_key, keys.aes_key_text
+        return self._xor_key, self._aes_key_text
+
     # -- Deriving the XOR key ----------------------------------------------
 
-    def _resolve_xor_key(self) -> Optional[int]:
+    def _resolve_xor_key(self, wxid: Optional[str] = None) -> Optional[int]:
         """Return the configured XOR key, or one derived from the files.
 
-        Runs the derivation at most once per store: it walks the attachment
+        Runs the derivation at most once per account: it walks the attachment
         tree, and the answer cannot change while WeChat keeps the same
         installation.  A failed derivation is remembered too, so a machine
         with no usable files does not rescan on every message.
         """
-        if self._xor_key is not None:
-            return self._xor_key
-        if not self._allow_derive_xor or self._xor_derive_done:
-            return self._derived_xor
+        xor_key, _ = self._keys_for(wxid)
+        if xor_key is not None:
+            return xor_key
+        if not self._allow_derive_xor or wxid in self._xor_derive_done:
+            return self._derived_xor.get(wxid)
 
-        self._xor_derive_done = True
-        self._derived_xor = derive_xor_key(self._sample_tails())
-        if self._derived_xor is None:
+        self._xor_derive_done.add(wxid)
+        derived = derive_xor_key(self._sample_tails(wxid))
+        self._derived_xor[wxid] = derived
+        if derived is None:
             logger.info(
                 "Image XOR key could not be derived from local files — "
                 "set IMAGE_XOR_KEY if images stay [图片]"
             )
         else:
             logger.info(
-                "Image XOR key derived from local files: 0x%02X",
-                self._derived_xor,
+                "Image XOR key derived from local files: 0x%02X", derived
             )
-        return self._derived_xor
+        return derived
 
-    def _sample_tails(self):
+    def _sample_tails(self, wxid: Optional[str] = None):
         """Yield the masked tail of every V2 container we can find.
 
         Only the last few bytes of each file are read, so sampling thousands
         of images costs a directory walk rather than megabytes of I/O.
+
+        Args:
+            wxid: Restrict the sample to one account's folder.  The XOR key
+                can differ per account, so voting across accounts would let a
+                larger account outvote the one being asked about.
         """
         taken = 0
-        for path in self._iter_dat_files():
+        for path in self._iter_dat_files(wxid):
             if taken >= _DERIVE_SAMPLE_LIMIT:
                 return
             try:
@@ -335,9 +401,9 @@ class ImageStore:
                 taken += 1
                 yield tail
 
-    def _iter_dat_files(self):
-        """Walk the attachment tree."""
-        for attach in self._attach_dirs():
+    def _iter_dat_files(self, wxid: Optional[str] = None):
+        """Walk the attachment tree, optionally for one account only."""
+        for attach in self._attach_dirs(wxid):
             try:
                 for path in attach.rglob("*.dat"):
                     yield path

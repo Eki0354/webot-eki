@@ -845,6 +845,9 @@ function DataPathSection({ form, update, detectedDataDir }) {
   const [detectResult, setDetectResult] = useState(null)
   const [detecting, setDetecting] = useState(false)
   const [detectError, setDetectError] = useState('')
+  const [keyResult, setKeyResult] = useState(null)
+  const [keyLoading, setKeyLoading] = useState(false)
+  const [keyError, setKeyError] = useState('')
 
   // ── Browse API ────────────────────────────────────────────────
 
@@ -938,6 +941,28 @@ function DataPathSection({ form, update, detectedDataDir }) {
       setTimeout(() => setDetectError(''), 5000)
     }
     setDetecting(false)
+  }
+
+  // ── Image key API ─────────────────────────────────────────────
+
+  async function handleRefreshImageKeys() {
+    setKeyLoading(true)
+    setKeyError('')
+    setKeyResult(null)
+    try {
+      const res = await fetch('http://127.0.0.1:7327/api/image-keys/refresh', {
+        method: 'POST',
+      })
+      const d = await res.json()
+      if (d.ok) {
+        setKeyResult(d)
+      } else {
+        setKeyError(d.error || '获取失败')
+      }
+    } catch {
+      setKeyError('无法连接到服务器')
+    }
+    setKeyLoading(false)
   }
 
   const hasCustomPath = (form.wechat_data_dir || '').trim().length > 0
@@ -1051,6 +1076,59 @@ function DataPathSection({ form, update, detectedDataDir }) {
           💡 已设置自定义路径。留空则恢复自动检测（{detectedDataDir || '默认 Documents 目录'}）
         </p>
       )}
+
+      {/* ── Image keys (图片解密密钥) ──────────────────────────────── */}
+      <div className="mt-6 pt-6 border-t border-border-main/60">
+        <Field label="图片解密密钥"
+          hint="微信按账号生成图片密钥，不在消息里也无法推导。微信运行时点右侧按钮即可自动获取并保存，图片就不再是「[图片]」占位符。">
+          <div className="flex items-start gap-2">
+            <div className="flex-1 text-[13px] text-text-muted font-mono bg-bg-raised border border-border-main rounded-full px-5 py-2.5">
+              {keyResult ? '已获取并保存' : '未获取（图片保持 [图片]）'}
+            </div>
+            <button
+              type="button"
+              onClick={handleRefreshImageKeys}
+              disabled={keyLoading}
+              className="shrink-0 px-4 py-2.5 bg-brand-green-light border border-brand-green/20 rounded-full text-[13px] text-brand-green-hover dark:text-brand-green font-semibold hover:bg-brand-green/10 transition-colors cursor-pointer disabled:opacity-50"
+            >
+              {keyLoading ? (
+                <span className="flex items-center gap-1.5">
+                  <svg className="animate-spin h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                  </svg>
+                  读取中
+                </span>
+              ) : '从微信获取'}</button>
+          </div>
+        </Field>
+
+        {keyResult && (
+          <div className="mt-3 p-4 rounded-2xl border bg-brand-green-light border-brand-green/20 space-y-2">
+            <div className="flex items-center gap-2">
+              <CheckCircle size={18} weight="fill" className="text-brand-green-hover dark:text-brand-green" />
+              <span className="text-sm font-semibold text-brand-green-hover dark:text-brand-green">{keyResult.message}</span>
+            </div>
+            {keyResult.accounts.map((acct, i) => (
+              <div key={i} className="flex items-center gap-3 text-xs font-mono bg-bg-main/60 border border-border-main rounded-xl px-3 py-2">
+                <span className="text-text-main font-semibold truncate">{acct.wxid}</span>
+                <span className="text-text-muted">·</span>
+                <span className="text-text-muted">XOR {acct.xor_key || '—'}</span>
+                <span className="text-text-muted">·</span>
+                <span className="text-text-muted">AES {acct.aes_key || '—'}</span>
+              </div>
+            ))}
+            <p className="text-[11px] text-text-muted mt-1">已写入 data/image_keys.json 并切换 IMAGE_KEY_PROVIDER=auto，重启机器人后生效</p>
+          </div>
+        )}
+
+        {keyError && (
+          <div className="mt-3 flex items-center gap-2 px-4 py-2.5 bg-[#d45656]/5 border border-[#d45656]/20 rounded-full text-sm text-[#d45656]">
+            <Warning size={16} weight="fill" className="text-[#d45656]" />
+            <span>{keyError}</span>
+          </div>
+        )}
+      </div>
 
       {/* ── Directory Browser Modal ────────────────────────────────── */}
       {browseOpen && (
