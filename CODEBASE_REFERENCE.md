@@ -1347,6 +1347,12 @@ MessageRouter.handle(msg) → [无 @mention]
 `load_config()` **只读 `os.environ`**，而 `.env` 原本只在进程 import 时 `load_dotenv()` 一次。
 因此任何写 `.env` 的路径都必须在写盘后调用 `src.config.apply_env_file()`，否则磁盘已更新、进程仍看到旧值（表现为"配置好了却提示 key 未设置"）。
 
+**import 时的优先级：`.env` 的非空值覆盖继承来的环境变量。** 原先用 `load_dotenv(path)`
+（默认 `override=False`），一个残留的系统环境变量会静默盖掉 `.env`——实测虚拟机里
+`MEDIA_VISION_ENABLED=true` 写在 `.env` 中，媒体管线却从未启动、图片全停在 `[图片]`，
+而 API key / WCDB key 等其他项都正常（所以看起来像"功能没装"）。现在逐项写入
+`os.environ`，**空值（`KEY=`）跳过**，以免把运维在进程环境里注入的 key 冲成空串。
+
 ```
 写 .env 的 4 个入口                      写盘后同步
 ─────────────────────────────────────   ─────────────────────────

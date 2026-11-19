@@ -190,7 +190,26 @@ def apply_env_file(env_path: Path | None = None) -> Path | None:
 _env_path = find_env_file()
 
 if _env_path:
-    load_dotenv(_env_path)
+    # .env is the user's explicit configuration, so its *non-empty* entries
+    # must win over anything inherited from the OS environment.  The plain
+    # ``load_dotenv(path)`` does not override, which let a stale system
+    # variable silently win: ``MEDIA_VISION_ENABLED=true`` in .env was
+    # ignored, the media pipeline never started, and every image stayed
+    # ``[图片]`` while all other .env keys (API key, WCDB key) worked fine.
+    #
+    # Empty entries are skipped on purpose: they mean "auto-detect / use
+    # the default", so an operator-provided key in the process environment
+    # survives instead of being blanked out by ``KEY=`` in the file.
+    import os as _os
+    from dotenv import dotenv_values as _dotenv_values
+
+    try:
+        for _key, _value in _dotenv_values(_env_path).items():
+            if _value is None or not str(_value).strip():
+                continue
+            _os.environ[_key] = str(_value)
+    except OSError:
+        load_dotenv(_env_path)
 else:
     load_dotenv()
 

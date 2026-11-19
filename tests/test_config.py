@@ -256,6 +256,64 @@ class WechatDataDirTests(unittest.TestCase):
             self.assertEqual(resolve_wechat_data_dir(config), "detected")
 
 
+class EnvFilePrecedenceTests(unittest.TestCase):
+    """The .env file must beat a stale variable inherited from the OS.
+
+    Measured on a VM: ``MEDIA_VISION_ENABLED=true`` sat in .env, yet the
+    media pipeline never started because ``load_dotenv`` does not override
+    by default and a leftover environment entry won.  Every other .env key
+    (API key, WCDB key) worked, so the file *was* being read — the
+    precedence was the bug, and it looked exactly like a missing feature.
+    """
+
+    def _run_config(self, env_file: Path, extra_env: dict, expr: str) -> str:
+        import subprocess
+
+        repo_root = Path(__file__).resolve().parent.parent
+        env = dict(os.environ)
+        env["WEBOT_ENV_FILE"] = str(env_file)
+        env.update(extra_env)
+        completed = subprocess.run(
+            [sys.executable, "-c",
+             "from src.config import load_config; print(%s)" % expr],
+            cwd=str(repo_root),
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return completed.stdout.strip()
+
+    def test_env_file_wins_over_inherited_variable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("MEDIA_VISION_ENABLED=true\n", encoding="utf-8")
+            self.assertEqual(
+                self._run_config(
+                    env_file,
+                    {"MEDIA_VISION_ENABLED": "false"},
+                    "load_config().media_vision_enabled",
+                ),
+                "True",
+            )
+
+    def test_empty_entry_keeps_operator_supplied_value(self):
+        """``KEY=`` means "use the default", not "blank it out"."""
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("DEEPSEEK_API_KEY=\n", encoding="utf-8")
+            self.assertEqual(
+                self._run_config(
+                    env_file,
+                    {"DEEPSEEK_API_KEY": "from-os-env"},
+                    "load_config().deepseek_api_key",
+                ),
+                "from-os-env",
+            )
+
+
 class FindEnvFileTests(unittest.TestCase):
     """Tests for find_env_file() behaviour."""
 

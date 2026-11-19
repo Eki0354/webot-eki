@@ -333,6 +333,15 @@ class Bot:
         else:
             logger.info("Model: %s", config.summarize_model)
         logger.info("Bot name: %r", config.bot_display_name)
+        # Worth its own line: when this says "off", every image stays
+        # [图片] and the media pipeline never even starts, which looks
+        # exactly like "the feature is missing" from the outside.
+        logger.info(
+            "Media vision: %s (provider=%s, data dir=%s)",
+            "on" if config.media_vision_enabled else "off",
+            config.image_key_provider,
+            config.wechat_data_dir or "<auto-detect>",
+        )
         if config.wechat_groups:
             logger.info("Groups: %s", config.wechat_groups)
         logger.info("DB path: %s", config.db_path)
