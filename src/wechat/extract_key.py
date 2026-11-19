@@ -337,6 +337,13 @@ def extract_image_keys(timeout: float = 5.0) -> dict:
     if not dll_path:
         raise RuntimeError("未找到 wx_key.dll，无法读取图片密钥")
 
+    # Check the process before touching the DLL: when WeChat is closed the
+    # answer cannot arrive no matter how long we retry, and blocking the
+    # startup path for `timeout` seconds per config read is a real cost.
+    if _find_wechat_pid() is None:
+        logger.info("微信未运行 — 跳过图片密钥读取")
+        return {}
+
     dll_err = _verify_dll_loadable(dll_path)
     if dll_err:
         raise RuntimeError(dll_err)

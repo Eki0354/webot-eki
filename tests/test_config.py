@@ -2,6 +2,7 @@
 
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -185,6 +186,74 @@ class DecodeWeChatGroupsTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # find_env_file
 # ---------------------------------------------------------------------------
+
+
+class WechatDataDirTests(unittest.TestCase):
+    """detect_wechat_data_dir / resolve_wechat_data_dir.
+
+    The settings page has always promised "leave WECHAT_DATA_DIR empty and it
+    is detected for you", but the media pipeline used to read the raw config
+    value, so an empty setting meant no ``.dat`` file was ever found while the
+    UI happily displayed a detected path.
+    """
+
+    def _make_install(self, root: Path, with_session_db: bool = True) -> Path:
+        base = root / "Documents" / "xwechat_files"
+        wxid = base / "wxid_test_abcd"
+        (wxid / "db_storage" / "session").mkdir(parents=True)
+        if with_session_db:
+            (wxid / "db_storage" / "session" / "session.db").write_bytes(b"")
+        return base
+
+    def test_detects_parent_of_wxid_dir(self):
+        from src.config import detect_wechat_data_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = self._make_install(root)
+            with patch.dict(os.environ, {"USERPROFILE": str(root)}):
+                self.assertEqual(detect_wechat_data_dir(), str(base))
+
+    def test_ignores_wxid_dir_without_session_db(self):
+        """A leftover folder is not an install; guessing would be worse."""
+        from src.config import detect_wechat_data_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._make_install(root, with_session_db=False)
+            with patch.dict(os.environ, {"USERPROFILE": str(root)}):
+                self.assertEqual(detect_wechat_data_dir(), "")
+
+    def test_returns_empty_when_nothing_matches(self):
+        from src.config import detect_wechat_data_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"USERPROFILE": tmp}):
+                self.assertEqual(detect_wechat_data_dir(), "")
+
+    def test_configured_value_wins(self):
+        from src.config import resolve_wechat_data_dir
+
+        config = MagicMock()
+        config.wechat_data_dir = r"D:\custom\wechat"
+        self.assertEqual(resolve_wechat_data_dir(config), r"D:\custom\wechat")
+
+    def test_empty_config_falls_back_to_detection(self):
+        from src.config import resolve_wechat_data_dir
+
+        config = MagicMock()
+        config.wechat_data_dir = ""
+        with patch("src.config.detect_wechat_data_dir",
+                   return_value=r"C:\detected"):
+            self.assertEqual(resolve_wechat_data_dir(config), r"C:\detected")
+
+    def test_whitespace_config_is_treated_as_empty(self):
+        from src.config import resolve_wechat_data_dir
+
+        config = MagicMock()
+        config.wechat_data_dir = "   "
+        with patch("src.config.detect_wechat_data_dir", return_value="detected"):
+            self.assertEqual(resolve_wechat_data_dir(config), "detected")
 
 
 class FindEnvFileTests(unittest.TestCase):

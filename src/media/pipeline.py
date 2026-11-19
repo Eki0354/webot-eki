@@ -30,7 +30,7 @@ What is supported, and why:
 import logging
 from typing import Optional
 
-from src.config import PROJECT_ROOT
+from src.config import PROJECT_ROOT, resolve_wechat_data_dir
 
 from .appmsg import looks_like_xml, reduce_appmsg, strip_sender_prefix
 from .blob import decode_blob, is_binary
@@ -68,7 +68,7 @@ class MediaPipeline:
         )
         self._emoji: Optional[EmojiStore] = (
             EmojiStore(
-                getattr(config, "wechat_data_dir", ""),
+                resolve_wechat_data_dir(config),
                 PROJECT_ROOT / "data" / "emoji_cache",
             )
             if self._vision
@@ -179,7 +179,7 @@ class MediaPipeline:
                 "MediaPipeline: image keys loaded for %d account(s)", len(table)
             )
         return ImageStore(
-            getattr(config, "wechat_data_dir", ""),
+            resolve_wechat_data_dir(config),
             PROJECT_ROOT / "data" / "image_cache",
             keys.xor_key,
             keys.aes_key_text,

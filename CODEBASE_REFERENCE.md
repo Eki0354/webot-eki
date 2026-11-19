@@ -225,6 +225,8 @@ todo_delete_keywords: list[str] = [
 | `_decode_wechat_groups(raw)` | ~20 | URL解码微信群名称 | `raw: str` | `str` (逗号分隔的解码后群名) |
 | `_sanitize_display_name(name)` | ~40 | 清理机器人显示名中的危险字符 | `name: str` | `str` |
 | `_resolve_project_root()` | ~70 | 解析项目根目录(支持 EXE frozen 模式) | 无 | `Path` |
+| `detect_wechat_data_dir()` | ~80 | 自动探测微信数据目录(包含 `wxid_*` 且带 `session.db` 的父目录); UI 与媒体管线共用同一份答案 | 无 | `str` (探测不到返回 `""`) |
+| `resolve_wechat_data_dir(config)` | ~110 | 返回读取附件用的微信数据目录: `WECHAT_DATA_DIR` 优先, 留空则回退到自动探测 | `config: BotConfig` | `str` |
 | `resolve_env_file()` | ~85 | 返回 .env 的权威路径(单一来源, 读写统一) | 无 | `Path` |
 | `find_env_file()` | ~100 | 返回实际存在的 .env 路径(canonical 优先, 向后兼容 cwd) | 无 | `Path \| None` |
 | `apply_env_file(env_path=None)` | ~120 | 把 .env 重新载入 `os.environ`(.env→进程内存的唯一入口, `override=True`; 文件缺失/读取失败返回 None) | `env_path: Path \| None` | `Path \| None` |

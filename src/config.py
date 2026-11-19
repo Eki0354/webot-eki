@@ -98,6 +98,48 @@ def resolve_env_file() -> Path:
     return PROJECT_ROOT / ".env"
 
 
+def detect_wechat_data_dir() -> str:
+    """Auto-detect the default WeChat data directory (parent of ``wxid_*``).
+
+    Returns the base directory path, or empty string when nothing looks like
+    a WeChat install.  This lives in ``config`` rather than in the web layer
+    because both the UI *and* the media pipeline need the same answer: the
+    UI promises "leave WECHAT_DATA_DIR empty and it is detected for you", and
+    a pipeline that skipped the detection found no ``.dat`` file at all while
+    the settings page showed a detected path.
+    """
+    candidates = [
+        Path(os.environ.get("USERPROFILE", "")) / "Documents" / "xwechat_files",
+        Path(os.environ.get("USERPROFILE", "")) / "Documents" / "WeChat Files",
+    ]
+    for base in candidates:
+        if not base.exists():
+            continue
+        try:
+            wxid_dirs = [d for d in base.iterdir() if d.is_dir() and d.name.startswith("wxid_")]
+            for wxid_dir in wxid_dirs:
+                session_db = wxid_dir / "db_storage" / "session" / "session.db"
+                if session_db.exists():
+                    return str(base)
+        except PermissionError:
+            continue
+    return ""
+
+
+def resolve_wechat_data_dir(config) -> str:
+    """Return the WeChat data directory to read attachments from.
+
+    ``WECHAT_DATA_DIR`` wins when set; otherwise the auto-detected default is
+    used, which is what the settings page has always promised.  Returns an
+    empty string when neither yields anything — callers must then degrade to
+    the ``[图片]`` placeholder rather than guess.
+    """
+    configured = str(getattr(config, "wechat_data_dir", "") or "").strip()
+    if configured:
+        return configured
+    return detect_wechat_data_dir()
+
+
 def find_env_file() -> Path | None:
     """Return the .env path that actually exists, or None.
 
