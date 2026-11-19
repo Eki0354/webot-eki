@@ -572,9 +572,59 @@ class ImageStoreTests(unittest.TestCase):
             md5 = "a" * 32
             (img / f"{md5}.dat").write_bytes(_v2(b"\xff\xd8\xff" + b"x" * 100))
 
-            store = self._store(root, xor_key=None, aes_key_text="")
+            # Derivation disabled: with no key at all there is nothing to try.
+            store = self._store(
+                root, xor_key=None, aes_key_text="", allow_derive_xor=False
+            )
             self.assertFalse(store.can_decrypt)
             self.assertIsNone(store.fetch(self._msg(md5, 100)))
+
+    def test_xor_key_is_derived_when_not_configured(self):
+        """The XOR key is recoverable from the files, not a secret to supply."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            img = self._img_dir(root)
+            key = 0xED
+            # Three files sharing one key — enough votes to settle it.
+            for i in range(3):
+                md5 = f"{i}" * 32
+                jpeg = b"\xff\xd8\xff\xe0" + b"J" * 200 + b"\xff\xd9"
+                tail = bytes(b ^ key for b in jpeg[-16:])
+                (img / f"{md5}.dat").write_bytes(
+                    _v2(jpeg[:-16] + tail, xor_size=16)
+                )
+
+            store = self._store(
+                root, xor_key=None, aes_key_text="", allow_derive_xor=True
+            )
+            self.assertEqual(store._resolve_xor_key(), key)
+            # The answer is cached: a second call must not rescan.
+            self.assertEqual(store._resolve_xor_key(), key)
+
+    def test_derivation_gives_up_when_undecidable(self):
+        """Too few matching files must not produce a guess."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            img = self._img_dir(root)
+            # A tail that no key can turn into a terminator.
+            (img / f"{'a' * 32}.dat").write_bytes(
+                _v2(b"\xff\xd8\xff" + b"x" * 100, xor_size=16)
+            )
+
+            store = self._store(
+                root, xor_key=None, aes_key_text="", allow_derive_xor=True
+            )
+            self.assertIsNone(store._resolve_xor_key())
+
+    def test_configured_xor_key_is_never_overridden(self):
+        """An explicit key wins; derivation must not run at all."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._img_dir(root)
+
+            store = self._store(root, xor_key=0x37, allow_derive_xor=True)
+            self.assertEqual(store._resolve_xor_key(), 0x37)
+            self.assertFalse(store._xor_derive_done)
 
     def test_fetch_decrypts_and_caches(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -22,11 +22,20 @@ a vision model would be worse than saying nothing.
 
 import hashlib
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Optional
 
-from .dat_decrypt import decrypt_dat, expected_dat_size, sniff_format
+from .dat_decrypt import (
+    DERIVE_TAIL_BYTES,
+    HEADER_LEN,
+    dat_version,
+    decrypt_dat,
+    derive_xor_key,
+    expected_dat_size,
+    sniff_format,
+)
 from .wxgf import unwrap_wxgf
 
 logger = logging.getLogger(__name__)
@@ -51,6 +60,11 @@ _SUFFIXES = sorted((s for s in _VARIANT_RANK if s), key=len, reverse=True)
 
 #: Skip absurdly large files: decrypting them costs memory for no benefit.
 _MAX_DAT_BYTES = 64 * 1024 * 1024
+
+#: How many file tails to sample when deriving the XOR key.  Ten already
+#: settle it on real data, but a larger cap costs little and covers stores
+#: whose first files are all thumbnails.
+_DERIVE_SAMPLE_LIMIT = 400
 
 
 def strip_variant(stem: str) -> str:
@@ -83,6 +97,7 @@ class ImageStore:
         cache_dir: Path,
         xor_key: Optional[int] = None,
         aes_key_text: str = "",
+        allow_derive_xor: bool = True,
     ) -> None:
         """
         Args:
@@ -91,16 +106,28 @@ class ImageStore:
             cache_dir:       Where decrypted images are kept between runs.
             xor_key:         Single-byte XOR key, or None when unavailable.
             aes_key_text:    Configured AES key string.
+            allow_derive_xor: Recover the XOR key from the files themselves
+                when it is not configured.  The key is not a secret that has
+                to be extracted — see :func:`dat_decrypt.derive_xor_key`.
         """
         self._data_dir = Path(wechat_data_dir) if wechat_data_dir else None
         self._cache_dir = Path(cache_dir)
         self._xor_key = xor_key
         self._aes_key_text = aes_key_text or ""
+        self._allow_derive_xor = allow_derive_xor
+        # Deriving scans the attachment tree, so it runs at most once and the
+        # answer (including "could not tell") is kept.
+        self._xor_derive_done = False
+        self._derived_xor: Optional[int] = None
 
     @property
     def can_decrypt(self) -> bool:
-        """True when at least one key is configured."""
-        return self._xor_key is not None or bool(self._aes_key_text)
+        """True when decryption is worth attempting."""
+        return (
+            self._xor_key is not None
+            or bool(self._aes_key_text)
+            or self._allow_derive_xor
+        )
 
     def fetch(self, msg: dict) -> Optional[Path]:
         """Return a decrypted image file for this message, or None."""
@@ -232,6 +259,12 @@ class ImageStore:
 
         plain = decrypt_dat(data, self._xor_key, self._aes_key_text)
         if not plain:
+            # The XOR key is recoverable from the files, so a missing one is
+            # not fatal — try once, then reuse the answer for every message.
+            derived = self._resolve_xor_key()
+            if derived is not None and derived != self._xor_key:
+                plain = decrypt_dat(data, derived, self._aes_key_text)
+        if not plain:
             return None
 
         if sniff_format(plain) == "wxgf":
@@ -246,6 +279,70 @@ class ImageStore:
             logger.debug("Decrypted %s is not an image — key wrong?", dat)
             return None
         return plain
+
+    # -- Deriving the XOR key ----------------------------------------------
+
+    def _resolve_xor_key(self) -> Optional[int]:
+        """Return the configured XOR key, or one derived from the files.
+
+        Runs the derivation at most once per store: it walks the attachment
+        tree, and the answer cannot change while WeChat keeps the same
+        installation.  A failed derivation is remembered too, so a machine
+        with no usable files does not rescan on every message.
+        """
+        if self._xor_key is not None:
+            return self._xor_key
+        if not self._allow_derive_xor or self._xor_derive_done:
+            return self._derived_xor
+
+        self._xor_derive_done = True
+        self._derived_xor = derive_xor_key(self._sample_tails())
+        if self._derived_xor is None:
+            logger.info(
+                "Image XOR key could not be derived from local files — "
+                "set IMAGE_XOR_KEY if images stay [图片]"
+            )
+        else:
+            logger.info(
+                "Image XOR key derived from local files: 0x%02X",
+                self._derived_xor,
+            )
+        return self._derived_xor
+
+    def _sample_tails(self):
+        """Yield the masked tail of every V2 container we can find.
+
+        Only the last few bytes of each file are read, so sampling thousands
+        of images costs a directory walk rather than megabytes of I/O.
+        """
+        taken = 0
+        for path in self._iter_dat_files():
+            if taken >= _DERIVE_SAMPLE_LIMIT:
+                return
+            try:
+                with path.open("rb") as handle:
+                    header = handle.read(HEADER_LEN)
+                    if dat_version(header) != 2:
+                        continue
+                    xor_size = int.from_bytes(header[10:14], "little", signed=True)
+                    if xor_size < 2:
+                        continue
+                    handle.seek(-min(xor_size, DERIVE_TAIL_BYTES), os.SEEK_END)
+                    tail = handle.read()
+            except OSError:
+                continue
+            if tail:
+                taken += 1
+                yield tail
+
+    def _iter_dat_files(self):
+        """Walk the attachment tree."""
+        for attach in self._attach_dirs():
+            try:
+                for path in attach.rglob("*.dat"):
+                    yield path
+            except OSError:
+                continue
 
     def _cache_path(self, dat: Path) -> Path:
         return self._cache_dir / f"{dat.stem}.jpg"

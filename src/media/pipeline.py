@@ -154,15 +154,18 @@ class MediaPipeline:
         return VisionClient(key, model, base, disable_thinking)
 
     def _create_image(self, config) -> Optional[ImageStore]:
-        """Build the image store, or None when no key is configured.
+        """Build the image store, or None when nothing can be decrypted.
 
-        Without keys every ``.dat`` stays encrypted, so building the store
-        would only cost directory scans for nothing.
+        The XOR key no longer has to be configured: it is recoverable from
+        the ``.dat`` files themselves, so a store is still worth building
+        when only the AES key is present.  With neither key, a V2 container
+        cannot be opened at all, so scanning the tree would be pure cost.
         """
         keys = resolve_image_keys(config)
         if not keys.usable:
             logger.info(
-                "MediaPipeline: image keys not configured — images stay [图片]"
+                "MediaPipeline: no image keys — images stay [图片]. "
+                "IMAGE_AES_KEY is the one that must be supplied."
             )
             return None
         return ImageStore(
@@ -170,6 +173,8 @@ class MediaPipeline:
             PROJECT_ROOT / "data" / "image_cache",
             keys.xor_key,
             keys.aes_key_text,
+            # Only worth deriving when the user did not already pin it down.
+            allow_derive_xor=keys.xor_key is None,
         )
 
     def _describe_image(self, msg: dict, chat_id: str) -> Optional[str]:

@@ -730,6 +730,8 @@ todo_delete_keywords: list[str] = [
 |---|---|---|---|
 | `sniff_format(data)` | 按魔数返回扩展名；`wxgf` 容器返回 `"wxgf"` | `data: bytes` | `str \| None` |
 | `dat_version(data)` | 2 = AES+XOR 容器，1 = 全文件 XOR，0 = 未知 | `data: bytes` | `int` |
+| `tail_candidates(tail)` | 返回能让 *tail* 以图片结尾符收尾的所有 XOR 密钥 | `tail: bytes` | `list[int]` |
+| `derive_xor_key(tails, min_votes=3)` | 对多个文件尾段投票推导 XOR 密钥；票数不足或次高票接近时返回 None | `tails, min_votes: int` | `int \| None` |
 | `parse_xor_key(value)` | 归一化 XOR 密钥到 `0..255`（接受 `0x37` / `55` / int） | `value` | `int \| None` |
 | `aes_key_from_text(text)` | 取字符串**前 16 个 ASCII 字符**作 AES key（非 hex 解码） | `text: str` | `bytes \| None` |
 | `expected_dat_size(plain_length, aes_size=1024)` | 容器尺寸公式；`aes_size=1024` 时等于 `length + 31` | `plain_length: int, aes_size: int` | `int` |
@@ -758,9 +760,11 @@ todo_delete_keywords: list[str] = [
 |---|---|---|---|
 | `strip_variant(stem)` | 剥离 `_h`/`_hd`/`_t` 等尺寸后缀还原基名（长后缀优先） | `stem: str` | `str` |
 | `variant_rank(stem)` | 变体优先级：`_h`(600) > 无后缀(500) > `_t`(100) | `stem: str` | `int` |
-| `ImageStore.__init__(wechat_data_dir, cache_dir, xor_key, aes_key_text)` | 初始化图片存取器 | 见参数 | `None` |
-| `ImageStore.can_decrypt` (property) | 是否配置了任一密钥 | 无 | `bool` |
+| `ImageStore.__init__(wechat_data_dir, cache_dir, xor_key, aes_key_text, allow_derive_xor=True)` | 初始化图片存取器 | 见参数 | `None` |
+| `ImageStore.can_decrypt` (property) | 是否值得尝试解密（有密钥或允许推导） | 无 | `bool` |
 | `ImageStore.fetch(msg)` | 定位 → 解密 → wxgf 解包 → 缓存，返回图片路径 | `msg: dict` | `Path \| None` |
+| `ImageStore._resolve_xor_key()` | 返回配置的 XOR 密钥，未配置时从文件投票推导（只跑一次，结果含失败都缓存） | 无 | `int \| None` |
+| `ImageStore._sample_tails()` | 逐个读出 V2 容器的掩码尾段（只读末尾 16 字节，上限 400 个） | 无 | `Iterator[bytes]` |
 
 `src/media/pipeline.py` — 统一入口：
 
@@ -1854,9 +1858,11 @@ WcdbBackend._standardize(msg)
 
 图片链路的三个前提（任一缺失即降级 `[图片]`，绝不输出半解密的乱码）：
 
-1. **密钥** — 每台机器不同，不在消息 XML 里、也无法推导，必须 `IMAGE_XOR_KEY` / `IMAGE_AES_KEY` 手动填
+1. **AES 密钥** — 每台机器不同，不在消息 XML 里、也无法推导，必须 `IMAGE_AES_KEY` 手动填（XOR 密钥可自动推导，见下）
 2. **容器结构** — `.dat` 是四段拼接，不是整段 AES：只有头部一段是 AES-128-ECB，中段明文，尾段单字节 XOR
 3. **codec** — `wxgf` 载荷是 HEVC；打包版为控制体积不含 PyAV，这类图片降级 `[图片]`
+
+**XOR 密钥不需要提取。** 尾段是单字节 XOR，而图片有固定结尾符（JPEG `FF D9`、PNG `IEND®B\`\x82`），所以密钥可以从文件本身反推。`ImageStore._resolve_xor_key()` 在未配置时遍历附件目录、对每个 V2 文件的尾段投票，选出唯一能让最多文件正确收尾的字节。实测本机 3807 个文件：真值 `0xED` 得 2650 票，次高仅 1 票，前 10 个文件即可稳定得出，耗时 0.15s，结果（含推导失败）每次运行只算一次。
 
 早前“整段 AES 全矩阵 0 命中 / XML `aeskey` 0/5 / CDN 直连 400”的结论，是因为把四段容器当成单一密码体；`aeskey` 签名的是 CDN 下载，与本地文件无关。
 
@@ -1866,7 +1872,7 @@ WcdbBackend._standardize(msg)
 |---|---|---|
 | `media_vision_enabled` | `False` | 视觉识别主开关；关闭时仍做文本归约 |
 | `media_vision_model` | `""` | 视觉模型覆盖；空 = 复用 `AI_BACKEND` 的模型 |
-| `image_xor_key` | `""` | 单字节 XOR 密钥；接受 `0x37` / `55` |
+| `image_xor_key` | `""` | 单字节 XOR 密钥；接受 `0x37` / `55`。**留空则自动从本地文件推导** |
 | `image_aes_key` | `""` | AES 密钥取字符串**前 16 个 ASCII 字符**（非 hex 解码） |
 | `image_key_provider` | `"env"` | `env` 读 `.env`；`file` 读 `data/image_keys.json`；`.env` 已填时始终优先 |
 
