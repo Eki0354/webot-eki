@@ -30,6 +30,23 @@ def _find_free_port():
         return s.getsockname()[1]
 
 
+#: The built SPA hard-codes its backend origin (``http://127.0.0.1:7327``), so
+#: browser tests can only exercise the real page when the server listens on
+#: that exact port.  Fall back to a free port when it is taken — API-level
+#: tests still work, and the browser tests skip with a clear reason.
+PREFERRED_PORT = 7327
+
+
+def _pick_test_port():
+    """Port 7327 when available, otherwise any free port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((SERVER_HOST, PREFERRED_PORT))
+            return PREFERRED_PORT
+        except OSError:
+            return _find_free_port()
+
+
 def _start_server(port):
     """Start the web server in a daemon thread. Returns when ready."""
     import traceback
@@ -95,7 +112,7 @@ def server():
     if not ui_dist.exists():
         pytest.skip("UI not built. Run: cd ui && npm run build")
 
-    SERVER_PORT = _find_free_port()
+    SERVER_PORT = _pick_test_port()
     BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 
     project_root = Path(__file__).resolve().parent.parent
@@ -280,8 +297,19 @@ except ImportError:
 def browser():
     if not PLAYWRIGHT_AVAILABLE:
         pytest.skip("Playwright not installed. Run: pip install playwright")
+    # Playwright's bundled Chromium is a ~150 MB download that fails outright
+    # on a restricted network.  A locally installed Chrome/Edge is the same
+    # engine, so allow opting into it: WEBOT_TEST_BROWSER_CHANNEL=chrome|msedge.
+    channel = os.environ.get("WEBOT_TEST_BROWSER_CHANNEL") or None
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        try:
+            browser = p.chromium.launch(headless=True, channel=channel)
+        except Exception as e:
+            pytest.skip(
+                f"Cannot launch browser (channel={channel!r}): {e}\n"
+                "Run: python -m playwright install chromium, "
+                "or set WEBOT_TEST_BROWSER_CHANNEL=chrome/msedge"
+            )
         yield browser
         browser.close()
 
