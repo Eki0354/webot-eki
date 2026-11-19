@@ -12,7 +12,7 @@ import threading
 import time
 from pathlib import Path
 
-from .config import BotConfig, PROJECT_ROOT
+from .config import BotConfig, ENV_FILE_USED, PROJECT_ROOT, resolve_env_file
 from .db import initialize_db, MessageStore
 from .summarize import create_summarizer
 from .trigger import TriggerDetector
@@ -341,6 +341,20 @@ class Bot:
             "on" if config.media_vision_enabled else "off",
             config.image_key_provider,
             config.wechat_data_dir or "<auto-detect>",
+        )
+        # Which .env was applied, and the raw values behind the line above.
+        # "off" alone cannot be diagnosed: it is the default, so it looks
+        # the same whether the file says false, sits elsewhere, or was
+        # never read.  These two lines separate those cases.
+        logger.info(
+            "Config root: %s | env: %s",
+            PROJECT_ROOT,
+            ENV_FILE_USED or "<none> (canonical: %s)" % resolve_env_file(),
+        )
+        logger.info(
+            "Raw env: MEDIA_VISION_ENABLED=%r IMAGE_KEY_PROVIDER=%r",
+            os.environ.get("MEDIA_VISION_ENABLED"),
+            os.environ.get("IMAGE_KEY_PROVIDER"),
         )
         if config.wechat_groups:
             logger.info("Groups: %s", config.wechat_groups)

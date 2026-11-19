@@ -224,6 +224,12 @@ else:
         ".env not found (canonical: %s). Using defaults.", resolve_env_file()
     )
 
+#: The .env this process actually applied (None when none was found).
+#: Exposed because the startup log runs before logging is configured, so
+#: this line is normally lost — callers log it again once handlers exist,
+#: which is the only way to tell "wrong file" apart from "wrong value".
+ENV_FILE_USED: "Path | None" = _env_path
+
 
 # Serializes .env writes across HTTP threads and background workers.
 _env_write_lock = _threading.Lock()
