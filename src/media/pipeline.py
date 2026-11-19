@@ -20,11 +20,11 @@ What is supported, and why:
   other 6 downloaded from the CDN; 6 of 9 produced a description.  The
   remaining 3 carry no ``cdnurl`` *and* their local file is an opaque
   container that is neither zstd nor zlib, so they degrade to ``[表情]``.
-* **image (localType=3)** — *not* supported.  The ``.dat`` container is
-  neither XOR (payload length is not block-aligned under either scheme) nor
-  AES with the XML ``aeskey`` (0/5 on targeted samples), and its CDN
-  thumbnails answer HTTP 400 because the filekey needs client-side signing.
-  These fall back to ``[图片]``.
+* **image (localType=3)** — the local ``.dat`` file is decrypted (four-segment
+  container) and a ``wxgf`` payload is unwrapped to JPEG, then described.
+  This needs the per-machine image keys (``IMAGE_XOR_KEY`` /
+  ``IMAGE_AES_KEY``) *and* vision; without either, the message keeps its
+  ``[图片]`` placeholder.  See :mod:`src.media.image`.
 """
 
 import logging
@@ -35,6 +35,8 @@ from src.config import PROJECT_ROOT
 from .appmsg import looks_like_xml, reduce_appmsg, strip_sender_prefix
 from .blob import decode_blob, is_binary
 from .emoji import EmojiStore
+from .image import ImageStore
+from .keys import resolve_image_keys
 from .vision import VisionClient
 
 logger = logging.getLogger(__name__)
@@ -72,21 +74,31 @@ class MediaPipeline:
             if self._vision
             else None
         )
-        self._stats = {"emoji": 0, "described": 0, "failed": 0}
+        self._image: Optional[ImageStore] = (
+            self._create_image(config) if self._vision else None
+        )
+        self._stats = {
+            "emoji": 0, "image": 0, "described": 0, "failed": 0,
+        }
         if self._vision_on:
             logger.info(
-                "MediaPipeline vision %s (model=%s)",
+                "MediaPipeline vision %s (model=%s); image decryption %s",
                 "ready" if self._vision else "unavailable",
                 getattr(config, "media_vision_model", "") or "backend default",
+                "ready" if (self._image and self._image.can_decrypt)
+                else "no keys",
             )
 
     # -- Public ------------------------------------------------------------
 
-    def process(self, msg: dict) -> Optional[str]:
+    def process(self, msg: dict, chat_id: str = "") -> Optional[str]:
         """Describe a media message.
 
         Args:
             msg: Raw WCDB message dict.
+            chat_id: Session the message belongs to.  Image files live under
+                ``msg/attach/{md5(chat_id)}/``, so an image message cannot be
+                located without it.
 
         Returns:
             A short description, or None when nothing could be extracted
@@ -98,9 +110,7 @@ class MediaPipeline:
             return None
 
         if local_type == LOCAL_TYPE_IMAGE:
-            # Container not decryptable — say so plainly rather than
-            # spending a vision call on an unreadable file.
-            return None
+            return self._describe_image(msg, chat_id)
 
         if local_type == LOCAL_TYPE_EMOJI:
             return self._describe_emoji(msg)
@@ -142,6 +152,50 @@ class MediaPipeline:
             )
             return None
         return VisionClient(key, model, base, disable_thinking)
+
+    def _create_image(self, config) -> Optional[ImageStore]:
+        """Build the image store, or None when no key is configured.
+
+        Without keys every ``.dat`` stays encrypted, so building the store
+        would only cost directory scans for nothing.
+        """
+        keys = resolve_image_keys(config)
+        if not keys.usable:
+            logger.info(
+                "MediaPipeline: image keys not configured — images stay [图片]"
+            )
+            return None
+        return ImageStore(
+            getattr(config, "wechat_data_dir", ""),
+            PROJECT_ROOT / "data" / "image_cache",
+            keys.xor_key,
+            keys.aes_key_text,
+        )
+
+    def _describe_image(self, msg: dict, chat_id: str) -> Optional[str]:
+        """Decrypt the image and describe it."""
+        if not self._vision or not self._vision.available or not self._image:
+            return None
+
+        self._stats["image"] += 1
+        # The raw message carries no session id, and the file lives under a
+        # directory named after it, so hand the pipeline's caller a copy
+        # rather than mutating the message the backend still needs.
+        located = dict(msg)
+        if chat_id:
+            located.setdefault("chat_id", chat_id)
+
+        image = self._image.fetch(located)
+        if not image:
+            self._stats["failed"] += 1
+            return None
+
+        description = self._vision.describe(image)
+        if description:
+            self._stats["described"] += 1
+            return f"[图片] {description}"
+        self._stats["failed"] += 1
+        return None
 
     def _describe_emoji(self, msg: dict) -> Optional[str]:
         """Download/locate the emoji image and describe it."""

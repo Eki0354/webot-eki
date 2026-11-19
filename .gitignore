@@ -67,6 +67,10 @@ data/bot_status.json
 
 # Media cache (emoji images downloaded from the CDN at runtime)
 data/emoji_cache/
+# Decrypted images — rebuilt on demand, and contains private chat photos
+data/image_cache/
+# Per-machine image keys pasted from an extractor (IMAGE_KEY_PROVIDER=file)
+data/image_keys.json
 
 # Runtime group name resolution (contains private chatroom IDs)
 data/group_names.json

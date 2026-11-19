@@ -370,6 +370,22 @@ class BotConfig:
     # Vision model override. Empty = reuse the configured AI backend's model.
     media_vision_model: str = ""
 
+    # === Image decryption (localType=3 ``.dat`` containers) ===
+    # WeChat encrypts received images per machine; these keys are not in the
+    # message XML and cannot be derived, so they have to be supplied.  Both
+    # default to empty, which means "no key" — images then degrade to the
+    # ``[图片]`` placeholder rather than being half-decrypted into garbage.
+    #
+    # ``image_xor_key`` is a single byte, written as ``0x37`` (hex) or ``55``
+    # (decimal).  ``image_aes_key`` is used as the *first 16 ASCII characters*
+    # of the string, not hex-decoded — see src/media/dat_decrypt.py.
+    image_xor_key: str = ""
+    image_aes_key: str = ""
+    # Where the keys come from: "env" (this config) or "file" (a JSON file at
+    # data/image_keys.json, convenient for pasting a third-party extractor's
+    # output without editing .env).  Keys already set here always win.
+    image_key_provider: str = "env"
+
 
 def _safe_float(raw: str, default: float, label: str) -> float:
     """Parse env value to float, raising RuntimeError with a friendly message on failure."""
@@ -640,6 +656,10 @@ def load_config() -> BotConfig:
         # Media (image / emoji / appmsg)
         "media_vision_enabled": os.getenv("MEDIA_VISION_ENABLED", "false").strip().lower() == "true",
         "media_vision_model": os.getenv("MEDIA_VISION_MODEL", "").strip(),
+        # Image decryption keys (per machine, not derivable — see dat_decrypt.py)
+        "image_xor_key": os.getenv("IMAGE_XOR_KEY", "").strip(),
+        "image_aes_key": os.getenv("IMAGE_AES_KEY", "").strip(),
+        "image_key_provider": os.getenv("IMAGE_KEY_PROVIDER", "env").strip().lower() or "env",
     }
 
     deepseek_model = os.getenv("DEEPSEEK_MODEL")

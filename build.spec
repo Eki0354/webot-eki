@@ -74,7 +74,13 @@ a = Analysis(
         'src.wechat.native', 'src.wechat.native.injector',
         'src.media', 'src.media.appmsg', 'src.media.blob',
         'src.media.emoji', 'src.media.pipeline', 'src.media.vision',
+        'src.media.dat_decrypt', 'src.media.wxgf',
+        'src.media.image', 'src.media.keys',
         'zstandard',
+        # AES-128-ECB for the .dat image container.  PyAV (HEVC) is
+        # deliberately excluded below: wxgf images then degrade to the
+        # [图片] placeholder instead of growing the EXE by ~100 MB.
+        'Crypto', 'Crypto.Cipher', 'Crypto.Cipher.AES',
         'src.web', 'src.web.server',
         'src.router', 'src.welcome',
         'src.todo', 'src.todo.store', 'src.todo.handler',

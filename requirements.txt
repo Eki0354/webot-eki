@@ -17,3 +17,5 @@ opencc-python-reimplemented>=0.1.7
 
 # Media messages — WeChat stores non-text bodies as zstd-compressed BLOBs
 zstandard>=0.22
+# Image decryption — the .dat container's head is AES-128-ECB
+pycryptodome>=3.20

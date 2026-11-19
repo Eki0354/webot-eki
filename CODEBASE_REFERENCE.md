@@ -137,6 +137,9 @@ grep "文件名" CODEBASE_REFERENCE.md
 | `VOICE_ASR_TO_SIMPLIFIED` | `bool` | `True` | `src/config.py` | `src/voice/asr.py` (各ASR后端) |
 | `MEDIA_VISION_ENABLED` | `bool` | `False` | `src/config.py` | `src/media/pipeline.py:MediaPipeline.__init__()` |
 | `MEDIA_VISION_MODEL` | `str` | `""` | `src/config.py` | `src/media/pipeline.py:MediaPipeline._create_vision()` |
+| `IMAGE_XOR_KEY` | `str` | `""` | `src/config.py` | `src/media/keys.py:resolve_image_keys()` |
+| `IMAGE_AES_KEY` | `str` | `""` | `src/config.py` | `src/media/keys.py:resolve_image_keys()` |
+| `IMAGE_KEY_PROVIDER` | `str` | `"env"` | `src/config.py` | `src/media/keys.py:resolve_image_keys()` |
 | `FEISHU_EXPORT_ENABLED` | `bool` | `False` | `src/config.py` | `src/integrations/feishu/exporter.py` |
 | `FEISHU_APP_ID` | `str` | `""` | `src/config.py` | `src/integrations/feishu/client.py:FeishuClient.__init__()` |
 | `FEISHU_APP_SECRET` | `str` | `""` | `src/config.py` | `src/integrations/feishu/client.py` |
@@ -721,19 +724,57 @@ todo_delete_keywords: list[str] = [
 | `VisionClient.available` (property) | key 与 model 是否齐备 | 无 | `bool` |
 | `VisionClient.describe(image_path, prompt)` | 返回一句话中文描述 | `image_path: Path, prompt: str` | `str \| None` |
 
+`src/media/dat_decrypt.py` — `.dat` 四段容器解密：
+
+| 函数 | 描述 | 参数 | 返回值 |
+|---|---|---|---|
+| `sniff_format(data)` | 按魔数返回扩展名；`wxgf` 容器返回 `"wxgf"` | `data: bytes` | `str \| None` |
+| `dat_version(data)` | 2 = AES+XOR 容器，1 = 全文件 XOR，0 = 未知 | `data: bytes` | `int` |
+| `parse_xor_key(value)` | 归一化 XOR 密钥到 `0..255`（接受 `0x37` / `55` / int） | `value` | `int \| None` |
+| `aes_key_from_text(text)` | 取字符串**前 16 个 ASCII 字符**作 AES key（非 hex 解码） | `text: str` | `bytes \| None` |
+| `expected_dat_size(plain_length, aes_size=1024)` | 容器尺寸公式；`aes_size=1024` 时等于 `length + 31` | `plain_length: int, aes_size: int` | `int` |
+| `decrypt_dat(data, xor_key, aes_key_text)` | 解密为原始图片字节；缺 key / 结构不符返回 None | 见参数 | `bytes \| None` |
+| `decrypt_dat_file(path, xor_key, aes_key_text)` | 解密文件并嗅探扩展名 | 见参数 | `tuple[bytes, str] \| None` |
+
+`src/media/wxgf.py` — `wxgf`/HEVC 容器解包：
+
+| 函数 | 描述 | 参数 | 返回值 |
+|---|---|---|---|
+| `is_wxgf(data)` | 是否为 `wxgf` 容器 | `data: bytes` | `bool` |
+| `is_plain_image(data)` | 是否已是可直接用的图片（JPEG/PNG/GIF/BMP/WEBP） | `data: bytes` | `bool` |
+| `av_available()` | PyAV 是否可导入（决定能否解 HEVC） | 无 | `bool` |
+| `unwrap_wxgf(data)` | 容器 → JPEG；已是图片原样返回；无 codec 返回 None | `data: bytes` | `bytes \| None` |
+
+`src/media/keys.py` — 图片密钥来源解析：
+
+| 函数 | 描述 | 参数 | 返回值 |
+|---|---|---|---|
+| `resolve_image_keys(config, data_dir=None)` | 按 `IMAGE_KEY_PROVIDER` 取密钥；`.env` 显式值优先于文件 | `config, data_dir: Path` | `ImageKeys` |
+| `ImageKeys.usable` (property) | 至少一个密钥可用 | 无 | `bool` |
+
+`src/media/image.py` — 图片消息定位/解密/缓存：
+
+| 函数 | 描述 | 参数 | 返回值 |
+|---|---|---|---|
+| `strip_variant(stem)` | 剥离 `_h`/`_hd`/`_t` 等尺寸后缀还原基名（长后缀优先） | `stem: str` | `str` |
+| `variant_rank(stem)` | 变体优先级：`_h`(600) > 无后缀(500) > `_t`(100) | `stem: str` | `int` |
+| `ImageStore.__init__(wechat_data_dir, cache_dir, xor_key, aes_key_text)` | 初始化图片存取器 | 见参数 | `None` |
+| `ImageStore.can_decrypt` (property) | 是否配置了任一密钥 | 无 | `bool` |
+| `ImageStore.fetch(msg)` | 定位 → 解密 → wxgf 解包 → 缓存，返回图片路径 | `msg: dict` | `Path \| None` |
+
 `src/media/pipeline.py` — 统一入口：
 
 | 函数 | 描述 | 参数 | 返回值 |
 |---|---|---|---|
 | `MediaPipeline.__init__(config)` | 初始化媒体管道 | `config` | `None` |
-| `MediaPipeline.process(msg)` | 媒体消息 → 文本（占位符由调用方兜底） | `msg: dict` | `str \| None` |
-| `MediaPipeline.stats()` | 计数器快照 | 无 | `dict` |
+| `MediaPipeline.process(msg, chat_id="")` | 媒体消息 → 文本（占位符由调用方兜底）；图片需 `chat_id` 定位目录 | `msg: dict, chat_id: str` | `str \| None` |
+| `MediaPipeline.stats()` | 计数器快照（`emoji`/`image`/`described`/`failed`） | 无 | `dict` |
 
 模块级常量：
 
 | 常量 | 值 | 说明 |
 |---|---|---|
-| `LOCAL_TYPE_IMAGE` | `3` | 图片（`.dat` 容器不可解，恒降级 `[图片]`） |
+| `LOCAL_TYPE_IMAGE` | `3` | 图片（`.dat` 解密 + wxgf 解包，需密钥与视觉） |
 | `LOCAL_TYPE_EMOJI` | `47` | 表情/贴纸 |
 | `LOCAL_TYPE_SYSTEM` | `10000` | 系统提示（加入/退出/撤回），直接丢弃 |
 
@@ -1757,10 +1798,14 @@ MacHybridBackend
 
 | 文件 | 路径 | 角色 |
 |---|---|---|
-| `pipeline.py` | `src/media/pipeline.py` | 统一入口 (归约 + 表情视觉描述) |
+| `pipeline.py` | `src/media/pipeline.py` | 统一入口 (归约 + 表情/图片视觉描述) |
 | `blob.py` | `src/media/blob.py` | BLOB 消息体解码 (base64 → zstd → 文本) |
 | `appmsg.py` | `src/media/appmsg.py` | appmsg/sysmsg XML → 一行文本 |
 | `emoji.py` | `src/media/emoji.py` | 表情图片定位 (本地 Persist / CDN 下载) |
+| `image.py` | `src/media/image.py` | 图片定位 (`msg/attach/{md5(session)}/`) + 解密 + 缓存 |
+| `dat_decrypt.py` | `src/media/dat_decrypt.py` | `.dat` 四段容器解析 (AES-128-ECB 头 + 明文 + XOR 尾) |
+| `wxgf.py` | `src/media/wxgf.py` | `wxgf`/HEVC 容器解包 (PyAV 可选) |
+| `keys.py` | `src/media/keys.py` | 图片密钥来源解析 (`env` / `file`) |
 | `vision.py` | `src/media/vision.py` | 图片描述 (OpenAI 兼容接口) |
 
 #### 调用链
@@ -1773,8 +1818,16 @@ WcdbBackend._standardize(msg)
   ├── localType == 34  → _try_voice()
   │
   ├── localType in {3,43,47,48,49}
-  │     └── _try_media(msg) or format_nontext_content(localType)
-  │           ├── 3  (图片)   → None → "[图片]"（.dat 容器不可解）
+  │     └── _try_media(msg, talker) or format_nontext_content(localType)
+  │           ├── 3  (图片)   → MediaPipeline._describe_image(msg, chat_id)
+  │           │     ├── ImageStore.fetch(msg)
+  │           │     │     ├── 定位 msg/attach/{md5(chat_id)}/{yyyy-MM}/Img/*.dat
+  │           │     │     │     匹配键: 基名（剥 _h/_hd/_t 后缀）+ file_size == length + 31
+  │           │     │     ├── decrypt_dat(data, xor_key, aes_key_text)
+  │           │     │     │     [15B header][AES-128-ECB 头段][明文段][XOR 尾段]
+  │           │     │     ├── unwrap_wxgf(data)  → HEVC → JPEG（无 PyAV 则 None）
+  │           │     │     └── 缓存 data/image_cache/{md5}
+  │           │     └── VisionClient.describe(image) → "[图片] 猫在键盘上"
   │           ├── 47 (表情)   → MediaPipeline._describe_emoji()
   │           │     ├── EmojiStore.fetch(xml)
   │           │     │     ├── 本地 {wxid}/business/emoticon/Persist/{md5[:2]}/{md5}
@@ -1793,17 +1846,19 @@ WcdbBackend._standardize(msg)
 
 | localType | 类型 | 状态 | 产出 |
 |---|---|---|---|
-| 3 | 图片 | ❌ 不可解 | `[图片]` |
+| 3 | 图片 | ✅ 可用（需密钥 + 视觉） | `[图片] <视觉描述>`，缺任一项降级 `[图片]` |
 | 47 | 表情/贴纸 | ✅ 可用 | `[表情] <视觉描述>` |
 | 49-family | 链接/文件/小程序/视频 | ✅ 可用 | `[链接] 标题` 等 |
 | 10000 | 系统提示 | — 丢弃 | 无 |
 | 1 | 文本（BLOB 存储） | ✅ 可用 | 原文 |
 
-图片不可解的三条实测结论（详见提交记录）：
+图片链路的三个前提（任一缺失即降级 `[图片]`，绝不输出半解密的乱码）：
 
-1. `.dat` 容器载荷长度对 16 取模均匀分布 → **不是分组密码**，AES 全矩阵 0 命中
-2. 消息自身 XML `aeskey` 定向解密 **0/5**
-3. CDN `cdnthumburl` 直连 **全部 HTTP 400**（filekey 需客户端签名）
+1. **密钥** — 每台机器不同，不在消息 XML 里、也无法推导，必须 `IMAGE_XOR_KEY` / `IMAGE_AES_KEY` 手动填
+2. **容器结构** — `.dat` 是四段拼接，不是整段 AES：只有头部一段是 AES-128-ECB，中段明文，尾段单字节 XOR
+3. **codec** — `wxgf` 载荷是 HEVC；打包版为控制体积不含 PyAV，这类图片降级 `[图片]`
+
+早前“整段 AES 全矩阵 0 命中 / XML `aeskey` 0/5 / CDN 直连 400”的结论，是因为把四段容器当成单一密码体；`aeskey` 签名的是 CDN 下载，与本地文件无关。
 
 #### 关键参数
 
@@ -1811,6 +1866,9 @@ WcdbBackend._standardize(msg)
 |---|---|---|
 | `media_vision_enabled` | `False` | 视觉识别主开关；关闭时仍做文本归约 |
 | `media_vision_model` | `""` | 视觉模型覆盖；空 = 复用 `AI_BACKEND` 的模型 |
+| `image_xor_key` | `""` | 单字节 XOR 密钥；接受 `0x37` / `55` |
+| `image_aes_key` | `""` | AES 密钥取字符串**前 16 个 ASCII 字符**（非 hex 解码） |
+| `image_key_provider` | `"env"` | `env` 读 `.env`；`file` 读 `data/image_keys.json`；`.env` 已填时始终优先 |
 
 #### 视觉后端支持
 
@@ -1942,12 +2000,17 @@ WCDB_KEY=
 #   - .env.example → . (示例配置)
 # hiddenimports: 显式列出 src.* 各模块 + 第三方包 (dotenv/anthropic/openai/
 #   pydantic/webview/psutil/PIL/comtypes/uiautomation) + src.media 与 zstandard
+#   + Crypto (Crypto.Cipher.AES, 用于 .dat 图片头段 AES-128-ECB)
 # 排除: faster_whisper, ctranslate2, numpy, onnxruntime, pysilk, tkinter, matplotlib, scipy
 ```
 
 `src/media` 与 `zstandard` 必须留在 `hiddenimports` 里：`MediaPipeline` 是在
 `WcdbBackend._get_media()` 内部延迟导入的，PyInstaller 的静态分析看不到这条
 路径，漏掉会让打出的 EXE 在运行时抛 `ImportError`。
+
+图片解密新增的 `src.media.dat_decrypt` / `wxgf` / `image` / `keys` 与 `Crypto`
+同理必须显式列出。**PyAV 被刻意排除**：`wxgf` 载荷是 HEVC，带上 PyAV 会让
+EXE 增大约 100 MB；不带时这类图片降级为 `[图片]` 占位符，其余链路不受影响。
 
 ### 5.3 `requirements.txt` 依赖说明
 
@@ -1969,6 +2032,7 @@ WCDB_KEY=
 | `faster-whisper>=1.0` | 本地语音识别 | 语音功能 |
 | `opencc-python-reimplemented>=0.1.7` | 繁简中文转换 | 语音功能 |
 | `zstandard>=0.22` | 解压微信非文本消息体 (base64 → zstd → 文本) | 媒体功能 |
+| `pycryptodome>=3.20` | `.dat` 图片容器头段 AES-128-ECB 解密 | 图片功能 |
 
 ### 5.4 前端依赖 (`ui/package.json`)
 

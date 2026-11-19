@@ -15,6 +15,7 @@ plain placeholder such as ``[图片]``.
 from .pipeline import MediaPipeline
 from .blob import decode_blob, is_binary
 from .emoji import EmojiStore, parse_emoji_xml
+from .keys import ImageKeys, resolve_image_keys
 from .vision import VisionClient, to_data_url, detect_mime
 
 __all__ = [
@@ -23,6 +24,8 @@ __all__ = [
     "is_binary",
     "EmojiStore",
     "parse_emoji_xml",
+    "ImageKeys",
+    "resolve_image_keys",
     "VisionClient",
     "to_data_url",
     "detect_mime",

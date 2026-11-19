@@ -551,13 +551,13 @@ class WcdbBackend(AbstractWeChatBackend):
             self._media = False
         return self._media
 
-    def _try_media(self, msg: dict) -> Optional[str]:
+    def _try_media(self, msg: dict, chat_id: str = "") -> Optional[str]:
         """Describe a media message; return text or None on failure."""
         media = self._get_media()
         if not media:  # False or None → disabled
             return None
         try:
-            return media.process(msg)
+            return media.process(msg, chat_id)
         except Exception:
             logger.exception("MediaPipeline.process failed")
             return None
@@ -617,13 +617,13 @@ class WcdbBackend(AbstractWeChatBackend):
         elif local_type in _MEDIA_LOCAL_TYPES:
             # Media is described by MediaPipeline when enabled; otherwise
             # it degrades to a plain placeholder.
-            content = self._try_media(msg) or format_nontext_content(local_type)
+            content = self._try_media(msg, talker) or format_nontext_content(local_type)
         elif is_binary(msg):
             # A BLOB that is not media: WeChat compresses ordinary text and
             # system notices the same way.  Try the media pipeline first (it
             # reduces appmsg XML to a title), then fall back to plain text.
             # The raw base64 must never become content.
-            content = self._try_media(msg) or self._blob_text(msg)
+            content = self._try_media(msg, talker) or self._blob_text(msg)
             if not content:
                 return None
         elif not content:

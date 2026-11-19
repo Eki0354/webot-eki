@@ -206,5 +206,447 @@ class MediaPipelineTests(unittest.TestCase):
         self.assertIsNone(pipeline._vision)
 
 
+def _v2(plain: bytes, aes_size: int = 0, xor_size: int = 0) -> bytes:
+    """Build a V2 container around *plain*, unencrypted.
+
+    With ``aes_size = 0`` there is no encrypted segment and no key is
+    needed, which keeps the container-structure tests key-free.
+    """
+    header = b"\x07\x08V2\x08\x07"
+    header += aes_size.to_bytes(4, "little", signed=True)
+    header += xor_size.to_bytes(4, "little", signed=True)
+    header += b"\x00"
+    return header + plain
+
+
+class DatContainerTests(unittest.TestCase):
+    """The four-segment ``.dat`` layout, measured on real files.
+
+    Only the head is encrypted: a plaintext middle and an XOR-masked tail
+    follow.  Treating the whole payload as ciphertext never produced an
+    image, which is why the layout is pinned down here.
+    """
+
+    def test_version_detection(self):
+        from src.media.dat_decrypt import dat_version
+
+        self.assertEqual(dat_version(b"\x07\x08V2\x08\x07" + b"\x00" * 9), 2)
+        self.assertEqual(dat_version(b"\x07\x08V1\x08\x07" + b"\x00" * 9), 1)
+        self.assertEqual(dat_version(b"\x00" * 15), 0)
+        self.assertEqual(dat_version(b"abc"), 0)
+
+    def test_header_layout(self):
+        from src.media.dat_decrypt import HEADER_LEN, decrypt_dat
+
+        # aesSize=0, xorSize=0 → the payload is returned verbatim.
+        payload = b"\xff\xd8\xff" + b"x" * 100
+        container = _v2(payload)
+        self.assertEqual(len(container), HEADER_LEN + len(payload))
+        self.assertEqual(decrypt_dat(container), payload)
+
+    def test_xor_tail_is_unmasked(self):
+        from src.media.dat_decrypt import decrypt_dat
+
+        key = 0x37
+        body = b"B" * 50
+        tail = bytes(b ^ key for b in b"T" * 20)
+        container = _v2(body + tail, xor_size=20)
+
+        # Without the key the masked tail must not be guessed at.
+        self.assertIsNone(decrypt_dat(container))
+        self.assertEqual(decrypt_dat(container, key), body + b"T" * 20)
+
+    def test_plaintext_middle_survives(self):
+        from src.media.dat_decrypt import decrypt_dat
+
+        # aesSize=0 with a long XOR tail: the middle is stored verbatim.
+        key = 0x5A
+        middle = bytes(range(256)) * 4
+        tail = bytes(b ^ key for b in b"\x01" * 100)
+        container = _v2(middle + tail, xor_size=100)
+        self.assertEqual(decrypt_dat(container, key), middle + b"\x01" * 100)
+
+    def test_missing_aes_key_refuses(self):
+        from src.media.dat_decrypt import decrypt_dat
+
+        container = _v2(b"\x00" * 1040, aes_size=1024)
+        self.assertIsNone(decrypt_dat(container, 0x37, ""))
+
+    def test_oversized_segment_refuses(self):
+        from src.media.dat_decrypt import decrypt_dat
+
+        # xorSize larger than what is left is a corrupt container.
+        container = _v2(b"x" * 10, xor_size=999)
+        self.assertIsNone(decrypt_dat(container, 0x37))
+
+    def test_negative_segment_refuses(self):
+        from src.media.dat_decrypt import decrypt_dat
+
+        container = _v2(b"x" * 10, xor_size=-5)
+        self.assertIsNone(decrypt_dat(container, 0x37))
+
+    def test_unknown_signature_refuses(self):
+        from src.media.dat_decrypt import decrypt_dat
+
+        self.assertIsNone(decrypt_dat(b"NOTADAT" + b"\x00" * 40, 0x37))
+
+    def test_v1_needs_xor_key(self):
+        from src.media.dat_decrypt import decrypt_dat
+
+        data = b"\x07\x08V1\x08\x07" + b"hello"
+        self.assertIsNone(decrypt_dat(data))
+        self.assertEqual(
+            decrypt_dat(data, 0x01),
+            bytes(b ^ 0x01 for b in data),
+        )
+
+    def test_expected_size_matches_real_rule(self):
+        from src.media.dat_decrypt import expected_dat_size
+
+        # aes_size=1024 is already block-aligned, so PKCS7 adds a full block
+        # and the container is exactly length + 31.
+        self.assertEqual(expected_dat_size(1000), 1031)
+        self.assertEqual(expected_dat_size(0), 31)
+        # No AES segment → only the 15-byte header.
+        self.assertEqual(expected_dat_size(1000, 0), 1015)
+
+    def test_key_normalisation(self):
+        from src.media.dat_decrypt import aes_key_from_text, parse_xor_key
+
+        self.assertEqual(parse_xor_key("0x37"), 0x37)
+        self.assertEqual(parse_xor_key("55"), 55)
+        self.assertEqual(parse_xor_key(0x37), 0x37)
+        for bad in (None, "", "zz", 300, True):
+            self.assertIsNone(parse_xor_key(bad), bad)
+
+        # The key is the first 16 ASCII characters, *not* the hex bytes.
+        self.assertEqual(
+            aes_key_from_text("491e17ca4a5f665d47616022d98c0a3e"),
+            b"491e17ca4a5f665d",
+        )
+        self.assertIsNone(aes_key_from_text("short"))
+
+    def test_sniff_format(self):
+        from src.media.dat_decrypt import sniff_format
+
+        self.assertEqual(sniff_format(b"\xff\xd8\xff\xe0"), ".jpg")
+        self.assertEqual(sniff_format(b"\x89PNG\r\n\x1a\n"), ".png")
+        self.assertEqual(sniff_format(b"GIF89a"), ".gif")
+        self.assertEqual(sniff_format(b"RIFF\x00\x00\x00\x00WEBPVP8 "), ".webp")
+        self.assertEqual(sniff_format(b"wxgf" + b"\x00" * 20), "wxgf")
+        # RIFF is shared with WAV/AVI — the form type must match.
+        self.assertIsNone(sniff_format(b"RIFF\x00\x00\x00\x00WAVEfmt "))
+        self.assertIsNone(sniff_format(b""))
+
+
+class WxgfContainerTests(unittest.TestCase):
+    """``wxgf`` is an HEVC wrapper; it must never be mistaken for an image."""
+
+    def test_magic_detection(self):
+        from src.media.wxgf import is_plain_image, is_wxgf
+
+        self.assertTrue(is_wxgf(b"wxgf" + b"\x00" * 20))
+        self.assertFalse(is_wxgf(b"\xff\xd8\xff"))
+        self.assertFalse(is_wxgf(b""))
+
+        self.assertTrue(is_plain_image(b"\xff\xd8\xff\xe0"))
+        self.assertTrue(is_plain_image(b"\x89PNG\r\n\x1a\n"))
+        self.assertFalse(is_plain_image(b"wxgf" + b"\x00" * 20))
+        self.assertFalse(is_plain_image(b""))
+
+    def test_plain_image_returned_unchanged(self):
+        from src.media.wxgf import unwrap_wxgf
+
+        # Some ``_hd_temp`` files are a bare PNG with no container at all.
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+        self.assertEqual(unwrap_wxgf(png), png)
+
+    def test_embedded_jpeg_extracted(self):
+        from src.media.wxgf import unwrap_wxgf
+
+        jpeg = b"\xff\xd8\xff\xe0" + b"J" * 600
+        container = b"wxgf" + b"\x00" * 12 + jpeg
+        self.assertEqual(unwrap_wxgf(container), jpeg)
+
+    def test_container_without_nalus_returns_none(self):
+        from src.media.wxgf import unwrap_wxgf
+
+        self.assertIsNone(unwrap_wxgf(b"wxgf" + b"\x00" * 40))
+        self.assertIsNone(unwrap_wxgf(b""))
+        self.assertIsNone(unwrap_wxgf(b"\x00" * 100))
+
+    def test_missing_codec_degrades(self):
+        from src.media.wxgf import unwrap_wxgf
+
+        # A VPS/SPS/PPS/IDR sequence; without PyAV this must return None
+        # rather than raise, so the caller keeps the placeholder.
+        vps = b"\x00\x00\x00\x01" + bytes([32 << 1]) + b"\x01\x02"
+        idr = b"\x00\x00\x00\x01" + bytes([19 << 1]) + b"\x03\x04"
+        container = b"wxgf" + b"\x00" * 12 + vps + idr
+
+        with patch.dict(sys.modules, {"av": None}):
+            self.assertIsNone(unwrap_wxgf(container))
+
+
+class ImageKeyTests(unittest.TestCase):
+    """Where the per-machine image keys come from."""
+
+    def _config(self, **kwargs):
+        from src.config import BotConfig
+
+        return BotConfig(**kwargs)
+
+    def test_defaults_are_empty(self):
+        from src.media.keys import resolve_image_keys
+
+        keys = resolve_image_keys(self._config())
+        self.assertIsNone(keys.xor_key)
+        self.assertEqual(keys.aes_key_text, "")
+        self.assertFalse(keys.usable)
+
+    def test_env_provider(self):
+        from src.media.keys import resolve_image_keys
+
+        keys = resolve_image_keys(self._config(
+            image_xor_key="0x37",
+            image_aes_key="491e17ca4a5f665d47616022d98c0a3e",
+        ))
+        self.assertEqual(keys.xor_key, 0x37)
+        self.assertEqual(keys.aes_key_text, "491e17ca4a5f665d47616022d98c0a3e")
+        self.assertTrue(keys.usable)
+
+    def test_invalid_values_are_dropped(self):
+        from src.media.keys import resolve_image_keys
+
+        keys = resolve_image_keys(self._config(
+            image_xor_key="zz", image_aes_key="short",
+        ))
+        self.assertIsNone(keys.xor_key)
+        self.assertEqual(keys.aes_key_text, "")
+        self.assertFalse(keys.usable)
+
+    def test_file_provider(self):
+        import json
+
+        from src.media.keys import resolve_image_keys
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "image_keys.json").write_text(
+                json.dumps({"xorKey": "55", "aesKey": "abcdefghijklmnopqrst"}),
+                encoding="utf-8",
+            )
+            keys = resolve_image_keys(
+                self._config(image_key_provider="file"), data_dir=root
+            )
+            self.assertEqual(keys.xor_key, 55)
+            self.assertEqual(keys.aes_key_text, "abcdefghijklmnopqrst")
+
+    def test_env_beats_file(self):
+        import json
+
+        from src.media.keys import resolve_image_keys
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "image_keys.json").write_text(
+                json.dumps({"xor_key": "55", "aes_key": "abcdefghijklmnopqrst"}),
+                encoding="utf-8",
+            )
+            # An explicit .env entry must never be overridden by a stale file.
+            keys = resolve_image_keys(
+                self._config(image_key_provider="file", image_xor_key="0x99"),
+                data_dir=root,
+            )
+            self.assertEqual(keys.xor_key, 0x99)
+            self.assertEqual(keys.aes_key_text, "abcdefghijklmnopqrst")
+
+    def test_missing_or_broken_file_is_not_fatal(self):
+        from src.media.keys import resolve_image_keys
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = self._config(image_key_provider="file")
+            self.assertFalse(resolve_image_keys(config, data_dir=root).usable)
+
+            (root / "image_keys.json").write_text("{not json", encoding="utf-8")
+            self.assertFalse(resolve_image_keys(config, data_dir=root).usable)
+
+            (root / "image_keys.json").write_text("[1, 2]", encoding="utf-8")
+            self.assertFalse(resolve_image_keys(config, data_dir=root).usable)
+
+    def test_unknown_provider_falls_back_to_env(self):
+        from src.media.keys import resolve_image_keys
+
+        keys = resolve_image_keys(self._config(
+            image_key_provider="weird", image_xor_key="0x01",
+        ))
+        self.assertEqual(keys.xor_key, 1)
+
+
+class ImageStoreTests(unittest.TestCase):
+    """Locating a ``.dat`` for a message, then decrypting it."""
+
+    CHAT = "44600994796@chatroom"
+
+    def _store(self, root: Path, **kwargs):
+        from src.media.image import ImageStore
+
+        params = {"xor_key": 0x37, "aes_key_text": "0123456789abcdef"}
+        params.update(kwargs)
+        return ImageStore(str(root), root / "cache", **params)
+
+    def _img_dir(self, root: Path) -> Path:
+        import hashlib
+
+        digest = hashlib.md5(self.CHAT.encode()).hexdigest()
+        img = root / "msg" / "attach" / digest / "2026-03" / "Img"
+        img.mkdir(parents=True)
+        return img
+
+    def _msg(self, md5: str, length: int) -> dict:
+        return {
+            "chat_id": self.CHAT,
+            "localType": 3,
+            "create_time": 1772000000,
+            "content_kind": "text",
+            "message_content": f'<msg><img md5="{md5}" length="{length}" /></msg>',
+        }
+
+    def test_variant_suffixes(self):
+        from src.media.image import strip_variant, variant_rank
+
+        base = "a" * 32
+        for suffix in ("_h", "_hd", "_b", "_w", "_c", "_t", ".t", ".h", "_thumb"):
+            self.assertEqual(strip_variant(base + suffix), base, suffix)
+        self.assertEqual(strip_variant(base), base)
+
+        # A full-size variant must beat the thumbnail, and the unsuffixed
+        # original must sit between them.
+        self.assertGreater(variant_rank(base + "_h"), variant_rank(base))
+        self.assertGreater(variant_rank(base), variant_rank(base + "_t"))
+
+    def test_locate_by_md5_prefers_full_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            img = self._img_dir(root)
+            md5 = "a" * 32
+            full = img / f"{md5}_h.dat"
+            thumb = img / f"{md5}_t.dat"
+            full.write_bytes(_v2(b"\xff\xd8\xff" + b"x" * 100))
+            thumb.write_bytes(_v2(b"\xff\xd8\xff" + b"y" * 20))
+
+            store = self._store(root)
+            found = store._locate(self._msg(md5, 100), self._msg(md5, 100)["message_content"])
+            self.assertEqual(found, full)
+
+    def test_locate_by_size_when_md5_differs(self):
+        from src.media.dat_decrypt import expected_dat_size
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            img = self._img_dir(root)
+            payload = b"\xff\xd8\xff" + b"x" * 1000
+            dat = img / f"{'a' * 32}.dat"
+            dat.write_bytes(_v2(payload))
+            length = dat.stat().st_size - 31
+            self.assertEqual(expected_dat_size(length), dat.stat().st_size)
+
+            store = self._store(root)
+            # The XML md5 is not the filename, so the size rule is the only
+            # thing that can pair this message with its file.
+            xml = self._msg("b" * 32, length)["message_content"]
+            self.assertEqual(store._locate(self._msg("b" * 32, length), xml), dat)
+
+    def test_locate_without_chat_id_gives_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._img_dir(root)
+            store = self._store(root)
+            self.assertIsNone(store._locate({"localType": 3}, "<msg/>"))
+
+    def test_fetch_without_keys_is_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            img = self._img_dir(root)
+            md5 = "a" * 32
+            (img / f"{md5}.dat").write_bytes(_v2(b"\xff\xd8\xff" + b"x" * 100))
+
+            store = self._store(root, xor_key=None, aes_key_text="")
+            self.assertFalse(store.can_decrypt)
+            self.assertIsNone(store.fetch(self._msg(md5, 100)))
+
+    def test_fetch_decrypts_and_caches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            img = self._img_dir(root)
+            md5 = "a" * 32
+            jpeg = b"\xff\xd8\xff\xe0" + b"J" * 2000 + b"\xff\xd9"
+            (img / f"{md5}.dat").write_bytes(_v2(jpeg))
+
+            store = self._store(root)
+            out = store.fetch(self._msg(md5, 2000))
+            self.assertIsNotNone(out)
+            self.assertEqual(out.read_bytes(), jpeg)
+            # Second call must hit the cache, not re-decrypt.
+            self.assertEqual(store.fetch(self._msg(md5, 2000)), out)
+
+    def test_fetch_rejects_non_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            img = self._img_dir(root)
+            md5 = "a" * 32
+            # Decrypts cleanly but is not an image — a wrong key looks like
+            # this, and it must not reach the vision model or the cache.
+            (img / f"{md5}.dat").write_bytes(_v2(b"\x00" * 500))
+
+            store = self._store(root)
+            self.assertIsNone(store.fetch(self._msg(md5, 500)))
+            self.assertFalse((root / "cache" / f"{md5}.jpg").exists())
+
+
+class MediaPipelineImageTests(unittest.TestCase):
+    """The pipeline must keep ``[图片]`` unless keys *and* vision are ready."""
+
+    def _pipeline(self, **overrides):
+        from src.media.pipeline import MediaPipeline
+
+        config = MagicMock()
+        config.media_vision_enabled = True
+        config.media_vision_model = ""
+        config.wechat_data_dir = ""
+        config.ai_backend = "deepseek"
+        config.deepseek_api_key = "sk-test"
+        config.deepseek_model = "deepseek-v4-flash"
+        config.deepseek_base_url = "https://api.deepseek.com"
+        config.image_xor_key = ""
+        config.image_aes_key = ""
+        config.image_key_provider = "env"
+        for key, value in overrides.items():
+            setattr(config, key, value)
+        return MediaPipeline(config)
+
+    def test_no_keys_means_no_image_store(self):
+        self.assertIsNone(self._pipeline()._image)
+
+    def test_keys_build_the_store(self):
+        pipeline = self._pipeline(
+            image_xor_key="0x37", image_aes_key="0123456789abcdef",
+        )
+        self.assertIsNotNone(pipeline._image)
+        self.assertTrue(pipeline._image.can_decrypt)
+
+    def test_image_without_location_returns_none(self):
+        msg = {
+            "localType": 3,
+            "content_kind": "blob",
+            "message_content": _blob("<msg><img md5=\"" + "a" * 32 + "\"/></msg>"),
+        }
+        pipeline = self._pipeline(image_xor_key="0x37")
+        # No chat_id and no data dir: nothing can be located, so the caller
+        # keeps "[图片]".
+        self.assertIsNone(pipeline.process(msg))
+
+
 if __name__ == "__main__":
     unittest.main()
