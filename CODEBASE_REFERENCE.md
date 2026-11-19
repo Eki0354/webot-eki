@@ -272,8 +272,9 @@ todo_delete_keywords: list[str] = [
 
 | 函数 | 行号 | 描述 | 参数 | 返回值 |
 |---|---|---|---|---|
-| `chat(message, ...)` | ~20 | AI 对话响应 (@bot) | `message: str, context_messages=None, requester_name="", bot_name="", group_name="", group_memory=""` | `str` |
-| `proactive_chat(mode, context_messages, ...)` | ~50 | 主动发言 | `mode: ProactiveMode, context_messages: list[dict], bot_name="", group_name="", group_memory=""` | `str` |
+| `chat(message, ...)` | ~20 | AI 对话响应 (@bot)；上下文行经 `label_described_media()` 渲染媒体 | `message: str, context_messages=None, requester_name="", bot_name="", group_name="", group_memory=""` | `str` |
+| `proactive_chat(mode, context_messages, ...)` | ~50 | 主动发言；上下文行同样经 `label_described_media()` 渲染 | `mode: ProactiveMode, context_messages: list[dict], bot_name="", group_name="", group_memory=""` | `str` |
+| `label_described_media(content)` | ~26 | 把已描述的媒体占位符改写成 `[图片内容：…]`，避免模型误判成占位符；裸占位符保持不变 | `content: str` | `str` |
 | `summarize(messages, requester_name)` | ~80 | 生成结构化摘要 | `messages: list[dict], requester_name: str` | `SummaryResult` |
 | `_multi_level_map_reduce(chunks, requester_name)` | ~100 | 多级 Map-Reduce 处理大量消息 | `chunks: list[list[dict]], requester_name: str` | `SummaryResult` |
 | `format_summary_for_reply(result, requester_name)` | ~130 | 格式化摘要为微信回复 | `result: SummaryResult, requester_name: str` | `str` |
@@ -1205,7 +1206,7 @@ MessageRouter.handle(msg)
 
 | Prompt | 位置 | 声明内容 |
 |---|---|---|
-| `CHAT_SYSTEM_PROMPT` | `base.py` §关于图片和媒体消息 | 标记后有文字=已描述可用；裸占位符=看不到，不得编造 |
+| `CHAT_SYSTEM_PROMPT` | `base.py` §关于图片和媒体消息 | `[图片内容：…]`/`[表情内容：…]`=已描述可直接用；标记后有文字=已描述可用；裸占位符=看不到，不得编造 |
 | `PROACTIVE_SYSTEM_PROMPT` | `base.py` §关于图片和媒体消息 | 同上（主动发言不编造媒体内容） |
 | `SYSTEM_PROMPT` / `CHUNK_SYSTEM_PROMPT` | `prompts.py` | 同上（总结时可用已描述的图片内容） |
 

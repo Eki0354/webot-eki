@@ -4,6 +4,7 @@ Implementations: ClaudeSummarizer, DeepSeekSummarizer.
 """
 
 import logging
+import re
 import time
 from abc import ABC, abstractmethod
 from typing import Callable, TypeVar
@@ -13,6 +14,33 @@ from .models import SummaryResult
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+#: Media placeholders emitted by the media pipeline.  A *described* one
+#: carries its content after the bracket, e.g. ``[图片] 一只猫在键盘上``.
+_MEDIA_KINDS = "图片|表情|视频|文件|语音|链接"
+_DESCRIBED_MEDIA_RE = re.compile(rf"^\[({_MEDIA_KINDS})\]\s*(\S.*)$", re.S)
+
+
+def label_described_media(content: str) -> str:
+    """Rewrite a described media placeholder into an explicit content label.
+
+    ``"[图片] 一只猫在键盘上"`` becomes ``"[图片内容：一只猫在键盘上]"``.
+
+    Why the rewrite: the model has a strong prior that a bare ``[图片]``
+    means "this image is unavailable", and it sometimes answers "我看不到图，
+    就是个占位符" even when the description sits right there in the context
+    (measured on a live run whose context did contain the full description).
+    Folding the content into the bracket removes the ambiguity instead of
+    asking the prompt to out-vote that prior on every call.
+
+    A bare placeholder with nothing after it is left untouched — it really is
+    unreadable, and the model must keep saying so.
+    """
+    match = _DESCRIBED_MEDIA_RE.match(content.strip())
+    if not match:
+        return content
+    kind, detail = match.group(1), match.group(2).strip()
+    return f"[{kind}内容：{detail}]"
 
 
 class AbstractSummarizer(ABC):
@@ -87,7 +115,8 @@ class AbstractSummarizer(ABC):
 
 ## 关于图片和媒体消息
 - 判断依据是方括号标记**后面有没有文字**，不是标记本身。
-- `[图片]`、`[表情]` 后面**跟着文字**（如"[图片] 一张瑞幸券的截图"、"[表情] 一只猫在摇头"）表示这张图已经被视觉模型看过并描述过了，这段文字就是图的内容，可以正常引用、回答、接话。
+- 上下文里出现 `[图片内容：…]`、`[表情内容：…]` 就是**已经看过并描述过的图**，方括号里的文字就是图的实际内容，直接照它回答、接话。
+- `[图片]`、`[表情]` 后面**跟着文字**（如"[图片] 一张瑞幸券的截图"、"[表情] 一只猫在摇头"）同样表示这张图已经被视觉模型看过并描述过了，这段文字就是图的内容，可以正常引用、回答、接话。
 - 只有**孤零零的** `[图片]`、`[视频]`、`[文件]`（后面没有文字）才是没解析的占位符，这时你看不到内容，不要编造。
 - 有人问图里有什么、让你念图里的字：描述里有就照实答，描述里没有就说没看清，**不要笼统地回"我看不到图"**——那是在撒谎，因为图其实已经看过了。
 
@@ -158,7 +187,9 @@ class AbstractSummarizer(ABC):
                 sender = m.get("sender_name", "?")
                 content = m.get("content", "")
                 if content:
-                    context_lines.append(f"{sender}: {content}")
+                    context_lines.append(
+                        f"{sender}: {label_described_media(content)}"
+                    )
             if context_lines:
                 context_section = (
                     "最近群聊记录（网友提到了之前的内容，请参考）：\n"
@@ -267,7 +298,8 @@ class AbstractSummarizer(ABC):
 - 对方认真说事时少抖机灵，语气放轻。
 
 ## 关于图片和媒体消息
-- `[图片]`、`[表情]` 后面**跟着文字**（如"[图片] 一张瑞幸券的截图"）表示已经描述过，那就是图的内容，可以正常用。
+- 上下文里出现 `[图片内容：…]`、`[表情内容：…]` 就是已经看过并描述过的图，方括号里的文字就是图的内容，可以直接用。
+- `[图片]`、`[表情]` 后面**跟着文字**（如"[图片] 一张瑞幸券的截图"）同样表示已经描述过，那就是图的内容，可以正常用。
 - 只有孤零零的 `[图片]`、`[视频]`、`[文件]`（后面没有文字）才是没解析的占位符，不要编造。
 
 ## 当前群聊状态
@@ -334,7 +366,9 @@ class AbstractSummarizer(ABC):
             sender = m.get("sender_name", "?")
             content = m.get("content", "")
             if content:
-                recent_lines.append(f"{sender}: {content}")
+                recent_lines.append(
+                    f"{sender}: {label_described_media(content)}"
+                )
 
         if not recent_lines:
             return ""

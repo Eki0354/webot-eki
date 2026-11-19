@@ -204,6 +204,10 @@ class MediaPipeline:
         image = self._image.fetch(located)
         if not image:
             self._stats["failed"] += 1
+            logger.warning(
+                "MediaPipeline: image not decrypted (chat=%s, msg=%s)",
+                chat_id or "?", msg.get("message_id", "?"),
+            )
             return None
 
         description = self._vision.describe(image)
@@ -211,6 +215,10 @@ class MediaPipeline:
             self._stats["described"] += 1
             return f"[图片] {description}"
         self._stats["failed"] += 1
+        logger.warning(
+            "MediaPipeline: vision gave no text for %s (model=%s)",
+            image.name, getattr(self._vision, "_model", "?"),
+        )
         return None
 
     def _describe_emoji(self, msg: dict) -> Optional[str]:
