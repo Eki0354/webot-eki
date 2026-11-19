@@ -9,6 +9,7 @@ the round trip (it used to be dropped entirely).
 import base64
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -836,6 +837,64 @@ class ImageStoreTests(unittest.TestCase):
             with patch.dict(sys.modules, {"av": None}):
                 self.assertIsNone(store.fetch(self._msg(md5, 2000)))
             self.assertFalse((root / "cache" / f"{md5}.jpg").exists())
+
+    def test_new_message_waits_for_the_file_to_land(self):
+        """WeChat writes the row first and the picture ~2 s later.
+
+        The poll interval is 1 s, so without a retry the tick that sees the
+        message finds no file and the image stays ``[图片]`` for good — this
+        happened for every image sent while the bot was running.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            img = self._img_dir(root)
+            md5 = "c" * 32
+            jpeg = b"\xff\xd8\xff\xe0" + b"J" * 2000 + b"\xff\xd9"
+            msg = self._msg(md5, 2000)
+            msg["create_time"] = int(time.time())  # just arrived
+
+            store = self._store(root)
+            calls = {"n": 0}
+            real_fetch_once = store._fetch_once
+
+            def slow_disk(m, xml):
+                """No file on the first look, written by the second."""
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return None
+                (img / f"{md5}.dat").write_bytes(_v2(jpeg))
+                return real_fetch_once(m, xml)
+
+            with patch.object(store, "_fetch_once", side_effect=slow_disk), \
+                 patch("src.media.image._ARRIVAL_POLL_SEC", 0):
+                out = store.fetch(msg)
+
+            self.assertIsNotNone(out)
+            self.assertEqual(out.read_bytes(), jpeg)
+            self.assertEqual(calls["n"], 2)
+
+    def test_old_message_does_not_wait(self):
+        """An image never opened in the client has no file and never will.
+
+        Waiting on those would stall the queue for seconds per message.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._img_dir(root)
+            md5 = "d" * 32
+            msg = self._msg(md5, 2000)
+            msg["create_time"] = int(time.time()) - 3600  # an hour old
+
+            store = self._store(root)
+            calls = {"n": 0}
+
+            def counted(m, xml):
+                calls["n"] += 1
+                return None
+
+            with patch.object(store, "_fetch_once", side_effect=counted):
+                self.assertIsNone(store.fetch(msg))
+            self.assertEqual(calls["n"], 1)
 
 
 class MediaPipelineImageTests(unittest.TestCase):

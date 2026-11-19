@@ -769,7 +769,9 @@ todo_delete_keywords: list[str] = [
 | `variant_rank(stem)` | 变体优先级：`_h`(600) > 无后缀(500) > `_t`(100) | `stem: str` | `int` |
 | `ImageStore.__init__(wechat_data_dir, cache_dir, xor_key, aes_key_text, allow_derive_xor=True)` | 初始化图片存取器 | 见参数 | `None` |
 | `ImageStore.can_decrypt` (property) | 是否值得尝试解密（有密钥或允许推导） | 无 | `bool` |
-| `ImageStore.fetch(msg)` | 定位 → 解密 → wxgf 解包 → 缓存，返回图片路径 | `msg: dict` | `Path \| None` |
+| `ImageStore.fetch(msg)` | 定位 → 解密 → wxgf 解包 → 缓存，返回图片路径；新消息会短暂重试等文件落盘 | `msg: dict` | `Path \| None` |
+| `ImageStore._fetch_once(msg, xml)` | 单次 定位→解密→缓存，不等待（供 `fetch` 重试调用） | `msg: dict, xml: str` | `Path \| None` |
+| `ImageStore._arrival_deadline(msg)` | 新消息返回重试截止时刻，旧消息返回 None（旧图没有文件也不会再有） | `msg: dict` | `float \| None` |
 | `ImageStore._resolve_xor_key()` | 返回配置的 XOR 密钥，未配置时从文件投票推导（只跑一次，结果含失败都缓存） | 无 | `int \| None` |
 | `ImageStore._plain_siblings(dat)` | 同基名的其他 `.dat` 变体（`_h` 优先），用于 wxgf 无 codec 时兜底 | `dat: Path` | `list[Path]` |
 | `ImageStore._sample_tails()` | 逐个读出 V2 容器的掩码尾段（只读末尾 16 字节，上限 400 个） | 无 | `Iterator[bytes]` |
@@ -1839,11 +1841,13 @@ WcdbBackend._standardize(msg)
   │     └── _try_media(msg, talker) or format_nontext_content(localType)
   │           ├── 3  (图片)   → MediaPipeline._describe_image(msg, chat_id)
   │           │     ├── ImageStore.fetch(msg)
+  │           │     │     ├── _arrival_deadline(msg) — 新消息给 5s 重试窗口
   │           │     │     ├── 定位 msg/attach/{md5(chat_id)}/{yyyy-MM}/Img/*.dat
   │           │     │     │     匹配键: 基名（剥 _h/_hd/_t 后缀）+ file_size == length + 31
   │           │     │     ├── decrypt_dat(data, xor_key, aes_key_text)
   │           │     │     │     [15B header][AES-128-ECB 头段][明文段][XOR 尾段]
   │           │     │     ├── unwrap_wxgf(data)  → HEVC → JPEG（无 PyAV 则 None）
+  │           │     │     │     失败时 _plain_siblings() 改用同图 _h/_t 的 JPEG 副本
   │           │     │     └── 缓存 data/image_cache/{md5}
   │           │     └── VisionClient.describe(image) → "[图片] 猫在键盘上"
   │           ├── 47 (表情)   → MediaPipeline._describe_emoji()

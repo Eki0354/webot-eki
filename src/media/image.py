@@ -66,6 +66,17 @@ _MAX_DAT_BYTES = 64 * 1024 * 1024
 #: whose first files are all thumbnails.
 _DERIVE_SAMPLE_LIMIT = 400
 
+#: A message younger than this may still be waiting for its file to appear.
+#: WeChat writes the picture 1.2–2.0 s after the message row (measured on 8
+#: consecutive images), so the window has to cover that plus a slow disk.
+_ARRIVAL_GRACE_SEC = 30.0
+
+#: How long to keep retrying while the file is missing, and how often.
+#: Total worst case is bounded by this, so one undelivered image cannot
+#: stall the message queue for long.
+_ARRIVAL_WAIT_SEC = 5.0
+_ARRIVAL_POLL_SEC = 0.5
+
 
 def strip_variant(stem: str) -> str:
     """Return the base md5 of a ``.dat`` stem, dropping its size suffix.
@@ -139,7 +150,12 @@ class ImageStore:
         )
 
     def fetch(self, msg: dict) -> Optional[Path]:
-        """Return a decrypted image file for this message, or None."""
+        """Return a decrypted image file for this message, or None.
+
+        Retries briefly when the message is new, because WeChat commits the
+        message row *before* the picture reaches disk — see
+        :meth:`_arrival_deadline`.
+        """
         if not self.can_decrypt:
             logger.debug("Image keys not configured — keeping [图片]")
             return None
@@ -148,6 +164,17 @@ class ImageStore:
         if not xml:
             return None
 
+        deadline = self._arrival_deadline(msg)
+        while True:
+            image = self._fetch_once(msg, xml)
+            if image is not None:
+                return image
+            if deadline is None or time.monotonic() >= deadline:
+                return None
+            time.sleep(_ARRIVAL_POLL_SEC)
+
+    def _fetch_once(self, msg: dict, xml: str) -> Optional[Path]:
+        """One locate → decrypt → cache attempt, with no waiting."""
         dat = self._locate(msg, xml)
         if dat is None:
             return None
@@ -161,6 +188,26 @@ class ImageStore:
             return None
 
         return self._cache(dat, image)
+
+    def _arrival_deadline(self, msg: dict) -> Optional[float]:
+        """Deadline for waiting on a not-yet-written file, or None.
+
+        WeChat writes the message row first and the picture 1.2–2.0 s later
+        (measured on 8 consecutive messages).  The poll interval is 1 s, so
+        a tick that lands inside that window finds no usable file — and
+        since the message is already marked processed, the image stayed
+        ``[图片]`` for good.
+
+        Waiting is only right for a *new* message.  An older one has no file
+        because there never was one (never opened in the client), so waiting
+        would stall the queue once per such message.
+        """
+        created = _as_int(_first_attr(msg, ("create_time", "createTime", "timestamp")))
+        if not created:
+            return None
+        if time.time() - created > _ARRIVAL_GRACE_SEC:
+            return None
+        return time.monotonic() + _ARRIVAL_WAIT_SEC
 
     # -- Locating ----------------------------------------------------------
 
