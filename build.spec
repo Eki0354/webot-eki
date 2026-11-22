@@ -104,6 +104,15 @@ a = Analysis(
         # deliberately excluded below: wxgf images then degrade to the
         # [图片] placeholder instead of growing the EXE by ~100 MB.
         'Crypto', 'Crypto.Cipher', 'Crypto.Cipher.AES',
+        # Chain repair in link_fetcher imports these inside functions, so
+        # PyInstaller's static scan is the only thing that can find them.
+        # Without them the frozen EXE silently loses TLS repair and falls
+        # back to plaintext (or fails outright) on sites that send the leaf
+        # certificate alone.
+        'cryptography', 'cryptography.x509',
+        'cryptography.x509.verification',
+        'cryptography.hazmat.primitives.serialization',
+        'certifi',
         'src.web', 'src.web.server',
         'src.router', 'src.welcome',
         'src.todo', 'src.todo.store', 'src.todo.handler',

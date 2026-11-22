@@ -485,6 +485,22 @@ class MessageRouter:
             logger.exception("Link fetch failed")
             return ""
         if not articles:
+            # A link was present but nothing came back.  Without this line the
+            # only symptom is the model saying "我打不开链接", which reads like
+            # a prompt bug; the real reason (DNS / TLS / timeout / no route
+            # out of the host) is logged by ``link_fetcher``, and this line
+            # ties it to the message that triggered it.
+            try:
+                from .media.link_fetcher import extract_urls
+                urls = extract_urls(text)
+            except Exception:
+                urls = []
+            if urls:
+                logger.warning(
+                    "Link context: no article fetched for %d URL(s) in '%s' — "
+                    "see the 'Link ...' lines above for the reason",
+                    len(urls), text[:60],
+                )
             return ""
         logger.info(
             "Link context: %d article(s) for '%s'", len(articles), text[:40],

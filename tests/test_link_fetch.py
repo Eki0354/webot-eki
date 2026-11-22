@@ -703,6 +703,184 @@ class ConfigSwitchTests(unittest.TestCase):
             importlib.reload(config_module)
 
 
+class TlsRepairTests(unittest.TestCase):
+    """The build must not depend on the machine's cached intermediates.
+
+    Measured failure this covers: ``matrix67.com`` sends the leaf certificate
+    only (``CN=matrix67.com``, issued by ``CN=YR2``).  The dev box happened to
+    have ``YR2`` cached in Windows' store, so fetching worked there; the VM had
+    a clean store, the handshake died with "unable to get local issuer
+    certificate", and the bot answered "我打不开链接".
+
+    All offline: the network is not touched, only the decision logic that
+    surrounds it.
+    """
+
+    def test_urllib_wrapped_tls_error_is_recognised(self):
+        """urllib buries an SSLError in URLError.reason; that must still count."""
+        import ssl
+        import urllib.error
+
+        from src.media.link_fetcher import _is_tls_error
+
+        cause = ssl.SSLCertVerificationError("unable to get local issuer certificate")
+        wrapped = urllib.error.URLError(cause)
+        self.assertTrue(_is_tls_error(wrapped))
+
+    def test_plain_network_error_is_not_a_tls_error(self):
+        """A DNS failure must not trigger chain repair or a plaintext retry."""
+        import urllib.error
+
+        from src.media.link_fetcher import _is_tls_error
+
+        self.assertFalse(_is_tls_error(urllib.error.URLError("getaddrinfo failed")))
+        self.assertFalse(_is_tls_error(TimeoutError("timed out")))
+
+    def test_http_fallback_keeps_host_and_path(self):
+        """Only the scheme changes — the fallback cannot reach a new target."""
+        from src.media.link_fetcher import _http_fallback
+
+        self.assertEqual(
+            _http_fallback("https://matrix67.com/blog/archives/336?p=1"),
+            "http://matrix67.com/blog/archives/336?p=1",
+        )
+
+    def test_http_fallback_ignores_http_urls(self):
+        from src.media.link_fetcher import _http_fallback
+
+        self.assertEqual(_http_fallback("http://example.com/a"), "")
+
+    def test_trust_anchors_exclude_intermediates(self):
+        """An intermediate accepted as an anchor ends the repair one hop early.
+
+        Windows' store caches intermediates, so without this filter the dev box
+        "verified" a chain containing just ``YR2`` while the same chain still
+        failed the actual handshake — the repair silently did nothing.
+        """
+        from src.media.link_fetcher import _trust_anchors
+
+        anchors = _trust_anchors()
+        self.assertTrue(anchors, "no trust anchors at all: TLS could never work")
+        for cert in anchors:
+            self.assertEqual(
+                cert.subject, cert.issuer,
+                msg=f"non-root in the anchor set: {cert.subject.rfc4514_string()}",
+            )
+
+    def test_failed_repair_is_cached_not_retried(self):
+        """An unreachable chain must not be re-walked on every mention."""
+        from src.media import link_fetcher
+
+        link_fetcher._intermediate_cache.clear()
+        try:
+            # Pre-seeded failure: the function must return it without doing
+            # any network work, which is what makes a dead link cheap.
+            link_fetcher._intermediate_cache["dead.example"] = ""
+            self.assertEqual(link_fetcher._verified_intermediates("dead.example"), "")
+        finally:
+            link_fetcher._intermediate_cache.clear()
+
+
+class FetchAttemptTests(unittest.TestCase):
+    """fetch_article's escalation order, exercised without a network."""
+
+    def setUp(self):
+        from src.media import link_fetcher
+
+        self.fetcher = link_fetcher
+        link_fetcher.clear_cache()
+        link_fetcher._intermediate_cache.clear()
+
+    def tearDown(self):
+        self.fetcher.clear_cache()
+        self.fetcher._intermediate_cache.clear()
+
+    def _patch(self, fake):
+        original = self.fetcher._fetch_once
+        self.fetcher._fetch_once = fake
+        self.addCleanup(setattr, self.fetcher, "_fetch_once", original)
+        original_is_public = self.fetcher.is_public_url
+        self.fetcher.is_public_url = lambda url, **kw: True
+        self.addCleanup(setattr, self.fetcher, "is_public_url", original_is_public)
+
+    def test_repaired_retry_succeeds_without_plaintext(self):
+        """A TLS failure triggers one repaired retry; success stops there."""
+        import ssl
+
+        from src.media.link_fetcher import Article
+
+        calls = []
+
+        def _fake(url, *, host=""):
+            calls.append(host)
+            if not host:
+                return None, ssl.SSLCertVerificationError("unable to get local issuer")
+            return Article(url=url, title="t", text="正文"), None
+
+        self._patch(_fake)
+        article = self.fetcher.fetch_article("https://matrix67.com/blog/archives/336")
+        self.assertIsNotNone(article)
+        self.assertEqual(article.text, "正文")
+        # Plain attempt, then exactly one repaired attempt — no http fallback.
+        self.assertEqual(calls, ["", "matrix67.com"])
+
+    def test_plaintext_fallback_after_failed_repair(self):
+        """Both HTTPS attempts failing still reads the page over http."""
+        import ssl
+
+        from src.media.link_fetcher import Article
+
+        urls = []
+
+        def _fake(url, *, host=""):
+            urls.append(url)
+            if url.startswith("https://"):
+                return None, ssl.SSLCertVerificationError("unable to get local issuer")
+            return Article(url=url, title="t", text="明文正文"), None
+
+        self._patch(_fake)
+        article = self.fetcher.fetch_article("https://matrix67.com/blog/archives/336")
+        self.assertIsNotNone(article)
+        self.assertEqual(
+            urls,
+            [
+                "https://matrix67.com/blog/archives/336",
+                "https://matrix67.com/blog/archives/336",
+                "http://matrix67.com/blog/archives/336",
+            ],
+        )
+
+    def test_dns_failure_does_not_degrade_to_plaintext(self):
+        """Only a TLS problem justifies reading the page unauthenticated."""
+        import urllib.error
+
+        calls = []
+
+        def _fake(url, *, host=""):
+            calls.append(url)
+            return None, urllib.error.URLError("getaddrinfo failed")
+
+        self._patch(_fake)
+        self.assertIsNone(
+            self.fetcher.fetch_article("https://matrix67.com/blog/archives/336")
+        )
+        self.assertEqual(calls, ["https://matrix67.com/blog/archives/336"])
+
+    def test_empty_page_does_not_trigger_repair(self):
+        """A 200 with nothing readable is not a TLS problem."""
+        calls = []
+
+        def _fake(url, *, host=""):
+            calls.append(url)
+            return None, None
+
+        self._patch(_fake)
+        self.assertIsNone(
+            self.fetcher.fetch_article("https://matrix67.com/blog/archives/336")
+        )
+        self.assertEqual(calls, ["https://matrix67.com/blog/archives/336"])
+
+
 class PromptDocumentationTests(unittest.TestCase):
     """The prompt must mention the block the code now inserts."""
 

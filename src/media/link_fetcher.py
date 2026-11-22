@@ -191,16 +191,20 @@ def _host_is_public(host: str, *, resolve: bool) -> bool:
 
     try:
         infos = socket.getaddrinfo(host, None)
-    except (OSError, UnicodeError):
-        logger.debug("Link skipped: cannot resolve %s", host)
+    except (OSError, UnicodeError) as exc:
+        # WARNING, not DEBUG: when fetching yields nothing the only clue left
+        # is this line, and the reply then says "我打不开链接" with no way to
+        # tell why.  The bot logs at INFO, so DEBUG is invisible in practice.
+        logger.warning("Link skipped: cannot resolve %s (%s)", host, exc)
         return False
     if not infos:
+        logger.warning("Link skipped: %s resolved to no address", host)
         return False
     # Every address must be public: a host that resolves to both 1.2.3.4 and
     # 127.0.0.1 would otherwise be able to reach the loopback on a retry.
     for info in infos:
         if not _is_public_ip(info[4][0]):
-            logger.debug("Link skipped: %s resolves to %s", host, info[4][0])
+            logger.warning("Link skipped: %s resolves to %s", host, info[4][0])
             return False
     return True
 
@@ -477,14 +481,21 @@ def _cache_put(url: str, article: Optional[Article]) -> None:
         _cache.popitem(last=False)
 
 
-def _build_opener() -> urllib.request.OpenerDirector:
-    """Opener with the guarded redirect handler in place of the default one."""
+def _build_opener(host: str = "") -> urllib.request.OpenerDirector:
+    """Opener with the guarded redirect handler in place of the default one.
+
+    Args:
+        host: Passed to :func:`_ssl_context` so the chain-repair path can
+            install this host's missing intermediates.  "" means a plain
+            verifying context.
+    """
     return urllib.request.build_opener(
-        _GuardedRedirectHandler(), urllib.request.HTTPSHandler(context=_ssl_context())
+        _GuardedRedirectHandler(),
+        urllib.request.HTTPSHandler(context=_ssl_context(host)),
     )
 
 
-def _ssl_context() -> ssl.SSLContext:
+def _ssl_context(host: str = "") -> ssl.SSLContext:
     """Verifying TLS context: system trust store **plus** ``certifi``'s bundle.
 
     Both are needed, and each alone is measurably wrong on this machine:
@@ -500,19 +511,351 @@ def _ssl_context() -> ssl.SSLContext:
     So start from the system context and *add* certifi's roots to it.  If
     certifi is absent (it is optional for the frozen build), the system store
     is still used rather than turning verification off.
+
+    Args:
+        host: When given, also install that host's AIA-fetched intermediate
+            certificates (see :func:`_verified_intermediates`).  This is the
+            repair path for servers that send the leaf alone: browsers build
+            the missing part of the chain themselves, Python's ``ssl`` never
+            does, so a clean machine fails where this one succeeds.
     """
     context = ssl.create_default_context()
     try:
         import certifi  # optional: only used when already installed
         context.load_verify_locations(cafile=certifi.where())
-    except Exception:
-        logger.debug("certifi unavailable; using the system trust store only")
+    except Exception as exc:
+        # Visible on purpose: without certifi the frozen build trusts only
+        # Windows' store, which is exactly the setup where a site whose chain
+        # needs an intermediate the store lacks starts failing.
+        logger.warning(
+            "Link fetch: certifi unavailable (%s: %s) — using the system "
+            "trust store only", type(exc).__name__, exc,
+        )
+    if host:
+        # One PEM blob, not a sequence: iterating it would hand
+        # ``load_verify_locations`` a single character as a certificate.
+        pem = _verified_intermediates(host)
+        if pem:
+            try:
+                context.load_verify_locations(cadata=pem)
+            except Exception as exc:
+                logger.warning(
+                    "Link fetch: could not install the repaired chain for %s "
+                    "(%s: %s)", host, type(exc).__name__, exc,
+                )
     return context
+
+
+# ── Certificate chain repair ─────────────────────────────────────────
+#
+# Some servers send only the leaf certificate and leave the intermediates out
+# (measured: matrix67.com sends one cert, ``CN=matrix67.com`` issued by
+# ``CN=YR2``).  Browsers and Windows fetch the rest automatically; Python's
+# ``ssl`` module does not, so the handshake dies with "unable to get local
+# issuer certificate" — on *any* machine whose trust store does not happen to
+# have YR2 cached, which is what a freshly provisioned VM looks like.  That is
+# the whole bug: the bot reported "我打不开链接" on the VM while the same link
+# worked on the dev machine.
+
+#: AIA walking is bounded: a chain longer than this is broken or hostile.
+_MAX_CHAIN_DEPTH = 5
+#: Per-certificate AIA download budget.  Repair runs after a failed
+#: handshake, i.e. already off the fast path, so this stays short.
+_AIA_TIMEOUT_SEC = 3
+
+#: host → PEM of verified intermediates ("" when repair is impossible).
+_intermediate_cache: dict[str, str] = {}
+
+
+def _aia_ca_issuers(cert) -> list[str]:
+    """Return the *CA Issuers* URLs from a certificate's AIA extension."""
+    try:
+        from cryptography import x509
+    except Exception:
+        return []
+    try:
+        ext = cert.extensions.get_extension_for_class(
+            x509.AuthorityInformationAccess
+        )
+    except Exception:
+        return []
+    return [
+        desc.access_location.value
+        for desc in ext.value
+        if desc.access_method == x509.oid.AuthorityInformationAccessOID.CA_ISSUERS
+        and isinstance(desc.access_location, x509.UniformResourceIdentifier)
+    ]
+
+
+def _trust_anchors() -> list:
+    """Every **root** this process would accept, as ``cryptography`` objects.
+
+    Mirrors :func:`_ssl_context` in coverage — certifi's bundle *and* the
+    system store — but keeps only self-signed certificates.
+
+    Filtering to self-signed is load-bearing, not tidiness: Windows' store
+    also caches *intermediate* certificates (measured: it carries ``YR2`` on
+    the dev box), and an intermediate accepted as an anchor makes the repair
+    step stop one hop too early.  The chain then looks verified here while
+    still being incomplete for OpenSSL, which is exactly how a repaired fetch
+    failed on the VM with the intermediates present.
+    """
+    anchors: list = []
+    seen: set[bytes] = set()
+
+    def _add(cert) -> None:
+        try:
+            from cryptography.hazmat.primitives import serialization
+            # ``subject == issuer`` is the definition of a root.
+            if cert.subject != cert.issuer:
+                return
+            fingerprint = cert.public_bytes(serialization.Encoding.DER)
+        except Exception:
+            return
+        if fingerprint in seen:
+            return
+        seen.add(fingerprint)
+        anchors.append(cert)
+
+    try:
+        from cryptography import x509
+        import certifi
+        pem = open(certifi.where(), "rb").read()
+        for block in re.findall(
+            rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", pem, re.S
+        ):
+            try:
+                _add(x509.load_pem_x509_certificate(block))
+            except Exception:
+                continue
+    except Exception as exc:
+        logger.debug("Link fetch: certifi roots unavailable (%s)", exc)
+    for store in ("ROOT", "CA"):
+        try:
+            for der, encoding, _trust in ssl.enum_certificates(store):
+                if encoding != "x509_asn":
+                    continue
+                try:
+                    _add(x509.load_der_x509_certificate(der))
+                except Exception:
+                    continue
+        except Exception:
+            # Non-Windows, or the store is locked; certifi alone will do.
+            continue
+    return anchors
+
+
+def _verified_intermediates(host: str) -> str:
+    """Fetch *host*'s missing intermediates via AIA and prove they are valid.
+
+    Returns the PEM of the intermediates to install, or "" when the chain
+    cannot be completed or does not verify.
+
+    **Why this cannot be used to MITM the bot** — the obvious objection, and
+    the reason the verification step is not optional: a certificate pulled
+    from an AIA URL is attacker-controlled the moment DNS or the plain-HTTP
+    AIA URL is, and :meth:`SSLContext.load_verify_locations` promotes whatever
+    it is handed into a **trust anchor**.  Adding an unverified certificate
+    would therefore let anyone with a forged chain impersonate any site.  So
+    the full path is validated first — leaf → intermediates → an anchor this
+    process already trusts for *this* hostname — using the same policy engine
+    OpenSSL uses.  Only certificates that are part of a chain terminating in a
+    pre-existing trust anchor are installed, and even then they are
+    intermediates, never roots: a forged leaf still fails verification.
+    """
+    if host in _intermediate_cache:
+        return _intermediate_cache[host]
+    # Cache the failure too: an unreachable chain should not be re-walked on
+    # every mention of the same link.
+    _intermediate_cache[host] = ""
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives.serialization import Encoding
+        from cryptography.x509.verification import DNSName, PolicyBuilder, Store
+    except Exception as exc:
+        logger.debug("Link fetch: chain repair unavailable (%s)", exc)
+        return ""
+
+    try:
+        # Step 1 — the leaf.  Verification is off *only* to read the
+        # certificate; nothing is trusted on the strength of this handshake.
+        probe = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        probe.check_hostname = False
+        probe.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((host, 443), timeout=_AIA_TIMEOUT_SEC) as raw:
+            with probe.wrap_socket(raw, server_hostname=host) as tls:
+                chain = tls.get_unverified_chain() or []
+        if not chain:
+            logger.warning("Link fetch: %s sent no certificate", host)
+            return ""
+        leaf = x509.load_der_x509_certificate(bytes(chain[0]))
+
+        # Step 2 — walk AIA upwards.  Each hop is followed only while the
+        # next certificate is signed by the current one, so a hostile AIA
+        # cannot splice in an unrelated certificate.
+        intermediates = [
+            x509.load_der_x509_certificate(bytes(der)) for der in chain[1:]
+        ]
+        current = leaf
+        for _depth in range(_MAX_CHAIN_DEPTH):
+            urls = _aia_ca_issuers(current)
+            if not urls:
+                break
+            fetched = None
+            for url in urls:
+                if not is_public_url(url, resolve=False):
+                    continue
+                try:
+                    with urllib.request.urlopen(url, timeout=_AIA_TIMEOUT_SEC) as resp:
+                        blob = resp.read(64 * 1024)
+                    fetched = x509.load_der_x509_certificate(blob)
+                    break
+                except Exception as exc:
+                    logger.debug("Link fetch: AIA %s failed (%s)", url, exc)
+            if fetched is None:
+                break
+            if fetched.subject != current.issuer:
+                logger.warning(
+                    "Link fetch: AIA for %s returned %r, expected issuer %r — "
+                    "refusing the chain", host,
+                    fetched.subject.rfc4514_string(),
+                    current.issuer.rfc4514_string(),
+                )
+                return ""
+            intermediates.append(fetched)
+            current = fetched
+
+        if not intermediates:
+            logger.info("Link fetch: no intermediates needed for %s", host)
+            return ""
+
+        # Step 3 — the load-bearing check.  Anything that does not chain to a
+        # trust anchor we already had is discarded, which is what keeps this
+        # from becoming a way to trust attacker-supplied certificates.
+        verifier = (
+            PolicyBuilder()
+            .store(Store(_trust_anchors()))
+            .build_server_verifier(DNSName(host))
+        )
+        verifier.verify(leaf, intermediates)
+    except Exception as exc:
+        logger.warning(
+            "Link fetch: could not repair the certificate chain for %s "
+            "(%s: %s)", host, type(exc).__name__, exc,
+        )
+        return ""
+
+    pem = "".join(
+        cert.public_bytes(Encoding.PEM).decode("ascii") for cert in intermediates
+    )
+    _intermediate_cache[host] = pem
+    logger.info(
+        "Link fetch: repaired the TLS chain for %s with %d intermediate(s)",
+        host, len(intermediates),
+    )
+    return pem
 
 
 def clear_cache() -> None:
     """Drop every cached page (used by tests)."""
     _cache.clear()
+
+
+def _is_tls_error(exc: BaseException) -> bool:
+    """True when *exc* is a TLS failure, whether wrapped by urllib or not.
+
+    ``urllib`` wraps handshake failures in ``URLError`` and leaves the real
+    cause in ``.reason``, so a plain ``isinstance(exc, SSLError)`` misses the
+    very case this repair path exists for.
+    """
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (ssl.SSLError, ssl.CertificateError)):
+            return True
+        current = getattr(current, "reason", None)
+        if not isinstance(current, BaseException):
+            return False
+    return False
+
+
+def _http_fallback(url: str) -> str:
+    """The same page over plain HTTP, or "" when *url* is already http.
+
+    Used only when HTTPS failed for a *certificate* reason: some servers send
+    an incomplete chain, and reading the piece over plaintext beats not
+    reading it at all.  The scheme and nothing else changes — same host, same
+    path — so this cannot be turned into a request to somewhere new, and the
+    result still passes :func:`is_public_url` before it is fetched.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return ""
+    if parts.scheme.lower() != "https":
+        return ""
+    return urllib.parse.urlunsplit(
+        ("http", parts.netloc, parts.path, parts.query, "")
+    )
+
+
+def _fetch_once(
+    url: str, *, host: str = ""
+) -> tuple[Optional[Article], Optional[BaseException]]:
+    """One fetch attempt.  Returns ``(article, error)`` and never raises.
+
+    Args:
+        url: Page to read.
+        host: Passed to :func:`_build_opener` to enable chain repair.  "" for
+            the plain verifying context, which is the normal first attempt.
+
+    Returns:
+        ``(article, None)`` on success, ``(None, exception)`` when the request
+        itself failed, and ``(None, None)`` when it was answered but had
+        nothing readable in it — the last case must not trigger repairs,
+        because the connection was fine.
+    """
+    request = urllib.request.Request(url, headers={
+        "User-Agent": _UA,
+        "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5",
+        # Ask for an uncompressed body; the decode path still handles gzip.
+        "Accept-Encoding": "identity",
+    })
+    try:
+        with _build_opener(host).open(request, timeout=_TIMEOUT_SEC) as response:
+            if not _is_textual(response.headers.get("Content-Type", "")):
+                logger.warning(
+                    "Link skipped: non-textual %s (%s)",
+                    response.headers.get("Content-Type"), url[:80],
+                )
+                return None, None
+            raw = response.read(_MAX_BYTES + 1)[:_MAX_BYTES]
+            charset = response.headers.get_content_charset() or ""
+            page = _decode(
+                _decompress(raw, response.headers.get("Content-Encoding", "")),
+                charset,
+            )
+            if not charset:
+                meta = _META_CHARSET_RE.search(page[:4096])
+                if meta:
+                    page = _decode(raw, meta.group(1))
+            title, text = extract_article(page)
+            if text:
+                return Article(url=url, title=title, text=text), None
+            logger.warning(
+                "Link skipped: no readable body in %s (%d bytes, "
+                "content-type=%s)", url[:80], len(raw),
+                response.headers.get("Content-Type"),
+            )
+            return None, None
+    except urllib.error.HTTPError as exc:
+        # The server answered, it just refused: no repair or fallback helps.
+        logger.warning("Link fetch HTTP %s: %s", exc.code, url[:80])
+        return None, None
+    except Exception as exc:
+        return None, exc
 
 
 def fetch_article(url: str) -> Optional[Article]:
@@ -521,6 +864,16 @@ def fetch_article(url: str) -> Optional[Article]:
     Blocking: the caller is expected to run this off the reply path or accept
     up to ``_TIMEOUT_SEC`` of latency.  Never raises — a link that cannot be
     read is a normal outcome, not an error.
+
+    Three attempts at most, each strictly harder to reach than the last:
+
+    1. Plain verifying fetch.  This is what nearly every site needs.
+    2. On a *TLS* failure only, repair the chain via AIA and retry.  Some
+       servers send the leaf certificate alone (measured: ``matrix67.com``);
+       browsers fill the gap in silently, Python's ``ssl`` does not, so
+       whether the fetch works otherwise depends on what the machine happens
+       to have cached — a dev box passed, a fresh VM failed.
+    3. Still TLS-broken, then read the same page over plain HTTP.
 
     Args:
         url: The shared link.  Must pass :func:`is_public_url`.
@@ -544,42 +897,46 @@ def fetch_article(url: str) -> Optional[Article]:
         _cache_put(url, None)
         return None
 
-    request = urllib.request.Request(url, headers={
-        "User-Agent": _UA,
-        "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5",
-        # Ask for an uncompressed body; the decode path still handles gzip.
-        "Accept-Encoding": "identity",
-    })
-
-    article: Optional[Article] = None
     try:
-        with _build_opener().open(request, timeout=_TIMEOUT_SEC) as response:
-            if not _is_textual(response.headers.get("Content-Type", "")):
-                logger.debug(
-                    "Link skipped: non-textual %s",
-                    response.headers.get("Content-Type"),
-                )
-            else:
-                raw = response.read(_MAX_BYTES + 1)[:_MAX_BYTES]
-                charset = response.headers.get_content_charset() or ""
-                page = _decode(
-                    _decompress(raw, response.headers.get("Content-Encoding", "")),
-                    charset,
-                )
-                if not charset:
-                    meta = _META_CHARSET_RE.search(page[:4096])
-                    if meta:
-                        page = _decode(raw, meta.group(1))
-                title, text = extract_article(page)
-                if text:
-                    article = Article(url=url, title=title, text=text)
-                else:
-                    logger.debug("Link skipped: no readable body in %s", url)
-    except urllib.error.HTTPError as exc:
-        logger.debug("Link fetch HTTP %s: %s", exc.code, url)
-    except Exception:
-        logger.debug("Link fetch failed: %s", url, exc_info=True)
+        hostname = urllib.parse.urlsplit(url).hostname or ""
+    except ValueError:
+        hostname = ""
+
+    article, error = _fetch_once(url)
+
+    if article is None and error is not None and _is_tls_error(error) and hostname:
+        logger.info(
+            "Link fetch: TLS failed for %s (%s), retrying with a repaired "
+            "certificate chain", url[:80], type(error).__name__,
+        )
+        article, retry_error = _fetch_once(url, host=hostname)
+        if article is None and retry_error is not None:
+            error = retry_error
+
+    fallback = _http_fallback(url)
+    if article is None and fallback and error is not None and _is_tls_error(error):
+        # Logged as a warning: the page is now readable, but it travelled in
+        # clear text and a network attacker could have altered what the model
+        # will summarise.  Silence here would hide that.
+        logger.warning(
+            "Link fetch: reading %s over plain HTTP because its certificate "
+            "chain could not be verified — content is not authenticated",
+            fallback[:80],
+        )
+        article, fallback_error = _fetch_once(fallback)
+        if article is None and fallback_error is not None:
+            error = fallback_error
+
+    if article is None and error is not None:
+        # The reply degrades to "我打不开链接" and this line is the only trace
+        # of *why* — TLS, DNS, timeout, proxy.  Keep it at WARNING so it
+        # survives the bot's INFO-level log, and name the exception type: a
+        # bare repr of an SSLError and of a timeout read nothing alike.
+        logger.warning(
+            "Link fetch failed: %s (%s: %s)", url[:80],
+            type(error).__name__, error,
+        )
+        logger.debug("Link fetch traceback", exc_info=error)
 
     _cache_put(url, article)
     if article:

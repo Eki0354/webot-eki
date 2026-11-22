@@ -19,3 +19,7 @@ opencc-python-reimplemented>=0.1.7
 zstandard>=0.22
 # Image decryption — the .dat container's head is AES-128-ECB
 pycryptodome>=3.20
+# Certificate-chain repair for link fetching — some sites send the leaf alone
+cryptography>=42.0
+# TLS trust store — Mozilla's CA bundle, merged with the system store
+certifi>=2024.0.0

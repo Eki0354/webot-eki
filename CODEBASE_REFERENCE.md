@@ -855,7 +855,11 @@ todo_delete_keywords: list[str] = [
 
 已知限制（不隐藏）：先解析校验、再由 urllib 二次解析连接，DNS rebinding 攻击者可让第二次解析指向内网。彻底封堵需要把 socket 钉在已校验的 IP 上（自定义 `HTTPSConnection`），收益有限——攻击者需同时控制域名并赢得竞态，且只能读到他自己控制的页面。
 
-TLS：`_ssl_context()` 返回**系统信任库 + `certifi` 合并**的上下文。两者单独用都不够，实测：裸默认上下文拒绝缺中间证书的站点（`www.example.com` 失败）；只用 `certifi` 又拒绝国内 CA 签发的站点（`matrix67.com` 失败，`mp.weixin.qq.com`/`python.org` 通过）。因此从系统默认上下文出发、再 `load_verify_locations(cafile=certifi.where())` 叠加；缺失 `certifi` 时仍用系统信任库，**不关闭验证**。
+TLS：`_ssl_context(host="")` 返回**系统信任库 + `certifi` 合并**的上下文。两者单独用都不够，实测：裸默认上下文拒绝缺中间证书的站点（`www.example.com` 失败）；只用 `certifi` 又拒绝国内 CA 签发的站点（`matrix67.com` 失败，`mp.weixin.qq.com`/`python.org` 通过）。因此从系统默认上下文出发、再 `load_verify_locations(cafile=certifi.where())` 叠加；缺失 `certifi` 时仍用系统信任库，**不关闭验证**。
+
+中间证书自动补链：部分服务器**只下发叶子证书**（实测 `matrix67.com` 只发 1 张，`CN=matrix67.com` 由 `CN=YR2` 签发）。浏览器和 Windows 会自动补齐，Python 的 `ssl` 不会——本机系统 store 恰好缓存了 `YR2` 所以抓取成功，干净的 VM 没有缓存，握手报 `unable to get local issuer certificate`，表现就是「读不到正文」。`_verified_intermediates(host)` 沿 AIA 扩展逐级上溯（实测 `YR2 → Root YR → ISRG Root X1`），**必须先验到已有信任根才采用**：AIA 地址本身可被 DNS/明文劫持，而 `load_verify_locations` 会把传入证书提升为信任锚，未经校验就装载等于开放 MITM。验证用 `cryptography.x509.verification` 的 `PolicyBuilder`（与 OpenSSL 同一套策略），只装载中间证书、绝不装载根。信任锚只保留**自签根**——Windows store 也缓存中间证书，若把中间证书当锚，补链会少爬一跳、看似验证通过而实际握手仍失败。
+
+`fetch_article(url)` 最多三级尝试，一级比一级更难触发：① 普通验证抓取 → ② **仅 TLS 失败时**补链重试 → ③ 仍失败则对**同一主机同一路径**降级到 `http://`（明文，日志以 WARNING 记录「内容未经认证」）。DNS 失败、超时、HTTP 错误码都不触发后两级——那些情况补链和明文都没有意义。补链结果按主机缓存（失败也缓存），命中即用，不会每次提及都重爬。
 
 模块级常量：
 
@@ -866,6 +870,8 @@ TLS：`_ssl_context()` 返回**系统信任库 + `certifi` 合并**的上下文�
 | `_MAX_TEXT` | `1800` | 交给模型的正文长度 |
 | `_MAX_LINKS_PER_QUESTION` | `2` | 单个提问最多抓几个链接 |
 | `_FETCH_BUDGET_SEC` | `8` | 整批抓取的总时限 |
+| `_MAX_CHAIN_DEPTH` | `5` | AIA 补链最多上溯几级 |
+| `_AIA_TIMEOUT_SEC` | `3` | 单张 AIA 证书下载超时 |
 | `_CACHE_TTL_SEC` / `_CACHE_MAX` | `600` / `64` | 页面缓存有效期与容量 |
 
 ### 2.36 `src/ai_profiles.py` (多套 AI 配置档案)
