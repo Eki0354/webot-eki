@@ -744,7 +744,7 @@ todo_delete_keywords: list[str] = [
 | `extract_refermsg(xml)` | 解析 `<refermsg>`：返回 `{type, content, displayname}`，content 做 HTML 反转义（引用图片的 `<img>` 载荷就在里面） | `xml: str` | `dict \| None` |
 | `appmsg_title(xml)` | 取 appmsg `<title>`（引用时即用户自己的提问） | `xml: str` | `str` |
 | `appmsg_url(xml)` | 取 appmsg `<url>`（文章/文件目标）；上限 500 字符，避免被 120 字的正文截断成死链；`<cdnattachurl>` 不匹配 | `xml: str` | `str` |
-| `reduce_appmsg(xml)` | appmsg → `"[链接] 标题 URL"`（无 URL 时只有标题）；含 `<refermsg>` → `"[引用] <用户的话> [链接] <被引用标题 URL>"`（不再误标 `[直播]`）；sysmsg → `None` | `xml: str` | `str \| None` |
+| `reduce_appmsg(xml)` | appmsg → `"[链接] 标题 URL"`（无 URL 时只有标题）；含 `<refermsg>` → `"[引用] <用户的话> [链接] <被引用标题 URL>"`（不再误标 `[直播]`）；**引用 `type=1` 纯文本时 → `"[引用] <用户的话> [原文] <原文> <URL…>"`**（引用裸链接问「分析下这篇」不再丢 URL）；sysmsg → `None` | `xml: str` | `str \| None` |
 
 `src/media/emoji.py` — 表情图片定位与下载：
 
@@ -855,7 +855,7 @@ todo_delete_keywords: list[str] = [
 
 已知限制（不隐藏）：先解析校验、再由 urllib 二次解析连接，DNS rebinding 攻击者可让第二次解析指向内网。彻底封堵需要把 socket 钉在已校验的 IP 上（自定义 `HTTPSConnection`），收益有限——攻击者需同时控制域名并赢得竞态，且只能读到他自己控制的页面。
 
-TLS：优先使用 `certifi` 的 CA 包。本机 CPython 的 `ssl.get_default_verify_paths()` 的 `cafile`/`capath` 均为 `None`，默认上下文会拒绝缺少中间证书的站点（实测 `example.com` 失败、`python.org` 通过）；缺失 `certifi` 时回退系统默认，**不关闭验证**。
+TLS：`_ssl_context()` 返回**系统信任库 + `certifi` 合并**的上下文。两者单独用都不够，实测：裸默认上下文拒绝缺中间证书的站点（`www.example.com` 失败）；只用 `certifi` 又拒绝国内 CA 签发的站点（`matrix67.com` 失败，`mp.weixin.qq.com`/`python.org` 通过）。因此从系统默认上下文出发、再 `load_verify_locations(cafile=certifi.where())` 叠加；缺失 `certifi` 时仍用系统信任库，**不关闭验证**。
 
 模块级常量：
 

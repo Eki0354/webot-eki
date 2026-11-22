@@ -109,6 +109,79 @@ class AppmsgUrlTests(unittest.TestCase):
         xml = '<msg><appmsg><title>总决赛你的队友</title><type>5</type></appmsg></msg>'
         self.assertEqual(reduce_appmsg(xml), "[链接] 总决赛你的队友")
 
+    def test_quoted_bare_link_keeps_the_quoted_url(self):
+        """Quoting a pasted URL must hand the model that URL.
+
+        Reported live: a member quoted a bare link and asked "分析下这篇",
+        and the bot answered "引用里没带链接啊" — the quoted ``type=1`` payload
+        (the link itself) was dropped, so it was telling the truth.
+        """
+        from src.media.appmsg import reduce_appmsg
+
+        xml = (
+            '<msg><appmsg><title>@Dobby 分析下这篇文章的内容</title>'
+            '<type>57</type>'
+            '<refermsg><type>1</type><displayname>Eki</displayname>'
+            f'<content>{_LINK}</content>'
+            '</refermsg></appmsg></msg>'
+        )
+        reduced = reduce_appmsg(xml)
+        self.assertTrue(reduced.startswith("[引用] @Dobby 分析下这篇文章的内容"), reduced)
+        self.assertIn("[原文]", reduced)
+        self.assertIn(_LINK, reduced)
+
+    def test_quoted_text_with_link_keeps_wording_and_url(self):
+        """A quoted sentence with a trailing link keeps both halves."""
+        from src.media.appmsg import reduce_appmsg
+
+        xml = (
+            '<msg><appmsg><title>这篇讲了啥</title><type>57</type>'
+            '<refermsg><type>1</type><displayname>张三</displayname>'
+            f'<content>看这个 {_LINK}</content>'
+            '</refermsg></appmsg></msg>'
+        )
+        reduced = reduce_appmsg(xml)
+        self.assertIn("看这个", reduced)
+        self.assertIn(_LINK, reduced)
+
+    def test_quoted_text_trailing_punctuation_is_not_part_of_the_url(self):
+        """``https://x/a，`` must not carry the Chinese comma into the URL."""
+        from src.media.appmsg import reduce_appmsg
+
+        xml = (
+            '<msg><appmsg><title>看下</title><type>57</type>'
+            '<refermsg><type>1</type><displayname>张三</displayname>'
+            f'<content>{_LINK}，很值得读</content>'
+            '</refermsg></appmsg></msg>'
+        )
+        reduced = reduce_appmsg(xml)
+        self.assertIn(_LINK, reduced)
+        self.assertNotIn(f"{_LINK}，", reduced)
+
+    def test_quoted_text_without_link_adds_no_empty_label(self):
+        """A quoted plain sentence still arrives, just without a URL."""
+        from src.media.appmsg import reduce_appmsg
+
+        xml = (
+            '<msg><appmsg><title>你说啥</title><type>57</type>'
+            '<refermsg><type>1</type><displayname>张三</displayname>'
+            '<content>今天好热</content>'
+            '</refermsg></appmsg></msg>'
+        )
+        self.assertEqual(reduce_appmsg(xml), "[引用] 你说啥 [原文] 今天好热")
+
+    def test_quoted_markup_payload_is_not_treated_as_text(self):
+        """A ``type=1`` payload that is really markup must not leak as-is."""
+        from src.media.appmsg import reduce_appmsg
+
+        xml = (
+            '<msg><appmsg><title>看这个</title><type>57</type>'
+            '<refermsg><type>1</type><displayname>张三</displayname>'
+            '<content>&lt;msg&gt;&lt;appmsg&gt;x&lt;/appmsg&gt;&lt;/msg&gt;</content>'
+            '</refermsg></appmsg></msg>'
+        )
+        self.assertEqual(reduce_appmsg(xml), "[引用] 看这个")
+
 
 class ExtractUrlsTests(unittest.TestCase):
     """Chat text wraps links in punctuation; the path must not absorb it."""

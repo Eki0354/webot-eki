@@ -485,21 +485,29 @@ def _build_opener() -> urllib.request.OpenerDirector:
 
 
 def _ssl_context() -> ssl.SSLContext:
-    """Verifying TLS context, trusting ``certifi``'s bundle when available.
+    """Verifying TLS context: system trust store **plus** ``certifi``'s bundle.
 
-    Windows CPython builds here ship no ``cafile``/``capath`` (measured:
-    ``ssl.get_default_verify_paths()`` returns None for both), and the default
-    context then rejects sites whose chain needs an intermediate the local
-    store lacks — ``example.com`` fails, ``python.org`` passes.  certifi is
-    already on disk through other packages, so prefer its complete Mozilla
-    bundle; without it, fall back to the system defaults rather than disabling
-    verification.
+    Both are needed, and each alone is measurably wrong on this machine:
+
+    * The bare default context rejects sites whose chain needs an
+      intermediate that Windows' own store does not carry (measured:
+      ``www.example.com`` fails with "unable to get local issuer certificate").
+    * ``certifi`` alone rejects sites signed by a CA issued in China that
+      exists in the Windows store but not in Mozilla's (measured:
+      ``matrix67.com`` — the very link in the bug report — fails, while
+      ``mp.weixin.qq.com`` and ``python.org`` both pass).
+
+    So start from the system context and *add* certifi's roots to it.  If
+    certifi is absent (it is optional for the frozen build), the system store
+    is still used rather than turning verification off.
     """
+    context = ssl.create_default_context()
     try:
         import certifi  # optional: only used when already installed
-        return ssl.create_default_context(cafile=certifi.where())
+        context.load_verify_locations(cafile=certifi.where())
     except Exception:
-        return ssl.create_default_context()
+        logger.debug("certifi unavailable; using the system trust store only")
+    return context
 
 
 def clear_cache() -> None:

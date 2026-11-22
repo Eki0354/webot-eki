@@ -40,8 +40,18 @@ _DEFAULT_LABEL = "[链接]"
 #: "the quoted message is a link".
 _APPMSG_LINK_TYPE = "5"
 
+#: ``<type>`` value for an ordinary text message.  A member very often quotes
+#: a bare link and asks about it, so this payload must be read too.
+_APPMSG_TEXT_TYPE = 1
+
 #: Label used when the message quotes another message.
 _QUOTE_LABEL = "[引用]"
+
+#: Label for a quoted message's own text.  WeChat shows the quoted message
+#: above a reply; without it the quote reduces to the *reply's* wording only,
+#: and a quoted bare link — the "分析下这篇文章" case — arrives with no URL at
+#: all, which is exactly what made the bot ask for a link it could not see.
+_QUOTE_BODY_LABEL = "[原文]"
 
 _TITLE_RE = re.compile(r"<title>(.*?)</title>", re.S)
 _DES_RE = re.compile(r"<des>(.*?)</des>", re.S)
@@ -54,6 +64,11 @@ _REFERMSG_STRIP_RE = re.compile(r"<refermsg>.*?</refermsg>", re.S)
 _APPTYPE_RE = re.compile(r"<appmsg\b.*?<type>\s*(\d+)\s*</type>", re.S)
 _CDATA_RE = re.compile(r"^<!\[CDATA\[(.*?)\]\]>$", re.S)
 _REFERMSG_RE = re.compile(r"<refermsg>(.*?)</refermsg>", re.S)
+#: A bare URL inside quoted chat text.  Same boundary set as the fetcher's,
+#: so a quoted "https://x.com/a，厉害" does not hand over the trailing comma.
+_BARE_URL_RE = re.compile(
+    r"https?://[^\s<>\"'`（）【】《》「」，。；：！？、\\^|]+", re.I
+)
 _REFER_TYPE_RE = re.compile(r"<type>\s*(\d+)\s*</type>")
 _REFER_CONTENT_RE = re.compile(r"<content>(.*?)</content>", re.S)
 _REFER_NAME_RE = re.compile(r"<displayname>(.*?)</displayname>", re.S)
@@ -67,6 +82,11 @@ _SENDER_PREFIX_RE = re.compile(
 _MAX_TEXT = 120
 #: URLs are longer than titles and must not be truncated into a dead link.
 _MAX_URL = 500
+#: A quoted chat line is a sentence, not a title — keep more of it.
+_MAX_QUOTED_TEXT = 200
+
+#: Trailing punctuation belongs to the sentence, not the URL ("https://x/a，").
+_TRAILING_JUNK = ".,;:!?)]}'\"…，。；：！？、）】」"
 
 
 def strip_sender_prefix(text: str) -> str:
@@ -147,25 +167,70 @@ def appmsg_url(xml: str) -> str:
     return _clean(match.group(1), _MAX_URL) if match else ""
 
 
+def _quoted_text_summary(content: str) -> str:
+    """Summarise a quoted *plain-text* message, keeping any URL intact.
+
+    The common case this exists for: someone pastes a bare link as a message,
+    a second person quotes it and asks "分析下这篇".  The quoted payload has
+    ``type=1`` and its ``<content>`` is the link itself — dropping it left the
+    reply reading "引用里没带链接啊，把文章链接甩过来", because the model was
+    telling the truth about the prompt it was given.
+
+    Returns:
+        ``"[原文] <文本> <URL…>"``, or "" when the payload carries nothing
+        usable (empty, or markup that should have been a different type).
+    """
+    text = strip_sender_prefix(content or "").strip()
+    if not text or looks_like_xml(text):
+        return ""
+
+    urls: list[str] = []
+    for match in _BARE_URL_RE.finditer(text):
+        url = match.group(0)
+        while url and url[-1] in _TRAILING_JUNK:
+            url = url[:-1]
+        if url and url not in urls:
+            urls.append(url)
+
+    # Take the links out before collapsing whitespace so a long URL cannot
+    # be cut in half by the text limit below.
+    rest = _clean(_BARE_URL_RE.sub(" ", text), _MAX_QUOTED_TEXT)
+
+    parts = [_QUOTE_BODY_LABEL]
+    if rest:
+        parts.append(rest)
+    parts.extend(urls)
+    return " ".join(parts) if len(parts) > 1 else ""
+
+
 def _quoted_summary(xml: str) -> str:
     """One-line summary of the message a reply quotes.
 
-    Only links are summarised.  A quoted image is handled earlier by
-    :meth:`MediaPipeline._describe_quoted`, and the remaining kinds carry
-    nothing the model can use — inventing a label for them would be worse
-    than saying nothing.
+    Links and plain text are both summarised: quoting a shared article card
+    and quoting a pasted URL are the same question to the person asking.
+    A quoted image is handled earlier by :meth:`MediaPipeline._describe_quoted`,
+    and the remaining kinds carry nothing the model can use — inventing a
+    label for them would be worse than saying nothing.
 
     Returns:
-        ``"[链接] 标题 URL"`` (URL omitted when absent), or "" when the
-        quoted message is not a link.
+        ``"[链接] 标题 URL"`` for a quoted card, ``"[原文] 文本 URL"`` for a
+        quoted text message, or "" when the quoted message is neither.
     """
     refer = extract_refermsg(xml)
+    if not refer:
+        return ""
     # ``extract_refermsg`` reports ``type`` as an int; the label table is
     # keyed by the string form, so compare on ints rather than mixing them
     # (which silently never matched).
-    if not refer or int(refer.get("type") or 0) != int(_APPMSG_LINK_TYPE):
-        return ""
+    kind = int(refer.get("type") or 0)
     content = refer.get("content") or ""
+
+    if kind == _APPMSG_TEXT_TYPE:
+        return _quoted_text_summary(content)
+
+    if kind != int(_APPMSG_LINK_TYPE):
+        return ""
+
     title_match = _TITLE_RE.search(content)
     title = _clean(title_match.group(1) if title_match else "")
     url = appmsg_url(content)
