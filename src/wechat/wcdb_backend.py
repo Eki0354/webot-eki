@@ -30,6 +30,37 @@ DEFAULT_POLL_SEC = 1.0
 MAX_DEDUP_SIZE = 5000
 MAX_CONSECUTIVE_ERRORS = 5   # trigger reinit after this many consecutive failures
 
+# How many recently persisted message IDs to preload into the dedup set on
+# startup, per group.  Without this the set is empty after every restart, and
+# the last page of history (including its images) is processed again — the
+# media pipeline then re-describes old pictures before any new message is
+# looked at.
+DEDUP_WARMUP_LIMIT = 200
+
+# ── "Read empty" detection ────────────────────────────────────────
+# Reading nothing and reading nothing *new* look identical from outside: the
+# DLL returns an empty list for both, so a frozen handle used to keep the
+# bot reporting db_ok while @-mentions never arrived.  SessionTable records
+# the last message time per chat, so the two cases can be told apart.
+# Measured on a live account: session.last_timestamp equals the newest
+# get_messages() create_time exactly for every chat that has messages.
+LAG_CHECK_INTERVAL_SEC = 60      # how often to read the session table
+STALL_WARN_SEC = 300             # session newer than what we read by this much → stalled
+STALL_WARN_REPEAT_SEC = 600      # per-group warning rate limit
+READ_GRACE_SEC = 120             # startup grace before "never read anything" counts
+
+# A read path that stays stalled for this long is treated as a dead handle,
+# not as "the group is quiet": the WCDB connection is closed and re-opened.
+# WeChat restarts, logouts and VM suspends all leave a stale handle behind,
+# and nothing used to recover from that because reads never raised.
+STALL_REINIT_SEC = 180
+STALL_REINIT_MIN_INTERVAL = 300  # never thrash the native handle
+
+# The window is a separate failure from the read path: sending needs it, but
+# reading the database does not.  It is re-scanned first (cheap), and only a
+# window that stays gone for this long escalates to a full rebuild.
+HWND_REINIT_SEC = 180
+
 # Message types whose body is media rather than text.  Used to pick a
 # placeholder when MediaPipeline cannot describe them.
 _MEDIA_LOCAL_TYPES = frozenset({
@@ -39,6 +70,35 @@ _MEDIA_LOCAL_TYPES = frozenset({
     48,     # location
     49,     # appmsg (link / file / mini-program)
 })
+
+
+def raw_message_id(msg: dict) -> str:
+    """Compute the stable message ID for a *raw* WCDB message.
+
+    This must stay in sync with the ID generated in ``_standardize``: the
+    poll loop calls it before standardization so that already-seen messages
+    are skipped without running the media pipeline (vision requests are the
+    expensive part, and they would otherwise re-describe old pictures on
+    every restart).
+    """
+    raw_id = (
+        str(msg.get("server_id", ""))
+        or str(msg.get("local_id", ""))
+        or f"{msg.get('sender_username', '')}|{msg.get('message_content', '')}"
+           f"|{msg.get('create_time', 0)}"
+    )
+    return hashlib.md5(str(raw_id).encode()).hexdigest()
+
+
+def _fmt_ts(ts: int) -> str:
+    """Format a Unix timestamp for human-readable log lines."""
+    if not ts:
+        return "never"
+    try:
+        return time.strftime("%m-%d %H:%M:%S", time.localtime(ts))
+    except (OSError, ValueError, OverflowError):
+        return str(ts)
+
 
 
 class WcdbBackend(AbstractWeChatBackend):
@@ -77,11 +137,33 @@ class WcdbBackend(AbstractWeChatBackend):
         # Callback thread pool — fire-and-forget AI calls so the poll loop
         # never blocks on a slow summarization.
         self._pool: concurrent.futures.ThreadPoolExecutor | None = None
+        # Guards `_pool` against the poll thread submitting while stop() is
+        # closing it.  Without this the two race and the submit raises
+        # RuntimeError("cannot schedule new futures after shutdown").
+        self._pool_lock = threading.Lock()
+        # Pools detached from `_pool` but not yet drained: stop() closes the
+        # pool to new work, and the shutdown path still has to wait for the
+        # callbacks it already queued.
+        self._retired_pools: list[concurrent.futures.ThreadPoolExecutor] = []
         # Voice recognition pipeline (lazy-init when voice_asr_enabled)
         self._voice: Optional[object] = None
         # Media (emoji/appmsg/vision) pipeline (lazy-init when media_vision_enabled)
         self._media: Optional[object] = None
         self._voice_config = config
+        # ── "Read empty" detection state ──────────────────────────
+        # Window over which "we read nothing at all" is tolerated: it starts
+        # at launch and restarts whenever the handle is rebuilt, since a
+        # fresh handle legitimately knows nothing yet.
+        self._read_watch_since = time.time()
+        self._last_seen_ts: dict[str, int] = {}    # talker -> newest message we read
+        self._session_ts: dict[str, int] = {}      # talker -> SessionTable last_timestamp
+        self._stalled: set[str] = set()            # talkers we cannot read new messages from
+        self._last_lag_check = 0.0
+        self._lag_warned_at: dict[str, float] = {}
+        self._stalled_since: Optional[float] = None   # when the stall started
+        self._last_reinit_at = 0.0                    # throttle handle rebuilds
+        self._no_hwnd_since: Optional[float] = None   # WeChat window missing since
+        self._last_window_check = 0.0                 # throttle window re-scans
 
     # ── Public API ─────────────────────────────────────────────────
 
@@ -126,6 +208,9 @@ class WcdbBackend(AbstractWeChatBackend):
         if not self._talker_ids:
             logger.error("No groups resolved. Check WECHAT_GROUPS.")
             return
+
+        # Don't replay the last page of history as if it were new.
+        self._warm_dedup()
 
         # Pre-find WeChat window
         hwnd = self._window.find_hwnd()
@@ -183,9 +268,18 @@ class WcdbBackend(AbstractWeChatBackend):
                     )
                     time.sleep(wait)
         finally:
-            # Drain in-flight callbacks gracefully
-            self._pool.shutdown(wait=True, cancel_futures=True)
-            self._pool = None
+            # Drain in-flight callbacks gracefully.  stop() may already have
+            # detached the pool (it closes it without waiting so the UI stays
+            # responsive), so the shutdown path has to finish draining what
+            # was handed over rather than assume `_pool` is still there.
+            with self._pool_lock:
+                pools = self._retired_pools[:]
+                self._retired_pools.clear()
+                if self._pool is not None:
+                    pools.append(self._pool)
+                    self._pool = None
+            for pool in pools:
+                pool.shutdown(wait=True, cancel_futures=True)
             if self._client:
                 self._client.close()
         logger.info("WcdbBackend stopped.")
@@ -202,9 +296,22 @@ class WcdbBackend(AbstractWeChatBackend):
         return self._send_and_confirm(group_name, chat_id, content)
 
     def stop(self) -> None:
+        """Signal shutdown and stop accepting callbacks.
+
+        The pool is detached and closed here (without waiting) so a stopping
+        bot cannot take new work, while ``_run``'s ``finally`` still drains
+        whatever was already queued.  Leaving ``_pool`` pointing at a closed
+        executor made the next submit raise
+        ``RuntimeError: cannot schedule new futures after shutdown``.
+        """
         self._running = False
-        if self._pool:
-            self._pool.shutdown(wait=False)
+        with self._pool_lock:
+            pool = self._pool
+            self._pool = None
+            if pool is not None:
+                self._retired_pools.append(pool)
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     # ── Recovery ─────────────────────────────────────────────────────
 
@@ -231,16 +338,54 @@ class WcdbBackend(AbstractWeChatBackend):
             raise
         # Clear dedup set — WCDB may return messages with new IDs
         self._known_ids = DedupSet(max_size=MAX_DEDUP_SIZE)
+        # Forget what the old handle could see: the new one must be judged on
+        # its own reads, otherwise it would stay "stalled" from the start.
+        self._last_seen_ts.clear()
+        self._session_ts.clear()
+        self._stalled.clear()
+        self._stalled_since = None
+        self._read_watch_since = time.time()
         # Re-resolve groups (talker IDs may have changed)
         self._resolve_groups()
+        # Re-seed with what is already stored, so the re-opened DB does not
+        # replay its whole last page (and its images) as if it were new.
+        self._warm_dedup()
         # Re-find WeChat window
-        hwnd = self._window.find_hwnd()
+        hwnd = self._window.find_hwnd(force=True)
         if hwnd:
             logger.info("WeChat window re-detected: HWND=%s", hwnd)
+            self._no_hwnd_since = None
         else:
             logger.warning("WeChat window not found after reinit")
+            # Restart the "window is gone" clock from the rebuild, so a
+            # second rebuild cannot fire immediately after a failed one.
+            self._no_hwnd_since = time.time()
 
     # ── Group resolution ────────────────────────────────────────────
+
+    def _warm_dedup(self) -> None:
+        """Seed the dedup set with message IDs already persisted.
+
+        The set lives only in memory, so without this every restart treats
+        the last polled page as brand new and runs the media pipeline over
+        its historical images — the vision requests then delay the first
+        real message (and its @-reply) by minutes.
+        """
+        if self._store is None or not self._talker_ids:
+            return
+        try:
+            warm = 0
+            for talker in self._talker_ids.values():
+                for msg_id in self._store.get_recent_message_ids(
+                    talker, limit=DEDUP_WARMUP_LIMIT,
+                ):
+                    if msg_id not in self._known_ids:
+                        self._known_ids.add(msg_id)
+                        warm += 1
+            if warm:
+                logger.info("Dedup warmed with %d stored message IDs", warm)
+        except Exception as e:
+            logger.warning("Dedup warmup failed (continuing): %s", e)
 
     def _resolve_groups(self) -> None:
         """Map configured group names to talker IDs from WCDB sessions.
@@ -417,6 +562,10 @@ class WcdbBackend(AbstractWeChatBackend):
             if not talker:
                 continue
             self._poll_group(group_name, talker, callback)
+        # Make "cannot read new messages" visible instead of silent.
+        self._maybe_check_read_lag()
+        # A vanished window breaks replies even when reading still works.
+        self._maybe_check_window()
         # Check shutdown signal before sleeping so stop() is responsive
         if not self._running:
             return
@@ -434,16 +583,35 @@ class WcdbBackend(AbstractWeChatBackend):
         if not messages:
             return
 
+        # Remember how far we can actually see into this chat — compared
+        # against SessionTable later to detect a frozen read path.
+        newest = max(
+            (int(m.get("create_time") or 0) for m in messages), default=0,
+        )
+        if newest > self._last_seen_ts.get(talker, 0):
+            self._last_seen_ts[talker] = newest
+
         for msg in reversed(messages):
             if not self._running:
                 break
 
+            # Dedup BEFORE standardization: standardizing runs the media
+            # pipeline (vision requests for images), which would otherwise
+            # re-describe the same old pictures on every restart.
+            pre_id = raw_message_id(msg)
+            if pre_id in self._known_ids:
+                continue
+
             standardized = self._standardize(msg, group_name, talker)
             if standardized is None:
+                # Filtered (system notice, empty body...).  Remember it so
+                # the next cycle does not standardize it again.
+                self._known_ids.add(pre_id)
                 continue
 
             msg_id = standardized["message_id"]
-            if msg_id in self._known_ids:
+            self._known_ids.add(pre_id)
+            if msg_id != pre_id and msg_id in self._known_ids:
                 continue
             self._known_ids.add(msg_id)
 
@@ -454,16 +622,248 @@ class WcdbBackend(AbstractWeChatBackend):
 
             # Fire-and-forget: callback (potentially AI call) + send run in
             # a thread pool worker so the poll loop continues immediately.
-            if self._pool:
-                self._pool.submit(
-                    self._handle_message,
-                    group_name, talker, standardized, callback,
-                )
-            else:
-                # Fallback (pool already shut down): run inline
+            # The submit happens under `_pool_lock`: stop() detaches and
+            # closes the pool concurrently, and submitting into a closed
+            # executor raises "cannot schedule new futures after shutdown".
+            submitted = False
+            with self._pool_lock:
+                if self._pool is not None:
+                    try:
+                        self._pool.submit(
+                            self._handle_message,
+                            group_name, talker, standardized, callback,
+                        )
+                        submitted = True
+                    except RuntimeError as e:
+                        # Pool closed between the check and the submit.
+                        logger.debug("Callback pool is closed: %s", e)
+            if not submitted:
+                # Fallback (shutting down): run inline so the message is not
+                # silently dropped while the process is still alive.
                 self._handle_message(
                     group_name, talker, standardized, callback,
                 )
+
+    def _maybe_check_read_lag(self) -> None:
+        """Rate-limited wrapper around :meth:`_check_read_lag`."""
+        now = time.time()
+        if now - self._last_lag_check < LAG_CHECK_INTERVAL_SEC:
+            return
+        self._last_lag_check = now
+        try:
+            self._check_read_lag(now)
+        except Exception as e:
+            # Diagnosis must never break polling.
+            logger.debug("Read-lag check failed: %s", e)
+
+    def _check_read_lag(self, now: float) -> None:
+        """Compare what we can read with what the session table says exists.
+
+        ``get_messages()`` returns an empty list both for "no new messages"
+        and for "this handle cannot read the message DB", and the non-DLL
+        path silently degrades to the first case.  SessionTable records the
+        last message time per chat, so a gap between the two means the read
+        path is broken — which is exactly the state that used to look
+        healthy while @-mentions were never delivered.
+        """
+        with self._client_lock:
+            sessions = self._client.get_sessions()
+        if not sessions:
+            logger.warning(
+                "Session table came back empty — cannot verify the read path"
+            )
+            return
+
+        by_username = {
+            str(s.get("username", "") or ""): s for s in sessions
+        }
+
+        stalled_now: set[str] = set()
+        for group_name, talker in self._talker_ids.items():
+            session = by_username.get(talker)
+            if session is None:
+                # The chat is not in the session list at all: either the
+                # group was left, or the handle reads a different account.
+                self._stalled.add(talker)
+                stalled_now.add(talker)
+                self._warn_lag(
+                    talker,
+                    f"group '{group_name}' ({talker}) is missing from the "
+                    f"session table — the WCDB handle may belong to another "
+                    f"WeChat account",
+                    now,
+                )
+                continue
+
+            try:
+                session_ts = int(session.get("last_timestamp") or 0)
+            except (TypeError, ValueError):
+                session_ts = 0
+            if session_ts <= 0:
+                # Nothing has ever been said here; nothing to compare.
+                continue
+            self._session_ts[talker] = session_ts
+
+            seen_ts = self._last_seen_ts.get(talker, 0)
+            if seen_ts <= 0:
+                # Never read a single message.  Give the (possibly rebuilt)
+                # handle a grace period: its first poll may not have run yet.
+                if now - self._read_watch_since > READ_GRACE_SEC:
+                    self._stalled.add(talker)
+                    stalled_now.add(talker)
+                    self._warn_lag(
+                        talker,
+                        f"group '{group_name}' ({talker}) has messages up to "
+                        f"{_fmt_ts(session_ts)} but none could be read — "
+                        f"the message database is not being read",
+                        now,
+                    )
+                continue
+
+            lag = session_ts - seen_ts
+            if lag > STALL_WARN_SEC:
+                self._stalled.add(talker)
+                stalled_now.add(talker)
+                self._warn_lag(
+                    talker,
+                    f"group '{group_name}' ({talker}) is {lag // 60}m behind: "
+                    f"session has messages up to {_fmt_ts(session_ts)}, "
+                    f"last read was {_fmt_ts(seen_ts)} — new messages are "
+                    f"not coming through",
+                    now,
+                )
+            else:
+                self._stalled.discard(talker)
+
+        if stalled_now:
+            logger.warning(
+                "Read path stalled for %d of %d group(s)",
+                len(stalled_now), len(self._talker_ids),
+            )
+            if self._stalled_since is None:
+                self._stalled_since = now
+            elif (now - self._stalled_since >= STALL_REINIT_SEC
+                    and now - self._last_reinit_at >= STALL_REINIT_MIN_INTERVAL):
+                # Stalled long enough to be a dead handle rather than a quiet
+                # group.  Reads never raise in this state, so nothing else
+                # would ever notice — rebuild the WCDB connection.
+                logger.error(
+                    "Read path stalled for %ds — rebuilding the WCDB handle",
+                    int(now - self._stalled_since),
+                )
+                self._last_reinit_at = now
+                self._stalled_since = None
+                try:
+                    self._reinitialize()
+                except Exception as e:
+                    # Diagnosis must not take polling down with it; the next
+                    # cycle retries after STALL_REINIT_MIN_INTERVAL.
+                    logger.error("Handle rebuild failed: %s", e)
+        else:
+            self._stalled_since = None
+
+    def _maybe_check_window(self) -> None:
+        """Re-scan for WeChat's window and recover when it stays gone.
+
+        ``no_hwnd`` used to be a heartbeat string and nothing more: replies
+        silently failed while the bot kept reporting itself as running.
+        The window is re-scanned cheaply first (WeChat may have been
+        minimised to tray and come back), and only a window that stays
+        missing escalates to a full handle rebuild.
+        """
+        now = time.time()
+        if now - self._last_window_check < LAG_CHECK_INTERVAL_SEC:
+            return
+        self._last_window_check = now
+
+        try:
+            hwnd = self._window.find_hwnd(force=True)
+        except Exception as e:
+            logger.debug("Window re-scan failed: %s", e)
+            return
+
+        if hwnd:
+            if self._no_hwnd_since is not None:
+                logger.info("WeChat window is back: HWND=%s", hwnd)
+            self._no_hwnd_since = None
+            return
+
+        if self._no_hwnd_since is None:
+            self._no_hwnd_since = now
+            logger.warning(
+                "WeChat window disappeared — replies cannot be sent until it "
+                "comes back"
+            )
+            return
+
+        gone_for = now - self._no_hwnd_since
+        if gone_for < HWND_REINIT_SEC:
+            return
+        if now - self._last_reinit_at < STALL_REINIT_MIN_INTERVAL:
+            return
+
+        logger.error(
+            "WeChat window has been missing for %ds — rebuilding the WCDB "
+            "handle (WeChat was probably restarted or logged out)",
+            int(gone_for),
+        )
+        self._last_reinit_at = now
+        self._no_hwnd_since = None
+        try:
+            self._reinitialize()
+        except Exception as e:
+            logger.error("Handle rebuild failed: %s", e)
+
+    def health_status(self) -> str:
+        """One-line health for the heartbeat (``wechat=...`` in the log).
+
+        ``no_hwnd`` means WeChat's window is gone; ``read_stalled`` means the
+        message database is not delivering.  Both used to look healthy:
+        reads returned empty instead of failing, so the only visible signal
+        was that @-mentions silently stopped arriving.
+        """
+        try:
+            hwnd = self._window._cached_hwnd
+            has_hwnd = bool(hwnd) and self._window._validate_hwnd(hwnd)
+        except Exception:
+            has_hwnd = False
+
+        if self._stalled:
+            return f"read_stalled({len(self._stalled)})"
+        if not has_hwnd:
+            return "no_hwnd"
+        return f"HWND_{hwnd}" if hwnd else "ok"
+
+    def _warn_lag(self, talker: str, message: str, now: float) -> None:
+        """Log a read-lag warning at most once per group per interval."""
+        last = self._lag_warned_at.get(talker, 0.0)
+        if now - last < STALL_WARN_REPEAT_SEC:
+            return
+        self._lag_warned_at[talker] = now
+        logger.warning("%s", message)
+
+    def read_progress(self) -> dict:
+        """Snapshot of what polling can actually see (for heartbeats/UI).
+
+        ``newest_seen`` is the newest message timestamp read from WCDB,
+        ``newest_session`` what WeChat itself records for those chats, and
+        ``lag_sec`` the gap between them.  A non-empty ``stalled_chats``
+        means the read path is not delivering, even though polling appears
+        healthy.
+        """
+        seen = {t: ts for t, ts in self._last_seen_ts.items() if ts > 0}
+        newest_seen = max(seen.values(), default=0)
+        newest_session = max(self._session_ts.values(), default=0)
+        return {
+            "newest_seen_ts": newest_seen,
+            "newest_session_ts": newest_session,
+            "lag_sec": (
+                max(0, newest_session - newest_seen)
+                if newest_seen and newest_session else 0
+            ),
+            "stalled_chats": sorted(self._stalled),
+            "tracked_chats": len(self._talker_ids),
+        }
 
     def _handle_message(self, group_name: str, talker: str,
                         standardized: dict, callback: MessageCallback) -> None:
@@ -701,15 +1101,13 @@ class WcdbBackend(AbstractWeChatBackend):
         # Generate stable message ID.
         # For system join messages, use a content-based ID to avoid
         # volatile WCDB server_id/local_id causing dedup misses.
+        # Otherwise reuse `raw_message_id` so the poll loop can compute the
+        # same ID *before* standardization and skip seen messages.
         if is_system_join:
             raw_id = f"join|{talker}|{new_member_id}|{content}|{ts}"
+            msg_id = hashlib.md5(str(raw_id).encode()).hexdigest()
         else:
-            raw_id = (
-                str(msg.get("server_id", ""))
-                or str(msg.get("local_id", ""))
-                or f"{sender}|{content}|{ts}"
-            )
-        msg_id = hashlib.md5(str(raw_id).encode()).hexdigest()
+            msg_id = raw_message_id(msg)
 
         return {
             "message_id": msg_id,

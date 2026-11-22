@@ -85,7 +85,7 @@ function MetricCard({ icon: Icon, label, value, sub, accent = 'green', chartData
   )
 }
 
-function LiveIndicator({ label, ok }) {
+function LiveIndicator({ label, ok, detail }) {
   return (
     <motion.div
       whileHover={{ x: 2 }}
@@ -103,7 +103,14 @@ function LiveIndicator({ label, ok }) {
           />
         )}
       </div>
-      <span className="text-sm text-text-main font-medium flex-1">{label}</span>
+      <span className="text-sm text-text-main font-medium flex-1">
+        {label}
+        {detail && (
+          <span className="ml-2 text-[11px] font-mono font-normal text-text-muted">
+            {detail}
+          </span>
+        )}
+      </span>
       <span
         className={`text-[11px] font-semibold font-mono px-3.5 py-1 rounded-full border transition-all ${
           ok
@@ -119,6 +126,15 @@ function LiveIndicator({ label, ok }) {
 
 const backendLabels = { wcdb: '本地数据库直读', mac_hybrid: 'macOS WeFlow 直读', mac_ui: 'macOS 界面自动化', direct: 'UIA 窗口读取' }
 const aiLabels = { deepseek: 'DeepSeek', claude: 'Claude' }
+
+// "time since" for the read-path indicator: seconds → a short label.
+function formatAgo(sec) {
+  if (sec === undefined || sec === null || sec < 0) return '从未'
+  if (sec < 60) return `${sec} 秒前`
+  if (sec < 3600) return `${Math.floor(sec / 60)} 分钟前`
+  if (sec < 86400) return `${Math.floor(sec / 3600)} 小时前`
+  return `${Math.floor(sec / 86400)} 天前`
+}
 
 export default function Dashboard({ status }) {
   const [busy, setBusy] = useState(false)
@@ -204,6 +220,19 @@ export default function Dashboard({ status }) {
     : -1
   const lastApi = apiSecAgo > 0 ? `${apiSecAgo} 秒前` : '暂无调用'
 
+  // Read-path health: reads return empty instead of failing, so a bot that
+  // silently stopped receiving messages used to look like a quiet group.
+  const stalledChats = status.stalled_chats || []
+  const readLagSec = status.read_lag_sec || 0
+  const msgSecAgo = status.last_message_sec_ago
+  const neverRead = msgSecAgo === undefined || msgSecAgo < 0
+  const readOk = stalledChats.length === 0 && readLagSec < 300
+  const readDetail = stalledChats.length > 0
+    ? `${stalledChats.length} 个群收不到新消息`
+    : neverRead
+      ? '尚未读到消息'
+      : `最新消息 ${formatAgo(msgSecAgo)}`
+
   return (
     <div className="space-y-8 max-w-6xl">
       {/* Control bar */}
@@ -279,6 +308,11 @@ export default function Dashboard({ status }) {
           </div>
           <div className="divide-y divide-border-main/40">
             <LiveIndicator label="数据库连接" ok={status.db_ok} />
+            <LiveIndicator
+              label="消息读取"
+              ok={readOk}
+              detail={readDetail}
+            />
             <LiveIndicator label="微信后端" ok={!!status.wechat_backend} />
             <LiveIndicator label="AI 后端" ok={!!status.ai_backend} />
             <LiveIndicator label="机器人进程" ok={status.running} />

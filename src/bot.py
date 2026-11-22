@@ -90,6 +90,7 @@ class HealthMonitor:
         db_status = self._check_db()
         wechat_status = self._check_wechat_hwnd()
         last_api_str = self._last_api_ago()
+        progress = self._read_progress()
 
         # Push to Web UI
         self._on_tick(
@@ -99,14 +100,64 @@ class HealthMonitor:
             last_api_call_time=self._summarizer.last_api_call_time,
             last_api_call_sec_ago=int(time.time() - self._summarizer.last_api_call_time)
                 if self._summarizer.last_api_call_time > 0 else -1,
+            last_message_sec_ago=self._sec_ago(progress["newest_seen_ts"]),
+            read_lag_sec=progress["lag_sec"],
+            stalled_chats=progress["stalled_chats"],
         )
 
         logger.info(
-            "HEARTBEAT: uptime=%dm, msgs=%d, db=%s, wechat=%s, last_api=%s",
+            "HEARTBEAT: uptime=%dm, msgs=%d, db=%s, wechat=%s, last_api=%s, "
+            "last_msg=%s, read_lag=%ds, stalled=%d",
             uptime_min, msgs, db_status, wechat_status, last_api_str,
+            self._ago_str(progress["newest_seen_ts"]),
+            progress["lag_sec"], len(progress["stalled_chats"]),
         )
 
-        self._write_status_json()
+        self._write_status_json(progress)
+
+    def _read_progress(self) -> dict:
+        """What polling can actually see, from the backend's own counters.
+
+        Backends that do not track reads (macOS, non-WCDB) report "unknown"
+        rather than a fake zero, so a quiet dashboard cannot be mistaken for
+        a broken read path.
+        """
+        empty = {
+            "newest_seen_ts": 0,
+            "newest_session_ts": 0,
+            "lag_sec": 0,
+            "stalled_chats": [],
+            "tracked_chats": 0,
+        }
+        reader = getattr(self._backend, "read_progress", None)
+        if not callable(reader):
+            return empty
+        try:
+            progress = reader()
+        except Exception:
+            logger.exception("read_progress() failed")
+            return empty
+        if not isinstance(progress, dict):
+            return empty
+        return {**empty, **progress}
+
+    @staticmethod
+    def _sec_ago(ts: int) -> int:
+        """Seconds since *ts*, or -1 when it never happened."""
+        if not ts:
+            return -1
+        return max(0, int(time.time() - ts))
+
+    def _ago_str(self, ts: int) -> str:
+        """Human-readable 'time since *ts*' for the heartbeat line."""
+        ago = self._sec_ago(ts)
+        if ago < 0:
+            return "never"
+        if ago < 60:
+            return f"{ago}s_ago"
+        if ago < 3600:
+            return f"{ago // 60}m_ago"
+        return f"{ago // 3600}h_ago"
 
     def _check_db(self) -> str:
         """Check database connection is alive."""
@@ -147,8 +198,10 @@ class HealthMonitor:
         else:
             return f"{ago // 3600}h_ago"
 
-    def _write_status_json(self) -> None:
+    def _write_status_json(self, progress: dict | None = None) -> None:
         """Write a lightweight status file for external watchdogs."""
+        if progress is None:
+            progress = self._read_progress()
         status = {
             "uptime_sec": int(time.time() - self._start_time),
             "messages_processed": self._router.messages_processed,
@@ -159,6 +212,13 @@ class HealthMonitor:
                 if self._summarizer.last_api_call_time > 0
                 else -1
             ),
+            # Read-path visibility for watchdogs: "messages_processed" only
+            # grows when something arrives, so a frozen read path is
+            # indistinguishable from a quiet group without these.
+            "last_message_sec_ago": self._sec_ago(progress["newest_seen_ts"]),
+            "read_lag_sec": progress["lag_sec"],
+            "stalled_chats": progress["stalled_chats"],
+            "tracked_chats": progress["tracked_chats"],
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
 

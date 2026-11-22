@@ -98,6 +98,7 @@ grep "文件名" CODEBASE_REFERENCE.md
 | `WECHAT_BACKEND` | `str` | `"wcdb"` | `src/config.py` | `src/bot.py:_create_wechat_backend()` |
 | `WECHAT_GROUPS` | `str` | `"*"` | `src/config.py` (经 `_decode_wechat_groups` URL解码) | `src/bot.py:_create_wechat_backend()`, `src/wechat/wcdb_backend.py:_resolve_groups()` |
 | `WECHAT_DATA_DIR` | `str` | `""` | `src/config.py` | `src/wechat/wcdb_client.py`, `src/voice/file_locator.py`, `src/web/server.py` |
+| `WECHAT_WXID` | `str` | `""` | `src/config.py` (引导流程由 `src/web/server.py:_run_step1_extraction()` 写入) | `src/wechat/wcdb_client.py:_find_wxid_and_dbpath()` (固定账号目录; 固定值取不到时抛 `FileNotFoundError` 而非回退) |
 | `BOT_DISPLAY_NAME` | `str` | `"群聊小助手"` | `src/config.py` (经 `_sanitize_display_name` 清洗) | `src/router.py:handle()` (多处), `src/bot.py:_log_banner()` |
 | `ADMIN_WXID` | `str` | `""` | `src/config.py` | `src/router.py:handle()` (管理员命令判断) |
 | `TRIGGER_KEYWORDS` | `list[str]` | 见下方默认值 | `src/config.py` | `src/trigger/detector.py:TriggerDetector.__init__()` |
@@ -177,6 +178,14 @@ grep "文件名" CODEBASE_REFERENCE.md
 | `DEFAULT_POLL_SEC` | `float` | `1.0` | `src/wechat/wcdb_backend.py` | 默认轮询间隔 |
 | `MAX_DEDUP_SIZE` | `int` | `5000` | `src/wechat/wcdb_backend.py` | 去重集合最大容量 |
 | `MAX_CONSECUTIVE_ERRORS` | `int` | `5` | `src/wechat/wcdb_backend.py` | 连续错误触发重初始化阈值 |
+| `DEDUP_WARMUP_LIMIT` | `int` | `200` | `src/wechat/wcdb_backend.py` | 启动时每个群预载入去重集合的历史消息 ID 数 (`_warm_dedup()`) |
+| `LAG_CHECK_INTERVAL_SEC` | `int` | `60` | `src/wechat/wcdb_backend.py` | 读空诊断与窗口复检的限频间隔 |
+| `STALL_WARN_SEC` | `int` | `300` | `src/wechat/wcdb_backend.py` | 会话表时间领先已读时间超过该值即判定"读不到新消息" |
+| `STALL_WARN_REPEAT_SEC` | `int` | `600` | `src/wechat/wcdb_backend.py` | 同一群的停滞告警重复间隔 |
+| `READ_GRACE_SEC` | `int` | `120` | `src/wechat/wcdb_backend.py` | 启动/重建句柄后"一条都没读到"的容忍期 |
+| `STALL_REINIT_SEC` | `int` | `180` | `src/wechat/wcdb_backend.py` | 读停滞持续该时长即视为句柄失效并 `_reinitialize()` |
+| `STALL_REINIT_MIN_INTERVAL` | `int` | `300` | `src/wechat/wcdb_backend.py` | 两次句柄重建的最小间隔 |
+| `HWND_REINIT_SEC` | `int` | `180` | `src/wechat/wcdb_backend.py` | 微信窗口消失该时长后升级为句柄重建 |
 | `WECHAT_PROCESS_NAMES` | `set` | `{"wechat.exe", "weixin.exe"}` | `src/wechat/window_controller.py` | 微信进程名集合 |
 | `MIN_WINDOW_WIDTH` / `MIN_WINDOW_HEIGHT` | `int` | `200` | `src/wechat/window_controller.py` | 窗口最小尺寸验证 |
 | `MSG_TYPE_MAP` | `dict` | 见代码 | `src/wechat/helpers.py` | 消息类型映射表 |
@@ -252,7 +261,10 @@ todo_delete_keywords: list[str] = [
 | `HealthMonitor._check_db()` | ~100 | 检查数据库连接 | 无 | `str` ("OK" 或错误信息) |
 | `HealthMonitor._check_wechat_hwnd()` | ~110 | 检查微信窗口句柄 | 无 | `str` |
 | `HealthMonitor._last_api_ago()` | ~130 | 最后一次 API 调用距今时间 | 无 | `str` |
-| `HealthMonitor._write_status_json()` | ~140 | 写入 bot_status.json 状态文件 | 无 | `None` |
+| `HealthMonitor._read_progress()` | ~120 | 读取后端的读空诊断快照(`read_progress()`); 后端不支持或抛异常时返回全零, 不伪造"健康" | 无 | `dict` (`newest_seen_ts/newest_session_ts/lag_sec/stalled_chats/tracked_chats`) |
+| `HealthMonitor._sec_ago(ts)` | ~145 | 静态方法; 距 *ts* 的秒数, `ts` 为 0 / 假值时返回 `-1`(表示"从未") | `ts: int` | `int` |
+| `HealthMonitor._ago_str(ts)` | ~151 | 心跳日志用的可读时间差(`never` / `12s_ago` / `5m_ago` / `3h_ago`) | `ts: int` | `str` |
+| `HealthMonitor._write_status_json(progress=None)` | ~201 | 写入 bot_status.json(含 `last_message_sec_ago` / `read_lag_sec` / `stalled_chats` / `tracked_chats`); `progress` 省略时自行读取 | `progress: dict \| None` | `None` |
 | `Bot.__init__(config)` | ~165 | 初始化 Bot 实例 | `config: BotConfig` | `None` |
 | `Bot.run()` | ~170 | 初始化所有组件并启动 bot (阻塞) | 无 | `None` |
 | `Bot._log_banner()` | ~260 | 打印启动横幅日志 | 无 | `None` |
@@ -352,8 +364,15 @@ todo_delete_keywords: list[str] = [
 | `__init__(bot_display_name, groups, poll_sec, store, config)` | 初始化 WCDB 后端 | 配置参数 | `None` |
 | `start(callback)` | 启动消息监听(阻塞) | `callback: MessageCallback` | `None` |
 | `send_text(chat_id, content)` | 发送文本消息 | `chat_id: str, content: str` | `bool` |
-| `stop()` | 停止监听 | 无 | `None` |
-| `_reinitialize()` | 关闭并重开 WCDB(故障恢复) | 无 | `None` |
+| `stop()` | 停止监听: 置 `_running=False`, 把 `_pool` 置 `None` 并移入 `_retired_pools` 后关闭(不等待), 避免轮询线程向已关闭线程池提交触发 `cannot schedule new futures after shutdown` | 无 | `None` |
+| `_reinitialize()` | 关闭并重开 WCDB(故障恢复); 同时清空读空诊断状态、重新 `_warm_dedup()` 并重扫窗口 | 无 | `None` |
+| `_warm_dedup()` | 用 `MessageStore.get_recent_message_ids()` 预载入去重集合, 避免重启后把上一页历史(及其图片)当新消息重跑媒体管线 | 无 | `None` |
+| `_maybe_check_read_lag()` | 限频(`LAG_CHECK_INTERVAL_SEC`)调用读空诊断, 异常不外抛 | 无 | `None` |
+| `_check_read_lag(now)` | 对比 SessionTable 的 `last_timestamp` 与本进程已读到的最大 `create_time`, 修出 `_stalled`; 停滞超过 `STALL_REINIT_SEC` 触发 `_reinitialize()` | `now: float` | `None` |
+| `_maybe_check_window()` | 限频复扫微信窗口; 窗口消失超过 `HWND_REINIT_SEC` 升级为句柄重建 | 无 | `None` |
+| `health_status()` | 心跳用单行状态: `read_stalled(N)` / `no_hwnd` / `HWND_<句柄>` / `ok` | 无 | `str` |
+| `read_progress()` | 读空诊断快照(心跳与 UI 消费) | 无 | `dict` |
+| `_warn_lag(talker, message, now)` | 按群限频(`STALL_WARN_REPEAT_SEC`)输出读停滞告警 | `talker: str, message: str, now: float` | `None` |
 | `_resolve_groups()` | 解析群组名称到 talker ID | 无 | `None` |
 | `_save_group_names(chatrooms)` | 持久化群名映射(静态) | `chatrooms: dict` | `None` |
 | `_save_group_members(chat_members)` | 持久化群成员列表(静态) | `chat_members: dict` | `None` |
@@ -388,6 +407,9 @@ todo_delete_keywords: list[str] = [
 | `_key_failure_message(tried_real_key)` | 生成"所有密钥源都失败"的错误文案：`tried_real_key=True` → `KEY_INVALID:`（密钥不匹配，多为多机共用 .env），`False` → `KEY_MISSING:`（未配置） | `tried_real_key: bool` | `str` |
 | `_is_replacement_dll(dll)` | 通过 `webot_wcdb_api_replacement` 导出识别自建替代 DLL | `dll: CDLL` | `bool` |
 | `_apply_drm_patch(dll_handle, dll_path)` | 单字节 DRM 补丁（仅原版 DLL 需要；字节不匹配时拒绝写入） | `dll_handle: int, dll_path: str` | `None` |
+| `_find_wxid_and_dbpath(custom_base_dir, pinned_wxid)` | 解析账号目录与数据库父目录。`pinned_wxid`(来自 `WECHAT_WXID`)优先且精确匹配优先于前缀匹配；固定账号取不到时抛 `FileNotFoundError`（**不回退**，否则会重现"密钥校验通过但读的是旧账号快照"）；未固定时报出多账号并存并取最新的一个 | `custom_base_dir: str, pinned_wxid: str` | `tuple[str, str]` |
+| `_account_has_db(wxid_dir)` | 该账号目录下是否有 `db_storage/session/session.db` | `wxid_dir: Path` | `bool` |
+| `_wxid_dirs(base)` | 列出 `wxid_*` 账号目录，按 mtime 新→旧 | `base: Path` | `list[Path]` |
 
 ### 2.10 `src/wechat/window_controller.py` (WeChatWindowController)
 
@@ -499,6 +521,7 @@ todo_delete_keywords: list[str] = [
 | `upsert_group_memory(chat_id, memory_text, message_count, last_message_id)` | 更新/插入群聊记忆 | `chat_id, memory_text, message_count, last_message_id` | `None` |
 | `get_new_message_count(chat_id, since_message_id)` | 统计新消息数 | `chat_id: str, since_message_id: str \| None` | `int` |
 | `get_messages_since_id(chat_id, since_message_id, limit)` | 获取某ID之后的消息 | `chat_id, since_message_id, limit` | `list[dict]` |
+| `get_recent_message_ids(chat_id, limit)` | 取某群最近写入的消息 ID(新→旧), 用于启动时预热去重集合 | `chat_id: str, limit: int` | `list[str]` |
 
 ### 2.20 `src/todo/store.py` (TodoStore)
 
@@ -677,7 +700,7 @@ todo_delete_keywords: list[str] = [
 | `Onboarding.jsx` | `Onboarding` | 4步引导流程主容器(侧边栏+步骤内容) |
 | `Dashboard.jsx` | `Dashboard` | 主仪表板(指标卡片+系统状态+控制栏) |
 | `Dashboard.jsx` | `MetricCard` | 指标卡片组件(图标/标签/数值/副标题/迷你SVG图表) |
-| `Dashboard.jsx` | `LiveIndicator` | 实时状态指示灯(脉冲动画) |
+| `Dashboard.jsx` | `LiveIndicator` | 实时状态指示灯(脉冲动画); 可选 `detail` 显示副文案(如"最新消息 3 分钟前") |
 | `Dashboard.jsx` | `KeyExtractionBanner` | 内联密钥提取横幅(单文件内组件); 按 `KEY_MISSING`/`KEY_INVALID` 区分标题, 轮询 step1-status |
 | `LogViewer.jsx` | `LogViewer` | 实时日志查看器(过滤/搜索/高亮) |
 | `ConfigPanel.jsx` | `AiSection` | AI 配置分栏: 多套 profile 选择/新建/保存/启用/删除、服务商预设联动、模型名 Combobox、从服务商拉取模型清单 |
@@ -690,6 +713,7 @@ todo_delete_keywords: list[str] = [
 | `generateSmoothPath(data, width, height)` | 把数值序列转成 SVG 平滑折线路径 | `data: number[], width=120, height=30` | `str` |
 | `isKeyError(text)` | 判断错误文案是否属于密钥类错误(前缀 `KEY_MISSING` / `KEY_INVALID`) | `text: str` | `bool` |
 | `readApiResponse(res)` | 无论 HTTP 状态码都先读 JSON body, 优先返回 `body.error`, 其次 `HTTP <status>` —— 保证服务端真实原因不被通用文案盖住 | `res: Response` | `dict` |
+| `formatAgo(sec)` | 相对时间文案: `<60` 秒→"N 秒前", 分钟, 小时, 天; 负值/空值→"从未" | `sec: number` | `str` |
 
 模块级常量：
 
@@ -1104,13 +1128,26 @@ WcdbBackend.start(callback)
   │     ├── get_display_names() → 批量解析昵称
   │     └── _save_group_names() → 持久化到 data/group_names.json
   │
+  ├── _warm_dedup()
+  │     └── MessageStore.get_recent_message_ids(talker, limit=200)
+  │           把已持久化的消息 ID 预载入 _known_ids, 重启后不重跑历史图片视觉描述
+  │
   └── while self._running:           # 主轮询循环
         ├── _poll_cycle(callback)
-        │     └── for each group:
-        │           _poll_group(group_name, talker, callback)
-        │             ├── get_messages(talker, limit=50)
-        │             ├── _standardize() → 统一消息格式
-        │             └── _handle_message() → 线程池提交
+        │     ├── for each group:
+        │     │     _poll_group(group_name, talker, callback)
+        │     │       ├── get_messages(talker, limit=50)
+        │     │       ├── raw_message_id(msg) → 命中 _known_ids 即跳过(去重前置, 不跑媒体管线)
+        │     │       ├── _standardize() → 统一消息格式(含媒体/语音描述)
+        │     │       └── _handle_message() → 锁内提交线程池; 池已关闭则回退为内联执行
+        │     ├── _maybe_check_read_lag()   (限频 60s)
+        │     │     └── _check_read_lag(now)
+        │     │           ├── get_sessions() → session.last_timestamp
+        │     │           ├── 与 _last_seen_ts 比较 → 滞后 > STALL_WARN_SEC 记入 _stalled
+        │     │           ├── _warn_lag() → 按群限频告警
+        │     │           └── 停滞 > STALL_REINIT_SEC → _reinitialize()
+        │     └── _maybe_check_window()     (限频 60s)
+        │           └── 窗口消失 > HWND_REINIT_SEC → _reinitialize()
         │
         └── time.sleep(poll_sec)
 ```
@@ -1124,6 +1161,10 @@ WcdbBackend.start(callback)
 | `max_workers` | `4` | 回调线程池大小 |
 | `MAX_CONSECUTIVE_ERRORS` | `5` | 连续错误触发重初始化 |
 | `MAX_DEDUP_SIZE` | `5000` | 去重集合上限 |
+| `DEDUP_WARMUP_LIMIT` | `200` | 启动时每组预载入的去重 ID 数 |
+| `STALL_WARN_SEC` | `300` | 读滞后超过该值判定"收不到新消息" |
+| `STALL_REINIT_SEC` | `180` | 读停滞持续该时长即重建 WCDB 句柄 |
+| `HWND_REINIT_SEC` | `180` | 窗口消失该时长后重建句柄 |
 
 #### 密钥源与失败分类（排障必读）
 
@@ -1153,6 +1194,27 @@ WcdbBackend.start(callback)
 > 或把项目复制到本机磁盘），然后**在虚拟机里**重新提取一次密钥。
 > 若 `reset` 阶段就失败，见 §功能D 的"前端错误呈现约定"与 `config.write_env_file()`：共享文件夹拒绝
 > `os.replace` 会让整个请求断连，旧版本把这种情况误报成"无法连接服务器"。
+
+#### 读空可见化（排障必读）
+
+`get_messages()` 对"这个群没新消息"和"这个句柄读不了消息库"都返回空列表，且不抛异常。心跳原先只看 bot 自己的 `messages.db` 与 HWND，于是**读路径冻结和群聊安静在外部完全一样**：`db_ok: true`、进度条正常，只有 @ 消息永远不来。
+
+现在两处把这两种情况分开：
+
+| 信号 | 来源 | 判据 |
+|---|---|---|
+| `_last_seen_ts[talker]` | `_poll_group()` 里读到的最大 `create_time` | 本进程实际读到哪一刻 |
+| `_session_ts[talker]` | `SessionTable.last_timestamp`（`_check_read_lag()` 每 60s 读一次） | 微信自己记录该会话最后一条消息的时间 |
+| `_stalled` | 两者相减 | 滞后 > `STALL_WARN_SEC`(300s)，或群根本不在会话表里（句柄属于别的账号） |
+
+命中后的动作，按严重程度分级：
+
+1. `_warn_lag()`：按群限频打印 WARNING（`STALL_WARN_REPEAT_SEC`），日志里能直接看到"session has messages up to X, last read was Y"。
+2. `read_progress()` → 心跳日志 `last_msg=/read_lag=/stalled=`、`bot_status.json`、WebSocket 状态快照 → 仪表板「消息读取」指示灯变红并显示"N 个群收不到新消息"。
+3. 停滞持续 `STALL_REINIT_SEC`(180s) → `_reinitialize()` 重建 WCDB 句柄（限频 `STALL_REINIT_MIN_INTERVAL`）；重建会清空诊断状态并重新 `_warm_dedup()`，新句柄按自己的读结果重新判定。
+4. 窗口维度独立走 `_maybe_check_window()`：`no_hwnd` 只影响发送，先轻量复扫，消失超过 `HWND_REINIT_SEC`(180s) 才升级为句柄重建。
+
+配合**去重前置**（`raw_message_id()` 在 `_standardize()` 之前判断），重启后不会再对上一页历史图片重跑视觉描述；`_warm_dedup()` 进一步把已持久化的 ID 预载入，使行重启后第一轮轮询就能直接处理真正的新消息。
 
 #### 消息标准化输出格式
 
@@ -2041,6 +2103,7 @@ SUMMARIZE_MODEL=claude-haiku-4-5-20251001      # Claude 模型
 WECHAT_BACKEND=wcdb                            # "wcdb" / "mac_hybrid" / "mac_ui"
 WECHAT_GROUPS=*                                # 群名(逗号分隔, URL编码, "*"=全部)
 WECHAT_DATA_DIR=                               # 微信数据目录(留空自动检测)
+WECHAT_WXID=                                    # 固定读取的微信账号目录(留空=取最新 wxid_*; 引导时自动写入)
 
 # === 机器人身份 ===
 BOT_DISPLAY_NAME=群聊小助手                     # 机器人显示名
@@ -2186,7 +2249,7 @@ EXE 增大约 100 MB；不带时这类图片降级为 `[图片]` 占位符，其
 |---|---|---|
 | `data/messages.db` | `src/db/schema.py` | SQLite 消息数据库 |
 | `data/bot.log` | `src/utils/logging_config.py` | 运行日志 |
-| `data/bot_status.json` | `src/bot.py:HealthMonitor` | 状态 JSON (外部监控) |
+| `data/bot_status.json` | `src/bot.py:HealthMonitor` | 状态 JSON (外部监控)。除 uptime/msgs/db 外含读路径字段: `last_message_sec_ago`(-1=从未读到)、`read_lag_sec`(会话表领先已读的秒数)、`stalled_chats`(收不到新消息的群)、`tracked_chats` |
 | `data/nicknames.json` | `src/nickname.py` | wxid → 昵称映射 |
 | `data/ai_profiles.json` | `src/ai_profiles.py:AiProfileStore` | 多套 AI 配置档案（服务商/密钥/Base URL/模型）+ 当前启用项；含明文密钥，已 .gitignore |
 | `data/group_names.json` | `src/wechat/wcdb_backend.py` | chat_id → {name, member_count} |

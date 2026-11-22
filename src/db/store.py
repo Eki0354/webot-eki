@@ -309,3 +309,21 @@ class MessageStore:
                     (chat_id, since_message_id, limit),
                 ).fetchall()
             return [dict(row) for row in rows]
+
+    def get_recent_message_ids(self, chat_id: str,
+                               limit: int = 200) -> list[str]:
+        """Return the most recently stored message IDs for a chat.
+
+        Used to warm the in-memory dedup set on startup: without it, every
+        restart re-processes the last polled page (re-describing old images
+        through the vision pipeline before any new message is handled).
+        """
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT message_id FROM messages
+                   WHERE chat_id = ?
+                   ORDER BY id DESC
+                   LIMIT ?""",
+                (chat_id, limit),
+            ).fetchall()
+            return [row["message_id"] for row in rows]

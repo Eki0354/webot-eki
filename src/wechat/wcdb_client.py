@@ -317,8 +317,37 @@ def _find_dll():
     )
 
 
-def _find_wxid_and_dbpath(custom_base_dir: str = ""):
-    """Auto-detect WeChat wxid and database path from the filesystem.
+def _account_has_db(wxid_dir: Path) -> bool:
+    """True when this account folder holds a readable session.db."""
+    return (wxid_dir / "db_storage" / "session" / "session.db").exists()
+
+
+def _wxid_dirs(base: Path) -> list[Path]:
+    """Account folders under *base*, newest first (mtime order)."""
+    try:
+        return sorted(
+            [d for d in base.iterdir() if d.is_dir() and d.name.startswith("wxid_")],
+            key=lambda d: d.stat().st_mtime,
+            reverse=True,
+        )
+    except PermissionError:
+        logger.warning("Permission denied reading %s — skipping", base)
+        return []
+
+
+def _find_wxid_and_dbpath(custom_base_dir: str = "", pinned_wxid: str = ""):
+    """Resolve WeChat wxid and data directory from the filesystem.
+
+    ``pinned_wxid`` (from ``WECHAT_WXID``) wins outright.  That matters
+    because the folder layout is not stable: re-logging into WeChat creates a
+    new ``wxid_*`` folder, and the old one keeps a snapshot of the last
+    session forever.  Picking by mtime therefore used to follow a frozen
+    account silently — the key verified, groups resolved, and no new message
+    ever arrived.
+
+    A pinned wxid that cannot be found is an error, not a fallback: falling
+    back would reproduce exactly the silent wrong-account read this pinning
+    exists to prevent.
 
     If custom_base_dir is provided, scans that directory first.
     Otherwise falls back to Documents\\xwechat_files\\ and Documents\\WeChat Files\\.
@@ -345,29 +374,61 @@ def _find_wxid_and_dbpath(custom_base_dir: str = ""):
         if default_base not in candidates:
             candidates.append(default_base)
 
+    # ── Pinned account: only this one is acceptable ──────────────────
+    if pinned_wxid:
+        for base in candidates:
+            if not base.exists():
+                continue
+            dirs = _wxid_dirs(base)
+            # Exact folder name first: a prefix match on "wxid_abc" would
+            # also accept "wxid_abcd_9999", i.e. another account.
+            matches = [d for d in dirs if d.name == pinned_wxid]
+            if not matches:
+                matches = [d for d in dirs if d.name.startswith(pinned_wxid)]
+            for wxid_dir in matches:
+                if _account_has_db(wxid_dir):
+                    logger.info(
+                        "Using pinned WECHAT_WXID: wxid=%s db=%s",
+                        wxid_dir.name, str(base),
+                    )
+                    return wxid_dir.name, str(base)
+                raise FileNotFoundError(
+                    f"WECHAT_WXID={pinned_wxid} matches {wxid_dir.name}, but it "
+                    f"has no db_storage/session/session.db — WeChat may still "
+                    f"be starting up. Clear WECHAT_WXID to let webot choose an "
+                    f"account automatically."
+                )
+        raise FileNotFoundError(
+            f"WECHAT_WXID={pinned_wxid} was not found under "
+            f"{', '.join(str(c) for c in candidates) or '(no candidate dirs)'}. "
+            f"WeChat may have been logged into a different account, or "
+            f"WECHAT_DATA_DIR points elsewhere. Clear WECHAT_WXID to let webot "
+            f"pick an account, or update it to the current wxid_* folder."
+        )
+
     # Scan candidates in order
     for base in candidates:
         if not base.exists():
             continue
-        # Find wxid directories (e.g., wxid_zogepsik3fud12_b6ce)
-        try:
-            wxid_dirs = sorted(
-                [d for d in base.iterdir() if d.is_dir() and d.name.startswith("wxid_")],
-                key=lambda d: d.stat().st_mtime,
-                reverse=True,
-            )
-        except PermissionError:
-            logger.warning("Permission denied reading %s — skipping", base)
+        wxid_dirs = _wxid_dirs(base)
+        usable = [d for d in wxid_dirs if _account_has_db(d)]
+        if not usable:
             continue
 
-        for wxid_dir in wxid_dirs:
-            # Verify session.db exists
-            session_db = wxid_dir / "db_storage" / "session" / "session.db"
-            if session_db.exists():
-                wxid = wxid_dir.name
-                source = "custom" if base == candidates[0] and custom_base_dir else "auto"
-                logger.info("%s-detected: wxid=%s db=%s", source, wxid, str(base))
-                return wxid, str(base)
+        if len(usable) > 1:
+            # Do not let mtime silently decide which account to read: a
+            # folder left behind by an earlier login keeps its old session.db
+            # and would report a healthy key while never seeing new messages.
+            logger.warning(
+                "Multiple WeChat accounts found under %s (%s) — reading the "
+                "newest. Set WECHAT_WXID to pin the right one.",
+                base, ", ".join(d.name for d in usable),
+            )
+
+        wxid_dir = usable[0]
+        source = "custom" if base == candidates[0] and custom_base_dir else "auto"
+        logger.info("%s-detected: wxid=%s db=%s", source, wxid_dir.name, str(base))
+        return wxid_dir.name, str(base)
 
     raise FileNotFoundError(
         "Cannot find WeChat data directory. Make sure WeChat is installed "
@@ -407,18 +468,22 @@ class WcdbNativeClient:
     # ── Init ──────────────────────────────────────────────────────────
 
     def _load_config(self):
-        # Read wechat_data_dir from config (custom path support)
+        # Read wechat_data_dir / wechat_wxid from config (custom path support)
         custom_dir = ""
+        pinned_wxid = ""
         try:
             from src.config import load_config
             config = load_config()
             custom_dir = config.wechat_data_dir
+            pinned_wxid = getattr(config, "wechat_wxid", "") or ""
         except Exception as e:
             logger.warning(
                 "Config load failed — falling back to auto-detection: %s", e
             )
 
-        wxid, db_path = _find_wxid_and_dbpath(custom_dir)
+        wxid, db_path = _find_wxid_and_dbpath(custom_dir, pinned_wxid)
+        if pinned_wxid:
+            logger.info("WECHAT_WXID pinned the account: %s", wxid)
         self._config = {
             "myWxid": wxid,
             "dbPath": db_path,

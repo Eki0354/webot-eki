@@ -117,6 +117,9 @@ export default function App() {
     db_ok: false,
     last_api_call_sec_ago: -1,
     last_api_call_time: 0,
+    last_message_sec_ago: -1,
+    read_lag_sec: 0,
+    stalled_chats: [],
     timestamp: '',
     error: '',
   }

@@ -754,6 +754,9 @@ class ServerStatusTests(unittest.TestCase):
             "running", "uptime_sec", "messages_processed",
             "wechat_backend", "ai_backend", "db_ok",
             "last_api_call_sec_ago", "last_api_call_time",
+            # Read-path visibility: a stalled read path used to look like a
+            # quiet group, so these three fields are part of the contract.
+            "last_message_sec_ago", "read_lag_sec", "stalled_chats",
             "timestamp", "error",
         }
         self.assertEqual(set(snap.keys()), expected_fields)

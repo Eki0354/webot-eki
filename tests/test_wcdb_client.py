@@ -148,5 +148,102 @@ class OpenFailureClassificationTests(unittest.TestCase):
         save.assert_called_once_with(key)
 
 
+class AccountPinningTests(unittest.TestCase):
+    """Picking the account folder: pinned wins, a missing pin is an error.
+
+    Folder layout is not stable — re-logging into WeChat creates a new
+    ``wxid_*`` folder while the old one keeps a frozen ``session.db``.  The
+    old mtime-only choice then read a snapshot forever while the key kept
+    verifying, which is why ``WECHAT_WXID`` exists.
+    """
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.base = Path(self._tmp.name) / "xwechat_files"
+        self.base.mkdir(parents=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _account(self, name: str, *, with_db: bool = True) -> Path:
+        account = self.base / name
+        (account / "db_storage" / "session").mkdir(parents=True)
+        if with_db:
+            (account / "db_storage" / "session" / "session.db").write_bytes(b"")
+        return account
+
+    def test_pinned_wxid_wins_over_newer_folder(self):
+        """The pin must beat mtime, or a re-login silently changes account."""
+        from src.wechat.wcdb_client import _find_wxid_and_dbpath
+
+        pinned = self._account("wxid_old_1111")
+        newer = self._account("wxid_new_2222")
+        # Make the unpinned folder look newer — mtime order would pick it.
+        import os
+        os.utime(pinned, (1_000_000, 1_000_000))
+        os.utime(newer, (2_000_000, 2_000_000))
+
+        wxid, db_path = _find_wxid_and_dbpath(str(self.base), "wxid_old_1111")
+
+        self.assertEqual(wxid, "wxid_old_1111")
+        self.assertEqual(Path(db_path), self.base)
+
+    def test_unpinned_picks_newest_usable_account(self):
+        """Without a pin, behaviour is unchanged: newest folder with a db."""
+        from src.wechat.wcdb_client import _find_wxid_and_dbpath
+
+        old = self._account("wxid_old_1111")
+        new = self._account("wxid_new_2222")
+        import os
+        os.utime(old, (1_000_000, 1_000_000))
+        os.utime(new, (2_000_000, 2_000_000))
+
+        wxid, _ = _find_wxid_and_dbpath(str(self.base), "")
+
+        self.assertEqual(wxid, "wxid_new_2222")
+
+    def test_missing_pin_raises_instead_of_falling_back(self):
+        """A pin that no longer exists must fail loudly, not read another account.
+
+        Falling back here reproduces exactly the bug the pin prevents: the
+        key still verifies against the wrong account's database.
+        """
+        from src.wechat.wcdb_client import _find_wxid_and_dbpath
+
+        self._account("wxid_other_3333")
+
+        with self.assertRaises(FileNotFoundError) as ctx:
+            _find_wxid_and_dbpath(str(self.base), "wxid_gone_9999")
+
+        msg = str(ctx.exception)
+        self.assertIn("WECHAT_WXID=wxid_gone_9999", msg)
+        self.assertIn("Clear WECHAT_WXID", msg)
+
+    def test_pin_without_session_db_raises_actionable_error(self):
+        """A pinned folder with no session.db names the real cause."""
+        from src.wechat.wcdb_client import _find_wxid_and_dbpath
+
+        self._account("wxid_starting_4444", with_db=False)
+
+        with self.assertRaises(FileNotFoundError) as ctx:
+            _find_wxid_and_dbpath(str(self.base), "wxid_starting_4444")
+
+        self.assertIn("session.db", str(ctx.exception))
+
+    def test_exact_match_beats_prefix_match(self):
+        """'wxid_abc' must not select 'wxid_abcd_9999' — a different account."""
+        from src.wechat.wcdb_client import _find_wxid_and_dbpath
+
+        self._account("wxid_abcd_9999")
+        exact = self._account("wxid_abc")
+        import os
+        # Make the decoy newer so a prefix-first search would lose.
+        os.utime(exact, (1_000_000, 1_000_000))
+
+        wxid, _ = _find_wxid_and_dbpath(str(self.base), "wxid_abc")
+
+        self.assertEqual(wxid, "wxid_abc")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -455,6 +455,8 @@ _ENV_TO_ONBOARDING = {
     "BOT_DISPLAY_NAME": ("bot_display_name", str),
     "PROACTIVE_ENABLED": ("proactive_enabled", "bool"),
     "STICKY_MENTION_ENABLED": ("sticky_mention_enabled", "bool"),
+    # Keeps the pinned account across a key re-extraction reset.
+    "WECHAT_WXID": ("wxid", str),
 }
 
 
@@ -497,6 +499,9 @@ def _write_onboarding_to_env(env_path):
             "PROACTIVE_ENABLED": str(_onboarding_data.get("proactive_enabled", False)).lower(),
             "STICKY_MENTION_ENABLED": str(_onboarding_data.get("sticky_mention_enabled", True)).lower(),
             "WCDB_KEY": _onboarding_data.get("key", ""),
+            # Pin the account folder verified during onboarding.  None (not
+            # "") so an empty in-memory value never clears a good pin.
+            "WECHAT_WXID": _onboarding_data.get("wxid") or None,
             "ONBOARDING_DONE": "true",
         }
     # Preserve existing keys not managed by onboarding
@@ -577,6 +582,14 @@ def _run_step1_extraction():
             # Also set in the current process for load_dotenv in this session
             import os as _os
             _os.environ["WCDB_KEY"] = key
+            # Pin the account directory we just verified.  Without this the
+            # client picks the newest wxid_* folder on every start, so a
+            # re-login that creates a fresh folder (or an old folder left
+            # behind by a previous login) sends it to a frozen snapshot while
+            # the key still verifies.
+            if wxid:
+                _set_env_key(env_path, "WECHAT_WXID", wxid)
+                _os.environ["WECHAT_WXID"] = wxid
             # Clear the KEY_MISSING error so it doesn't reappear on page refresh
             update_status(error="")
 
@@ -794,6 +807,10 @@ class _ServerStatus:
         "running", "uptime_sec", "messages_processed",
         "wechat_backend", "ai_backend", "db_ok",
         "last_api_call_sec_ago", "last_api_call_time",
+        # Read-path visibility: a bot that stops receiving messages used to
+        # look identical to a quiet group (reads return empty, not an error),
+        # so the dashboard showed "running" while @-mentions piled up unseen.
+        "last_message_sec_ago", "read_lag_sec", "stalled_chats",
         "timestamp", "error",
     )
 
@@ -807,6 +824,9 @@ class _ServerStatus:
         self.db_ok = False
         self.last_api_call_sec_ago = -1
         self.last_api_call_time = 0.0
+        self.last_message_sec_ago = -1   # -1 = nothing read yet
+        self.read_lag_sec = 0            # session time ahead of what we read
+        self.stalled_chats: list = []    # chats whose new messages never arrive
         self.timestamp = ""
         self.error = ""
         self._clients: list = []
