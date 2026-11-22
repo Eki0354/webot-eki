@@ -138,6 +138,7 @@ grep "文件名" CODEBASE_REFERENCE.md
 | `VOICE_ASR_TO_SIMPLIFIED` | `bool` | `True` | `src/config.py` | `src/voice/asr.py` (各ASR后端) |
 | `MEDIA_VISION_ENABLED` | `bool` | `False` | `src/config.py` | `src/media/pipeline.py:MediaPipeline.__init__()` |
 | `MEDIA_VISION_MODEL` | `str` | `""` | `src/config.py` | `src/media/pipeline.py:MediaPipeline._create_vision()` |
+| `LINK_FETCH_ENABLED` | `bool` | `True` | `src/config.py` | `src/router.py:_link_context()`、`src/web/server.py:_fetch_link_context()` |
 | `IMAGE_XOR_KEY` | `str` | `""` | `src/config.py` | `src/media/keys.py:resolve_image_keys()` |
 | `IMAGE_AES_KEY` | `str` | `""` | `src/config.py` | `src/media/keys.py:resolve_image_keys()` |
 | `IMAGE_KEY_PROVIDER` | `str` | `"env"` | `src/config.py` | `src/media/keys.py:resolve_image_keys()` |
@@ -282,6 +283,7 @@ todo_delete_keywords: list[str] = [
 | `MessageRouter._get_group_memory(chat_id)` | ~140 | 获取群聊记忆文本 | `chat_id: str` | `str` |
 | `MessageRouter._handle_summary(msg)` | ~145 | 生成聊天总结 | `msg: dict` | `str \| None` |
 | `MessageRouter._handle_chat(msg, clean_content)` | ~230 | 处理 @bot AI 对话 | `msg: dict, clean_content: str` | `str \| None` |
+| `MessageRouter._link_context(text)` | ~170 | 抓取提问里链接的正文并渲染成 prompt 块；受 `LINK_FETCH_ENABLED` 控制，任何失败都返回 `""`（不打断回复） | `text: str` | `str` |
 | `MessageRouter._handle_welcome(msg)` | ~280 | 发送新成员欢迎消息 | `msg: dict` | `str \| None` |
 | `MessageRouter._handle_proactive_chat(msg, mode)` | ~305 | 处理主动发言 | `msg: dict, mode: ProactiveMode` | `str \| None` |
 
@@ -289,7 +291,7 @@ todo_delete_keywords: list[str] = [
 
 | 函数 | 行号 | 描述 | 参数 | 返回值 |
 |---|---|---|---|---|
-| `chat(message, ...)` | ~20 | AI 对话响应 (@bot)；上下文行经 `label_described_media()` 渲染媒体 | `message: str, context_messages=None, requester_name="", bot_name="", group_name="", group_memory=""` | `str` |
+| `chat(message, ...)` | ~20 | AI 对话响应 (@bot)；上下文行经 `label_described_media()` 渲染媒体；`link_context` 为已抓取的链接正文 | `message: str, context_messages=None, requester_name="", bot_name="", group_name="", group_memory="", link_context=""` | `str` |
 | `proactive_chat(mode, context_messages, ...)` | ~50 | 主动发言；上下文行同样经 `label_described_media()` 渲染 | `mode: ProactiveMode, context_messages: list[dict], bot_name="", group_name="", group_memory=""` | `str` |
 | `label_described_media(content)` | ~26 | 把已描述的媒体占位符改写成 `[图片内容：…]`，避免模型误判成占位符；裸占位符保持不变 | `content: str` | `str` |
 | `summarize(messages, requester_name)` | ~80 | 生成结构化摘要 | `messages: list[dict], requester_name: str` | `SummaryResult` |
@@ -741,7 +743,8 @@ todo_delete_keywords: list[str] = [
 | `looks_like_xml(text)` | 判断内容是否为标记而非聊天文本 | `text: str` | `bool` |
 | `extract_refermsg(xml)` | 解析 `<refermsg>`：返回 `{type, content, displayname}`，content 做 HTML 反转义（引用图片的 `<img>` 载荷就在里面） | `xml: str` | `dict \| None` |
 | `appmsg_title(xml)` | 取 appmsg `<title>`（引用时即用户自己的提问） | `xml: str` | `str` |
-| `reduce_appmsg(xml)` | appmsg → `"[链接] 标题"`；含 `<refermsg>` → `"[引用] 标题"`（不再误标 `[直播]`）；sysmsg → `None` | `xml: str` | `str \| None` |
+| `appmsg_url(xml)` | 取 appmsg `<url>`（文章/文件目标）；上限 500 字符，避免被 120 字的正文截断成死链；`<cdnattachurl>` 不匹配 | `xml: str` | `str` |
+| `reduce_appmsg(xml)` | appmsg → `"[链接] 标题 URL"`（无 URL 时只有标题）；含 `<refermsg>` → `"[引用] <用户的话> [链接] <被引用标题 URL>"`（不再误标 `[直播]`）；sysmsg → `None` | `xml: str` | `str \| None` |
 
 `src/media/emoji.py` — 表情图片定位与下载：
 
@@ -832,6 +835,38 @@ todo_delete_keywords: list[str] = [
 | `LOCAL_TYPE_IMAGE` | `3` | 图片（`.dat` 解密 + wxgf 解包，需密钥与视觉） |
 | `LOCAL_TYPE_EMOJI` | `47` | 表情/贴纸 |
 | `LOCAL_TYPE_SYSTEM` | `10000` | 系统提示（加入/退出/撤回），直接丢弃 |
+
+`src/media/link_fetcher.py` — 抓取分享链接的页面并提取正文（网络 I/O，不调 AI、不读配置）：
+
+聊天接口本身没有联网能力，链接对模型只是一串字符——这是「AI 说打不开链接」的根因，本模块负责服务端抓取。**URL 来自群聊，陌生人可选，所以 SSRF 防护是重点。**
+
+| 函数 | 描述 | 参数 | 返回值 |
+|---|---|---|---|
+| `is_public_url(url, resolve=True)` | 仅放行公网 HTTP(S)：拒绝非 HTTP 协议、带凭证、非 80/443 端口、单标签主机名、`localhost`/`.local`/`.internal`；`resolve=True` 时解析 DNS 并要求**所有**地址均为公网 | `url: str, resolve: bool` | `bool` |
+| `extract_urls(text)` | 从聊天文本提取 URL（按出现顺序去重），剥离中文标点与句末符号 | `text: str` | `list[str]` |
+| `fetch_article(url)` | 抓取并归约为 `Article`；6s 超时、2MB 上限、仅文本类型、gzip/deflate 解压、charset 探测（含 `<meta charset>` 回退）；10 分钟/64 条缓存（失败也缓存）；**永不抛异常** | `url: str` | `Article \| None` |
+| `extract_article(html)` | HTML → `(标题, 正文)`；优先 `#js_content`（微信正文容器），否则整页；剔除 script/style/nav 等噪声；正文以 `{`/`[` 开头视为数据而非文章 | `html: str` | `tuple[str, str]` |
+| `fetch_for_question(text, max_links=2, budget_sec=8)` | 抓取一个提问里的链接；整批共享一个截止时间（两个死链不会各耗一次超时） | `text: str` | `list[Article]` |
+| `format_link_context(articles)` | 渲染成 prompt 块，带 `[链接正文]` 标记与「直接据此回答，不要说你打不开」的指令 | `articles: list[Article]` | `str` |
+| `Article.to_prompt_block(max_text=1800)` | 单篇渲染：`[链接正文] 标题 — URL` + 正文 | `Article` | `str` |
+| `clear_cache()` | 清空页面缓存（测试用） | 无 | `None` |
+
+重定向经 `_GuardedRedirectHandler` 逐跳复检（公网 URL 可 302 到 `127.0.0.1`），链长上限 3。
+
+已知限制（不隐藏）：先解析校验、再由 urllib 二次解析连接，DNS rebinding 攻击者可让第二次解析指向内网。彻底封堵需要把 socket 钉在已校验的 IP 上（自定义 `HTTPSConnection`），收益有限——攻击者需同时控制域名并赢得竞态，且只能读到他自己控制的页面。
+
+TLS：优先使用 `certifi` 的 CA 包。本机 CPython 的 `ssl.get_default_verify_paths()` 的 `cafile`/`capath` 均为 `None`，默认上下文会拒绝缺少中间证书的站点（实测 `example.com` 失败、`python.org` 通过）；缺失 `certifi` 时回退系统默认，**不关闭验证**。
+
+模块级常量：
+
+| 常量 | 值 | 说明 |
+|---|---|---|
+| `_TIMEOUT_SEC` | `6` | 单次抓取超时 |
+| `_MAX_BYTES` | `2 MB` | 正文下载上限 |
+| `_MAX_TEXT` | `1800` | 交给模型的正文长度 |
+| `_MAX_LINKS_PER_QUESTION` | `2` | 单个提问最多抓几个链接 |
+| `_FETCH_BUDGET_SEC` | `8` | 整批抓取的总时限 |
+| `_CACHE_TTL_SEC` / `_CACHE_MAX` | `600` / `64` | 页面缓存有效期与容量 |
 
 ### 2.36 `src/ai_profiles.py` (多套 AI 配置档案)
 
@@ -1319,6 +1354,7 @@ MessageRouter.handle(msg)
 | Prompt | 位置 | 声明内容 |
 |---|---|---|
 | `CHAT_SYSTEM_PROMPT` | `base.py` §关于图片和媒体消息 | `[图片内容：…]`/`[表情内容：…]`=已描述可直接用；标记后有文字=已描述可用；裸占位符=看不到，不得编造 |
+| `CHAT_SYSTEM_PROMPT` | `base.py` `{link_section}` 插槽 | `[链接正文]`=服务端已抓取的文章内容，直接据此回答，不得回"我打不开链接" |
 | `PROACTIVE_SYSTEM_PROMPT` | `base.py` §关于图片和媒体消息 | 同上（主动发言不编造媒体内容） |
 | `SYSTEM_PROMPT` / `CHUNK_SYSTEM_PROMPT` | `prompts.py` | 同上（总结时可用已描述的图片内容） |
 
@@ -2031,7 +2067,7 @@ WcdbBackend._standardize(msg)
               ├── 引用消息（appmsg 含 <refermsg>，localType 如 244813135921 = 57<<32|49）
               │     └── _describe_quoted()：refermsg.type==3 时用其 <img> 载荷
               │           → "[图片] …" → 输出「用户提问（引用的图片：…）」
-              ├── appmsg XML  → "[链接] 标题"（reduce_appmsg；引用则为 "[引用] 标题"）
+              ├── appmsg XML  → "[链接] 标题 URL"（reduce_appmsg；引用则为 "[引用] 用户的话 [链接] 标题 URL"）
               ├── sysmsg XML  → None（丢弃）
               └── 纯文本      → 原文（"哈哈哈哈哈哈哈"）
 ```
@@ -2042,7 +2078,7 @@ WcdbBackend._standardize(msg)
 |---|---|---|---|
 | 3 | 图片 | ✅ 可用（需密钥 + 视觉） | `[图片] <视觉描述>`，缺任一项降级 `[图片]` |
 | 47 | 表情/贴纸 | ✅ 可用 | `[表情] <视觉描述>` |
-| 49-family | 链接/文件/小程序/视频 | ✅ 可用 | `[链接] 标题` 等 |
+| 49-family | 链接/文件/小程序/视频 | ✅ 可用 | `[链接] 标题 URL` 等 |
 | 10000 | 系统提示 | — 丢弃 | 无 |
 | 1 | 文本（BLOB 存储） | ✅ 可用 | 原文 |
 

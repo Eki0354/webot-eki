@@ -463,6 +463,13 @@ class BotConfig:
     # Vision model override. Empty = reuse the configured AI backend's model.
     media_vision_model: str = ""
 
+    # === Shared links (appmsg / URLs in a question) ===
+    # Fetch the page behind a link and put its text in the prompt.  Default on:
+    # without it a chat model can only repeat the URL ("我打不开链接"), which was
+    # the reported bug.  Off = the URL still reaches the prompt, but the bot
+    # cannot read the article.
+    link_fetch_enabled: bool = True
+
     # === Image decryption (localType=3 ``.dat`` containers) ===
     # WeChat encrypts received images per machine; these keys are not in the
     # message XML and cannot be derived, so they have to be supplied.  Both
@@ -750,6 +757,8 @@ def load_config() -> BotConfig:
         # Media (image / emoji / appmsg)
         "media_vision_enabled": os.getenv("MEDIA_VISION_ENABLED", "false").strip().lower() == "true",
         "media_vision_model": os.getenv("MEDIA_VISION_MODEL", "").strip(),
+        # Shared links (fetch the page behind a URL in an @bot question)
+        "link_fetch_enabled": os.getenv("LINK_FETCH_ENABLED", "true").strip().lower() == "true",
         # Image decryption keys (per machine, not derivable — see dat_decrypt.py)
         "image_xor_key": os.getenv("IMAGE_XOR_KEY", "").strip(),
         "image_aes_key": os.getenv("IMAGE_AES_KEY", "").strip(),

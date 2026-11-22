@@ -135,7 +135,7 @@ class AbstractSummarizer(ABC):
 群：{group_name}  时间：{current_time}
 @你的人：{sender_name}
 
-{context_section}对方消息：
+{link_section}{context_section}对方消息：
 {current_message}
 
 只输出你要发的那句话。"""
@@ -145,7 +145,8 @@ class AbstractSummarizer(ABC):
              requester_name: str = "",
              bot_name: str = "群聊小助手",
              group_name: str = "群聊",
-             group_memory: str = "") -> str:
+             group_memory: str = "",
+             link_context: str = "") -> str:
         """Conversational AI response for @bot mentions.
 
         Args:
@@ -155,6 +156,9 @@ class AbstractSummarizer(ABC):
             bot_name: Bot's display name.
             group_name: WeChat group display name.
             group_memory: Group's long-term memory text (first-person diary).
+            link_context: Already-fetched article text for links in *message*.
+                Filled by the caller from :mod:`src.media.link_fetcher`; empty
+                when the question had no link or fetching is disabled.
 
         Returns:
             AI response text.
@@ -201,6 +205,11 @@ class AbstractSummarizer(ABC):
         # Escape any user-supplied strings that could contain { or }
         context_section = _esc(context_section)
         memory_display = _esc(memory_display)
+        # The article text arrives from a web page, which may well contain
+        # braces; unescaped, str.format would raise or swallow the block.
+        link_section = _esc(link_context.strip())
+        if link_section:
+            link_section += "\n\n"
 
         system_prompt = self.CHAT_SYSTEM_PROMPT.format(
             bot_name=bot_name,
@@ -210,6 +219,7 @@ class AbstractSummarizer(ABC):
             context_section=context_section,
             current_message=message,
             group_memory=memory_display,
+            link_section=link_section,
         )
 
         # ── 3. Build user message (just the trigger) ──────────────

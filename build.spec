@@ -32,6 +32,23 @@ _webview_dir = _find_webview_runtime_dir()
 _webview_runtime = _webview_dir / "runtimes" / "win-x64" / "native" / "WebView2Loader.dll"
 _webview_interop = _webview_dir / "WebBrowserInterop.x64.dll"
 
+
+def _find_certifi_bundle():
+    """Return certifi's cacert.pem as a PyInstaller datas entry, or [] .
+
+    The frozen EXE must be able to verify TLS by itself: this machine's
+    CPython reports no `cafile`/`capath`, and link fetching then fails on
+    sites whose chain needs an intermediate (example.com fails, python.org
+    passes).  Optional — builds without certifi still work, only less
+    reliably, so a missing package must not break the build.
+    """
+    for sp in (site.getsitepackages() + [site.getusersitepackages()]):
+        candidate = Path(sp) / "certifi" / "cacert.pem"
+        if candidate.exists():
+            return [(str(candidate), "certifi")]
+    return []
+
+
 if not _webview_runtime.exists():
     raise FileNotFoundError(f"WebView2Loader.dll not found at {_webview_runtime}")
 if not _webview_interop.exists():
@@ -54,7 +71,13 @@ a = Analysis(
         ('ui/dist', 'ui/dist'),
         ('.env.example', '.'),
         # data/ is runtime-generated — do NOT bundle into read-only _MEIPASS
-    ],
+    ]
+    # certifi's CA bundle.  The frozen EXE otherwise inherits the host's
+    # `ssl` defaults, which on Windows Python ship no cafile/capath at all —
+    # link fetching then fails on sites whose chain needs an intermediate
+    # (measured: example.com fails, python.org passes).  Optional: without
+    # certifi installed the build still works, just less reliably.
+    + _find_certifi_bundle(),
     hiddenimports=[
         'src', 'src.bot', 'src.config', 'src.main',
         'src.db', 'src.db.schema', 'src.db.store',
@@ -75,7 +98,7 @@ a = Analysis(
         'src.media', 'src.media.appmsg', 'src.media.blob',
         'src.media.emoji', 'src.media.pipeline', 'src.media.vision',
         'src.media.dat_decrypt', 'src.media.wxgf',
-        'src.media.image', 'src.media.keys',
+        'src.media.image', 'src.media.keys', 'src.media.link_fetcher',
         'zstandard',
         # AES-128-ECB for the .dat image container.  PyAV (HEVC) is
         # deliberately excluded below: wxgf images then degrade to the

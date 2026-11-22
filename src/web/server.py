@@ -685,6 +685,28 @@ def _can_import(module_name: str) -> bool:
         return False
 
 
+def _fetch_link_context(text: str, env=None) -> str:
+    """Fetch the pages *text* links to, for the web chat sandbox.
+
+    Mirrors what ``MessageRouter._link_context`` does on the live path so the
+    "test chat" box answers link questions the same way the bot does.  The
+    switch is read from the raw environment here because this module works
+    with the on-disk ``.env`` rather than a ``BotConfig``.
+
+    Never raises: fetching is enrichment, and a sandbox preview must still
+    return a reply when the network is down.
+    """
+    env = os.environ if env is None else env
+    if str(env.get("LINK_FETCH_ENABLED", "true")).strip().lower() != "true":
+        return ""
+    try:
+        from src.media.link_fetcher import fetch_for_question, format_link_context
+        return format_link_context(fetch_for_question(text))
+    except Exception:
+        logger.debug("Link fetch unavailable in chat sandbox", exc_info=True)
+        return ""
+
+
 def _platform_dependency_report(system_name=None, import_checker=None, command_checker=None):
     """Return platform-aware dependency diagnostics for onboarding."""
     import platform
@@ -2185,6 +2207,11 @@ class _UIHandler(SimpleHTTPRequestHandler):
                     bot_name=config.bot_display_name or "群聊小助手",
                     group_name=group_name,
                     group_memory=group_memory,
+                    # Same enrichment the real @bot path does, so a link
+                    # tested here behaves as it will in the group — without
+                    # it this preview reports "我打不开链接" and the feature
+                    # looks broken.
+                    link_context=_fetch_link_context(message, os.environ),
                 )
 
                 self.send_json({

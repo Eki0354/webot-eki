@@ -459,6 +459,38 @@ class MessageRouter:
 
     # ── AI Chat handler ──────────────────────────────────────────
 
+    def _link_context(self, text: str) -> str:
+        """Fetch the pages *text* links to, rendered for the chat prompt.
+
+        A chat completion cannot open URLs — without this, a group member who
+        asks "这文章讲了啥" gets "我打不开链接" even though the link is right
+        there in the prompt.
+
+        Deliberately forgiving: fetching is a best-effort enrichment, so any
+        failure (module missing, network down, nothing readable) yields "" and
+        the reply proceeds on the message alone.
+        """
+        if not getattr(self._config, "link_fetch_enabled", True):
+            return ""
+        try:
+            from .media.link_fetcher import fetch_for_question, format_link_context
+        except Exception:
+            logger.debug("link_fetcher unavailable", exc_info=True)
+            return ""
+        try:
+            articles = fetch_for_question(text)
+        except Exception:
+            # ``fetch_for_question`` is written not to raise; this is the
+            # seatbelt for a future edit that forgets that promise.
+            logger.exception("Link fetch failed")
+            return ""
+        if not articles:
+            return ""
+        logger.info(
+            "Link context: %d article(s) for '%s'", len(articles), text[:40],
+        )
+        return format_link_context(articles)
+
     def _handle_chat(self, msg: dict, clean_content: str) -> str | None:
         """Handle a conversational @bot mention."""
         # Resolve custom nickname from file (via sender_id=wxid),
@@ -500,6 +532,7 @@ class MessageRouter:
                 bot_name=self._config.bot_display_name,
                 group_name=msg.get("group_name", msg.get("chat_id", "群聊")),
                 group_memory=self._get_group_memory(msg["chat_id"]),
+                link_context=self._link_context(clean_content),
             )
             ai_reply = self._nicks.resolve_wxids(ai_reply)
             # Guard against empty AI reply — sending a bare @mention is confusing

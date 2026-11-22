@@ -35,11 +35,22 @@ _APPMSG_LABELS = {
 
 _DEFAULT_LABEL = "[链接]"
 
+#: ``<type>`` value for a shared link / article.  The quoted payload of a
+#: reply uses the same numbering, so this doubles as the check for
+#: "the quoted message is a link".
+_APPMSG_LINK_TYPE = "5"
+
 #: Label used when the message quotes another message.
 _QUOTE_LABEL = "[引用]"
 
 _TITLE_RE = re.compile(r"<title>(.*?)</title>", re.S)
 _DES_RE = re.compile(r"<des>(.*?)</des>", re.S)
+#: The article/file target.  ``<cdnattachurl>`` (files) does not match: the
+#: pattern needs the literal tag ``<url>``.
+_URL_RE = re.compile(r"<url>(.*?)</url>", re.S)
+#: Used to read a quote's *own* wording without picking up the quoted
+#: message's ``<title>``, which sits after it inside ``<refermsg>``.
+_REFERMSG_STRIP_RE = re.compile(r"<refermsg>.*?</refermsg>", re.S)
 _APPTYPE_RE = re.compile(r"<appmsg\b.*?<type>\s*(\d+)\s*</type>", re.S)
 _CDATA_RE = re.compile(r"^<!\[CDATA\[(.*?)\]\]>$", re.S)
 _REFERMSG_RE = re.compile(r"<refermsg>(.*?)</refermsg>", re.S)
@@ -54,6 +65,8 @@ _SENDER_PREFIX_RE = re.compile(
 )
 
 _MAX_TEXT = 120
+#: URLs are longer than titles and must not be truncated into a dead link.
+_MAX_URL = 500
 
 
 def strip_sender_prefix(text: str) -> str:
@@ -121,6 +134,49 @@ def appmsg_title(xml: str) -> str:
     return _clean(match.group(1)) if match else ""
 
 
+def appmsg_url(xml: str) -> str:
+    """Return the ``<url>`` of an appmsg — the article/file target.
+
+    The URL is the only thing a fetcher can act on, so it has to survive
+    reduction.  ``reduce_appmsg`` used to keep the title and drop this, which
+    left the model unable to even name the page it was asked about.
+    """
+    if not xml:
+        return ""
+    match = _URL_RE.search(xml)
+    return _clean(match.group(1), _MAX_URL) if match else ""
+
+
+def _quoted_summary(xml: str) -> str:
+    """One-line summary of the message a reply quotes.
+
+    Only links are summarised.  A quoted image is handled earlier by
+    :meth:`MediaPipeline._describe_quoted`, and the remaining kinds carry
+    nothing the model can use — inventing a label for them would be worse
+    than saying nothing.
+
+    Returns:
+        ``"[链接] 标题 URL"`` (URL omitted when absent), or "" when the
+        quoted message is not a link.
+    """
+    refer = extract_refermsg(xml)
+    # ``extract_refermsg`` reports ``type`` as an int; the label table is
+    # keyed by the string form, so compare on ints rather than mixing them
+    # (which silently never matched).
+    if not refer or int(refer.get("type") or 0) != int(_APPMSG_LINK_TYPE):
+        return ""
+    content = refer.get("content") or ""
+    title_match = _TITLE_RE.search(content)
+    title = _clean(title_match.group(1) if title_match else "")
+    url = appmsg_url(content)
+    parts = [_APPMSG_LABELS[_APPMSG_LINK_TYPE]]
+    if title:
+        parts.append(title)
+    if url:
+        parts.append(url)
+    return " ".join(parts) if len(parts) > 1 else ""
+
+
 def reduce_appmsg(xml: str) -> Optional[str]:
     """Return a one-line label for an appmsg/sysmsg payload, or None.
 
@@ -128,8 +184,9 @@ def reduce_appmsg(xml: str) -> Optional[str]:
         xml: The decoded message body.
 
     Returns:
-        ``"[链接] 标题"`` for appmsg payloads, None for system notices and
-        anything unrecognisable.
+        ``"[链接] 标题 URL"`` for appmsg payloads (URL only when present),
+        ``"[引用] <用户的话> [链接] <被引用的标题 URL>"`` for a reply,
+        None for system notices and anything unrecognisable.
     """
     if not xml:
         return None
@@ -138,25 +195,44 @@ def reduce_appmsg(xml: str) -> Optional[str]:
         # Join / leave / revoke notices — handled by the backend's filters.
         return None
 
+    if _REFERMSG_RE.search(xml):
+        # A quote.  Its own <type> is 57, which the table calls "[直播]";
+        # saying "直播" about a reply is worse than useless — the model reads
+        # it as the message's whole content.  The quoted payload sits after
+        # the sender's wording, so it must be stripped before reading the
+        # *reply's* title, otherwise the quoted article's <title> would be
+        # mistaken for the question.
+        own_part = _REFERMSG_STRIP_RE.sub("", xml)
+        own_match = _TITLE_RE.search(own_part)
+        own_title = _clean(own_match.group(1) if own_match else "")
+        quoted = _quoted_summary(xml)
+        if own_title and quoted:
+            return f"{_QUOTE_LABEL} {own_title} {quoted}"
+        if own_title:
+            return f"{_QUOTE_LABEL} {own_title}"
+        return f"{_QUOTE_LABEL} {quoted}" if quoted else None
+
     type_match = _APPTYPE_RE.search(xml)
     app_type = type_match.group(1) if type_match else ""
-    if _REFERMSG_RE.search(xml):
-        # A quote.  Its <type> is 57, which the table calls "[直播]"; saying
-        # "直播" about a reply is worse than useless — the model reads it as
-        # the message's whole content.
-        label = _QUOTE_LABEL
-    else:
-        label = _APPMSG_LABELS.get(app_type, _DEFAULT_LABEL)
+    label = _APPMSG_LABELS.get(app_type, _DEFAULT_LABEL)
 
     title_match = _TITLE_RE.search(xml)
     title = _clean(title_match.group(1) if title_match else "")
+
+    parts = [label]
     if title:
-        return f"{label} {title}"
+        parts.append(title)
+    else:
+        des_match = _DES_RE.search(xml)
+        des = _clean(des_match.group(1) if des_match else "")
+        if des:
+            parts.append(des)
 
-    des_match = _DES_RE.search(xml)
-    des = _clean(des_match.group(1) if des_match else "")
-    if des:
-        return f"{label} {des}"
+    url = appmsg_url(xml)
+    if url:
+        parts.append(url)
 
-    # No title or description — a bare label beats dumping XML.
-    return label if app_type else None
+    # No title, description or URL — a bare label beats dumping XML.
+    if len(parts) > 1 or app_type:
+        return " ".join(parts)
+    return None
