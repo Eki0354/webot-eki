@@ -385,6 +385,15 @@ todo_delete_keywords: list[str] = [
 | `_send_and_confirm(group_name, talker, content)` | 通过键盘发送并确认 | `group_name, talker, content` | `bool` |
 | `_get_voice()` | 懒初始化语音识别管道 | 无 | `VoicePipeline \| None \| False` |
 | `_try_voice(msg)` | 尝试语音识别 | `msg: dict` | `str \| None` |
+| `_get_media()` | 懒初始化 `MediaPipeline`, 并把 `_emoji_url_lookup` 与已采集的地址表注入其中 | 无 | `MediaPipeline \| None \| False` |
+| `_try_media(msg, chat_id="")` | 媒体消息 → 文本 | `msg: dict, chat_id: str` | `str \| None` |
+| `media_pipeline()` | 供按需回填使用; 媒体关闭时返回 None | 无 | `MediaPipeline \| None` |
+| `raw_messages(chat_id, limit=200)` | 读某会话的原始 WCDB 消息(仍带 `<img>` / `<emoji>` XML) | `chat_id: str, limit: int` | `list[dict]` |
+| `_emoji_addr(msg)` | 表情消息的 `(md5, cdnurl)`; 先做便宜的本地类型/`<emoji>` 判断再解 BLOB(静态) | `msg: dict` | `tuple[str\|None, str\|None]` |
+| `_harvest_emoji_urls(messages)` | 采集一页消息里的表情下载地址并持久化, 使「精简表情体」能靠字典命中取图 | `messages: list[dict]` | `None` |
+| `_emoji_scan_talkers(chat_id)` | 回查顺序: 提问会话 → 已配置群 → 其它群聊(最多 `EMOJI_URL_SCAN_CHATS` 个) | `chat_id: str` | `list[str]` |
+| `_session_chatrooms()` | 会话表里的群聊, 按 `sort_timestamp` 新→旧; 结果缓存 `SESSION_SCAN_CACHE_SEC` | 无 | `list[str]` |
+| `_emoji_url_lookup(md5, chat_id="")` | 在可读历史里找回该表情的签名 `cdnurl`(每会话最多读 `EMOJI_URL_SCAN_LIMIT` 条), 命中即持久化 | `md5: str, chat_id: str` | `str \| None` |
 
 ### 2.9 `src/wechat/wcdb_client.py` (WcdbNativeClient)
 
@@ -750,9 +759,12 @@ todo_delete_keywords: list[str] = [
 
 | 函数 | 描述 | 参数 | 返回值 |
 |---|---|---|---|
-| `parse_emoji_xml(xml)` | 从表情 XML 取 `(md5, cdnurl)`（含 `&amp;` 反转义） | `xml: str` | `tuple[str\|None, str\|None]` |
-| `EmojiStore.__init__(wechat_data_dir, cache_dir)` | 初始化表情存取器 | `wechat_data_dir: str, cache_dir: Path` | `None` |
-| `EmojiStore.fetch(xml)` | 本地 `Persist/{md5[:2]}/{md5}`（仅当确为图片）优先，否则 CDN 下载 | `xml: str` | `Path \| None` |
+| `parse_emoji_xml(xml)` | 从表情 XML 取 `(md5, cdnurl)`（属性允许 `md5 = "…"` 带空格写法；含 `&amp;` 反转义） | `xml: str` | `tuple[str\|None, str\|None]` |
+| `EmojiStore.__init__(wechat_data_dir, cache_dir, url_lookup=None)` | 初始化表情存取器；`url_lookup(md5, chat_id)` 用于「精简表情体」回查下载地址；同时加载 `emoji_urls.json` | `wechat_data_dir: str, cache_dir: Path, url_lookup: Callable[[str, str], str\|None] \| None` | `None` |
+| `EmojiStore.fetch(xml, chat_id="")` | 本地 `Persist/{md5[:2]}/{md5}`（仅当确为图片）优先，否则 CDN 下载；无 `cdnurl` 时先查内存/磁盘地址表，再经 `url_lookup` 跨会话回查 | `xml: str, chat_id: str` | `Path \| None` |
+| `EmojiStore.known_url(md5)` | 已记住的下载地址（小写 md5 键） | `md5: str` | `str \| None` |
+| `EmojiStore.set_url_lookup(lookup)` | 安装/清除跨会话回查回调 | `lookup: Callable[[str, str], str\|None] \| None` | `None` |
+| `EmojiStore.remember_urls(entries)` | 记住并持久化 `md5 → cdnurl`（原子写 `emoji_urls.json`，上限 2000 条） | `entries: dict[str, str]` | `None` |
 
 `src/media/vision.py` — 图片描述（OpenAI 兼容接口）：
 
@@ -839,6 +851,8 @@ todo_delete_keywords: list[str] = [
 | `MediaPipeline.process(msg, chat_id="")` | 媒体消息 → 文本（占位符由调用方兜底）；图片需 `chat_id` 定位目录；引用图片走 `_describe_quoted()` | `msg: dict, chat_id: str` | `str \| None` |
 | `MediaPipeline._describe_quoted(msg, chat_id)` | 引用消息（`<refermsg>`）里被引用的图片：用其 `<img>` 载荷复用解密+视觉，输出「用户提问（引用的图片：…）」；非图片引用返回 None | `msg: dict, chat_id: str` | `str \| None` |
 | `MediaPipeline.stats()` | 计数器快照（`emoji`/`image`/`described`/`failed`） | 无 | `dict` |
+| `MediaPipeline.set_emoji_url_lookup(lookup)` | 安装表情下载地址回查回调（精简表情体没有 `cdnurl` 时用） | `lookup: Callable[[str, str], str\|None] \| None` | `None` |
+| `MediaPipeline.remember_emoji_urls(entries)` | 把采集到的 `md5 → cdnurl` 交给 `EmojiStore` 持久化 | `entries: dict[str, str]` | `None` |
 | `MediaPipeline._vision_model()` | 日志用模型名；无视觉客户端时返回 `"?"` | 无 | `str` |
 | `MediaPipeline._vision_error()` | 最近一次视觉失败的具原因文本（`vision disabled` / `VisionClient.last_error`），让 WARNING 说得清**为什么**没描述出来 | 无 | `str` |
 

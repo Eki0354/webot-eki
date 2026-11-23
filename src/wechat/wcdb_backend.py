@@ -23,6 +23,7 @@ from .window_controller import WeChatWindowController
 from .helpers import DedupSet, format_nontext_content
 from src.media.appmsg import looks_like_xml, strip_sender_prefix
 from src.media.blob import decode_blob, is_binary
+from src.media.emoji import parse_emoji_xml
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,15 @@ STALL_REINIT_MIN_INTERVAL = 300  # never thrash the native handle
 # reading the database does not.  It is re-scanned first (cheap), and only a
 # window that stays gone for this long escalates to a full rebuild.
 HWND_REINIT_SEC = 180
+
+# ── Sticker download addresses ───────────────────────────────────
+# A sticker's body may arrive stripped (``<emoji md5=… len=…/>``) while the
+# same sticker reached another chat intact.  Recovering the address is a
+# bounded history read: the asking chat first, then the configured groups,
+# then recent group chats, a fixed page per chat.
+EMOJI_URL_SCAN_CHATS = 8         # chats read for one missing address
+EMOJI_URL_SCAN_LIMIT = 200       # messages read per chat (≈0.2–2 s each)
+SESSION_SCAN_CACHE_SEC = 300     # how long the chatroom list is reused
 
 # Message types whose body is media rather than text.  Used to pick a
 # placeholder when MediaPipeline cannot describe them.
@@ -164,6 +174,15 @@ class WcdbBackend(AbstractWeChatBackend):
         self._last_reinit_at = 0.0                    # throttle handle rebuilds
         self._no_hwnd_since: Optional[float] = None   # WeChat window missing since
         self._last_window_check = 0.0                 # throttle window re-scans
+        # md5 → signed CDN address, harvested from every emoji we read.  A
+        # chat can store a *stripped* sticker body (md5/len only), while the
+        # very same sticker arrived elsewhere with a full address; keeping
+        # the mapping in memory makes that case a dict hit instead of a
+        # history scan.  Persistence lives in EmojiStore.
+        self._emoji_url_hints: dict[str, str] = {}
+        # Recent group chats, reused while hunting a sticker's address.
+        self._session_chatroom_cache: list[str] = []
+        self._session_chatrooms_at = 0.0
 
     # ── Public API ─────────────────────────────────────────────────
 
@@ -583,6 +602,11 @@ class WcdbBackend(AbstractWeChatBackend):
         if not messages:
             return
 
+        # Cheap pass over the page we just read: any sticker that arrived
+        # with a signed address is remembered, which is what lets a stripped
+        # copy of the same sticker be fetched later.
+        self._harvest_emoji_urls(messages)
+
         # Remember how far we can actually see into this chat — compared
         # against SessionTable later to detect a frozen read path.
         newest = max(
@@ -946,6 +970,13 @@ class WcdbBackend(AbstractWeChatBackend):
         try:
             from src.media import MediaPipeline
             self._media = MediaPipeline(self._voice_config)
+            # A chat can hold a stripped sticker body with no download
+            # address; the same sticker usually arrived elsewhere intact.
+            self._media.set_emoji_url_lookup(self._emoji_url_lookup)
+            # Addresses harvested while polling before media was first used
+            # would otherwise live only in memory.
+            if self._emoji_url_hints:
+                self._media.remember_emoji_urls(dict(self._emoji_url_hints))
         except Exception:
             logger.exception("MediaPipeline init failed — media disabled")
             self._media = False
@@ -968,6 +999,162 @@ class WcdbBackend(AbstractWeChatBackend):
         """The MediaPipeline, or None when media handling is disabled."""
         media = self._get_media()
         return media or None
+
+    # ── Sticker download addresses ───────────────────────────────────
+
+    @staticmethod
+    def _emoji_addr(msg: dict) -> tuple[Optional[str], Optional[str]]:
+        """Return ``(md5, cdnurl)`` for an emoji message, else ``(None, None)``.
+
+        Decoding a BLOB costs a decompression, so the cheap tests come
+        first: a plain-text body without an ``<emoji>`` tag is rejected
+        without touching it, and a binary body is only decoded for a real
+        sticker message.
+        """
+        try:
+            local_type = int(msg.get("localType", msg.get("msg_type", 0)))
+        except (TypeError, ValueError):
+            return None, None
+
+        raw = msg.get("message_content") or msg.get("content") or ""
+        if not raw:
+            return None, None
+
+        binary = is_binary(msg)
+        if binary:
+            # Only a sticker's own body is worth decompressing.  A quoted
+            # payload stores the stripped form anyway, and the original
+            # message that carries the address is read on its own.
+            if local_type != 47:
+                return None, None
+            text = decode_blob(str(raw))
+        else:
+            text = str(raw)
+            if local_type != 47 and "<emoji" not in text:
+                return None, None
+        return parse_emoji_xml(text)
+
+    def _harvest_emoji_urls(self, messages) -> None:
+        """Remember every sticker address seen in a freshly read page.
+
+        A chat may store a stripped sticker body (``md5``/``len`` only) while
+        the same sticker arrived elsewhere intact, so collecting addresses
+        from *all* traffic turns the stripped case into a dict hit.
+        """
+        found: dict[str, str] = {}
+        for msg in messages or ():
+            md5, url = self._emoji_addr(msg)
+            if md5 and url:
+                found.setdefault(md5, url)
+        if not found:
+            return
+
+        fresh = {
+            md5: url for md5, url in found.items()
+            if self._emoji_url_hints.get(md5) != url
+        }
+        if not fresh:
+            return
+        self._emoji_url_hints.update(fresh)
+        media = self._media
+        if media:
+            media.remember_emoji_urls(fresh)
+
+    def _emoji_scan_talkers(self, chat_id: str) -> list[str]:
+        """Chats worth reading when hunting one sticker's address.
+
+        The chat that asked comes first (its own history is the cheapest and
+        most likely place), then the configured groups, then any other
+        group chat the session table knows about — a sticker usually travels
+        between groups, and the copy that kept its address may be anywhere.
+        """
+        talkers: list[str] = []
+
+        def add(talker: Optional[str]) -> None:
+            if talker and talker not in talkers:
+                talkers.append(talker)
+
+        add(chat_id)
+        for talker in list(self._talker_ids.values()):
+            add(talker)
+
+        if len(talkers) < EMOJI_URL_SCAN_CHATS:
+            for talker in self._session_chatrooms():
+                add(talker)
+                if len(talkers) >= EMOJI_URL_SCAN_CHATS:
+                    break
+        return talkers
+
+    def _session_chatrooms(self) -> list[str]:
+        """Group chats from the session table, newest first (cached)."""
+        now = time.time()
+        if now - self._session_chatrooms_at < SESSION_SCAN_CACHE_SEC:
+            return self._session_chatroom_cache
+        client = self._client
+        if client is None:
+            return []
+        try:
+            with self._client_lock:
+                sessions = client.get_sessions() or []
+        except Exception:
+            logger.debug("Cannot list sessions for emoji lookup", exc_info=True)
+            sessions = []
+
+        rows = [
+            s for s in sessions
+            if str(s.get("username", "")).endswith("@chatroom")
+        ]
+        rows.sort(
+            key=lambda s: int(s.get("sort_timestamp") or s.get("last_timestamp") or 0),
+            reverse=True,
+        )
+        self._session_chatroom_cache = [
+            str(s.get("username")) for s in rows if s.get("username")
+        ]
+        self._session_chatrooms_at = now
+        return self._session_chatroom_cache
+
+    def _emoji_url_lookup(self, md5: str, chat_id: str = "") -> Optional[str]:
+        """Find a signed download address for *md5* in readable history.
+
+        Called from the media pipeline for a sticker whose own body carries
+        no ``cdnurl``.  The URL is shared by every copy of that sticker, so
+        one hit in any chat is enough; the search is bounded because it runs
+        synchronously while a message is being answered.
+        """
+        md5 = (md5 or "").lower()
+        if not md5:
+            return None
+        known = self._emoji_url_hints.get(md5)
+        if known:
+            return known
+
+        client = self._client
+        if client is None:
+            return None
+
+        for talker in self._emoji_scan_talkers(chat_id):
+            try:
+                with self._client_lock:
+                    page = client.get_messages(
+                        talker=talker, limit=EMOJI_URL_SCAN_LIMIT,
+                    )
+            except Exception:
+                logger.debug("Emoji lookup: cannot read %s", talker, exc_info=True)
+                continue
+
+            for msg in page or ():
+                found_md5, url = self._emoji_addr(msg)
+                if found_md5 == md5 and url:
+                    logger.info(
+                        "Emoji %s: recovered download address from %s", md5, talker,
+                    )
+                    self._emoji_url_hints[md5] = url
+                    media = self._media
+                    if media:
+                        media.remember_emoji_urls({md5: url})
+                    return url
+        return None
 
     def raw_messages(self, chat_id: str, limit: int = 200) -> list[dict]:
         """Read raw WCDB messages for a chat, newest page included.

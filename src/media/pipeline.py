@@ -28,7 +28,7 @@ What is supported, and why:
 """
 
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 from src.config import PROJECT_ROOT, resolve_wechat_data_dir
 
@@ -96,6 +96,24 @@ class MediaPipeline:
             )
 
     # -- Public ------------------------------------------------------------
+
+    def set_emoji_url_lookup(
+        self, lookup: Optional[Callable[[str, str], Optional[str]]],
+    ) -> None:
+        """Let the caller resolve a stripped sticker's download address.
+
+        A chat may store an emoji body as just ``<emoji md5=… len=…/>`` while
+        the same sticker arrived elsewhere with a signed ``cdnurl``.  Without
+        this hook such a message can only fall back to its local file, which
+        is usually an opaque container.
+        """
+        if self._emoji is not None:
+            self._emoji.set_url_lookup(lookup)
+
+    def remember_emoji_urls(self, entries: dict[str, str]) -> None:
+        """Persist sticker download addresses harvested by the caller."""
+        if self._emoji is not None:
+            self._emoji.remember_urls(entries)
 
     def process(self, msg: dict, chat_id: str = "") -> Optional[str]:
         """Describe a media message.
@@ -350,7 +368,9 @@ class MediaPipeline:
             return None
 
         self._stats["emoji"] += 1
-        image = self._emoji.fetch(xml)
+        # The chat id widens the address search: some chats receive a
+        # stripped sticker body with no ``cdnurl`` at all.
+        image = self._emoji.fetch(xml, chat_id or msg.get("chat_id") or "")
         if not image:
             self._stats["failed"] += 1
             logger.warning(

@@ -77,10 +77,12 @@ class _FakeEmoji:
 
     def __init__(self, found: bool = True):
         self.seen = []
+        self.chats = []
         self._found = found
 
-    def fetch(self, xml):
+    def fetch(self, xml, chat_id=""):
         self.seen.append(xml)
+        self.chats.append(chat_id)
         if not self._found:
             return None
         from pathlib import Path

@@ -18,11 +18,14 @@ their CDN thumbnails return HTTP 400.  See ``src/media/pipeline.py``.
 """
 
 import html
+import json
 import logging
+import os
 import re
+import threading
 import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .vision import detect_mime
 
@@ -32,8 +35,24 @@ logger = logging.getLogger(__name__)
 _MAX_DOWNLOAD_BYTES = 8 * 1024 * 1024
 _DOWNLOAD_TIMEOUT_SEC = 15
 
-_MD5_RE = re.compile(r'md5="([0-9a-fA-F]{32})"')
-_CDNURL_RE = re.compile(r'cdnurl="([^"]+)"')
+# WeChat writes attributes both ways: a *received* emoji carries
+# ``cdnurl = "…"`` with spaces around the ``=``, while the shortened body
+# some builds store uses ``md5="…"`` with none.  Matching only the compact
+# form made every full XML look like it had no download address at all —
+# the URL was there, the regex just skipped it.  ``\b`` keeps the pattern
+# off ``androidmd5`` / ``s60v3md5``, which also end in ``md5``.
+_MD5_RE = re.compile(r'\bmd5\s*=\s*"([0-9a-fA-F]{32})"')
+_CDNURL_RE = re.compile(r'\bcdnurl\s*=\s*"([^"]+)"')
+
+#: Where the md5 → download-URL table is kept between runs.  A signed emoji
+#: ``cdnurl`` stays valid for weeks (verified on a 15-day-old message), so
+#: one successful lookup keeps paying off long after the message scrolls out
+#: of the readable history window.
+_URL_TABLE_NAME = "emoji_urls.json"
+
+#: Cap on remembered addresses.  Beyond this the oldest entries are dropped;
+#: a regularly used sticker set stays well under it.
+_MAX_URL_ENTRIES = 2000
 
 
 def parse_emoji_xml(xml: str) -> tuple[Optional[str], Optional[str]]:
@@ -54,19 +73,43 @@ def parse_emoji_xml(xml: str) -> tuple[Optional[str], Optional[str]]:
 class EmojiStore:
     """Find emoji images locally, falling back to the CDN."""
 
-    def __init__(self, wechat_data_dir: str, cache_dir: Path) -> None:
+    def __init__(
+        self,
+        wechat_data_dir: str,
+        cache_dir: Path,
+        url_lookup: Optional[Callable[[str, str], Optional[str]]] = None,
+    ) -> None:
         """
         Args:
             wechat_data_dir: Parent of the ``wxid_*`` folders (may be empty).
             cache_dir:       Where downloads are kept between runs.
+            url_lookup:      Called as ``url_lookup(md5, chat_id)`` when this
+                message carries no ``cdnurl``.  A chat can receive a *stripped*
+                sticker body (``<emoji md5=… len=…/>`` only), while the very
+                same sticker arrived elsewhere with a full signed address;
+                the callback is how the backend searches for it.
         """
         self._data_dir = Path(wechat_data_dir) if wechat_data_dir else None
         self._cache_dir = Path(cache_dir)
+        self._url_lookup = url_lookup
+        self._urls_path = self._cache_dir.parent / _URL_TABLE_NAME
+        self._urls: dict[str, str] = self._load_url_table()
+        # Emoji that a lookup already failed to resolve.  Repeated scans of
+        # the chat history cost seconds each, so a miss is not retried until
+        # the process restarts.
+        self._misses: set[str] = set()
+        self._urls_lock = threading.Lock()
 
     # -- Public ------------------------------------------------------------
 
-    def fetch(self, xml: str) -> Optional[Path]:
-        """Return a local image file for this emoji message, or None."""
+    def fetch(self, xml: str, chat_id: str = "") -> Optional[Path]:
+        """Return a local image file for this emoji message, or None.
+
+        Args:
+            xml: The emoji message body (or the quoted ``<emoji>`` payload).
+            chat_id: Session the message belongs to, used to widen the
+                download-address search when the body has been stripped.
+        """
         md5, cdnurl = parse_emoji_xml(xml)
         if not md5 and not cdnurl:
             return None
@@ -92,11 +135,107 @@ class EmojiStore:
             if local:
                 return local
 
-        if cdnurl:
-            return self._download(md5, cdnurl)
+        url = cdnurl
+        if not url and md5:
+            url = self.known_url(md5) or self._rescue_url(md5, chat_id)
+
+        if url:
+            image = self._download(md5, url)
+            if image and md5:
+                # Remember a working address: the same sticker is quoted
+                # again later, and by then its full XML may be long gone.
+                self.remember_urls({md5: url})
+            return image
         return None
 
+    def known_url(self, md5: str) -> Optional[str]:
+        """Return the remembered download address for *md5*, if any."""
+        with self._urls_lock:
+            return self._urls.get(md5.lower())
+
+    def set_url_lookup(
+        self, lookup: Optional[Callable[[str, str], Optional[str]]],
+    ) -> None:
+        """Install (or clear) the callback used for stripped sticker bodies."""
+        self._url_lookup = lookup
+
+    def remember_urls(self, entries: dict[str, str]) -> None:
+        """Persist ``md5 → cdnurl`` pairs discovered this run.
+
+        A sticker's signed address stays valid for weeks, so one successful
+        lookup keeps paying off after the message itself scrolls out of the
+        readable history window — and it spares the next call a full scan.
+        """
+        if not entries:
+            return
+        with self._urls_lock:
+            changed = False
+            for md5, url in entries.items():
+                key = str(md5).lower()
+                if not url or self._urls.get(key) == url:
+                    continue
+                self._urls[key] = url
+                changed = True
+            if not changed:
+                return
+            if len(self._urls) > _MAX_URL_ENTRIES:
+                # Keep the newest entries; the dict preserves insertion order.
+                excess = len(self._urls) - _MAX_URL_ENTRIES
+                for stale in list(self._urls)[:excess]:
+                    del self._urls[stale]
+            payload = dict(self._urls)
+            self._write_url_table(payload)
+
     # -- Internals ---------------------------------------------------------
+
+    def _rescue_url(self, md5: str, chat_id: str) -> Optional[str]:
+        """Ask the backend to find this md5's address in another chat."""
+        if not self._url_lookup or md5 in self._misses:
+            return None
+        try:
+            url = self._url_lookup(md5, chat_id)
+        except Exception:
+            logger.debug("Emoji URL lookup failed (md5=%s)", md5, exc_info=True)
+            url = None
+        if url:
+            logger.info("Emoji %s: recovered CDN address from history", md5)
+            self.remember_urls({md5: url})
+            return url
+        self._misses.add(md5)
+        logger.debug("Emoji %s: no CDN address in any readable chat", md5)
+        return None
+
+    def _load_url_table(self) -> dict[str, str]:
+        try:
+            raw = self._urls_path.read_text(encoding="utf-8")
+        except OSError:
+            return {}
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            logger.info("Emoji URL table is unreadable, starting empty: %s",
+                        self._urls_path)
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {
+            str(key).lower(): value
+            for key, value in data.items()
+            if isinstance(value, str) and value
+        }
+
+    def _write_url_table(self, payload: dict[str, str]) -> None:
+        """Write the table atomically, tolerating read-only locations."""
+        try:
+            self._urls_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._urls_path.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=0, sort_keys=True),
+                encoding="utf-8",
+            )
+            os.replace(tmp, self._urls_path)
+        except OSError:
+            logger.debug("Cannot persist emoji URL table", exc_info=True)
 
     def _persist_dirs(self) -> list[Path]:
         """Every ``business/emoticon/Persist`` directory we can see."""

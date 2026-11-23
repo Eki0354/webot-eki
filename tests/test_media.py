@@ -138,6 +138,73 @@ class EmojiStoreTests(unittest.TestCase):
             self.assertEqual(store._find_local(md5), png)
 
 
+class EmojiAddressTests(unittest.TestCase):
+    """A stripped sticker body must still be fetchable.
+
+    Measured on real data: the same sticker arrived in one chat as the full
+    ``<emoji … cdnurl = "…">`` and in another as ``<emoji md5=… len=…/>``
+    only.  The stripped copy has no address, and its local ``Persist`` file
+    is an opaque container, so without a lookup it can never be described.
+    """
+
+    MD5 = "b3de1b56b60b6781e79426e6eadbffbb"
+    URL = "http://vweixinf.tc.qq.com/110/20401/stodownload?m=" + MD5
+
+    def _store(self, root: Path, lookup=None):
+        from src.media.emoji import EmojiStore
+
+        return EmojiStore(str(root), root / "emoji_cache", url_lookup=lookup)
+
+    def test_stripped_body_is_resolved_through_lookup(self):
+        calls = []
+
+        def lookup(md5, chat_id):
+            calls.append((md5, chat_id))
+            return self.URL
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self._store(root, lookup)
+            wanted = root / "emoji_cache" / self.MD5
+            with patch.object(
+                type(store), "_download", autospec=True, return_value=wanted,
+            ) as download:
+                got = store.fetch(f'<msg><emoji md5="{self.MD5}" len="4834"/></msg>',
+                                  "55952837114@chatroom")
+
+            self.assertEqual(got, wanted)
+            self.assertEqual(calls, [(self.MD5, "55952837114@chatroom")])
+            self.assertEqual(download.call_args.args[2], self.URL)
+
+    def test_resolved_address_is_remembered_across_restarts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = self._store(root)
+            first.remember_urls({self.MD5: self.URL})
+
+            # A fresh store reads the table back from disk, so a later quote
+            # needs no history scan at all.
+            second = self._store(root)
+            self.assertEqual(second.known_url(self.MD5), self.URL)
+
+    def test_failed_lookup_is_not_repeated(self):
+        calls = []
+
+        def lookup(md5, chat_id):
+            calls.append(md5)
+            return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = self._store(root, lookup)
+            xml = f'<msg><emoji md5="{self.MD5}"/></msg>'
+            self.assertIsNone(store.fetch(xml, "chat"))
+            self.assertIsNone(store.fetch(xml, "chat"))
+
+            # Each scan reads whole histories; a known miss must stay cheap.
+            self.assertEqual(calls, [self.MD5])
+
+
 class MediaPipelineTests(unittest.TestCase):
     """End-to-end behaviour of process(), without touching the network."""
 
