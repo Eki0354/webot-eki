@@ -136,6 +136,18 @@ class MediaPipeline:
     def stats(self) -> dict:
         return dict(self._stats)
 
+    def _vision_model(self) -> str:
+        """Model name for log lines; "?" when there is no client."""
+        if self._vision is None:
+            return "?"
+        return getattr(self._vision, "model", "?")
+
+    def _vision_error(self) -> str:
+        """Why the last vision call produced nothing, for the log line."""
+        if self._vision is None:
+            return "vision disabled"
+        return getattr(self._vision, "last_error", "") or "unknown reason"
+
     # -- Internals ---------------------------------------------------------
 
     def _create_vision(self, config) -> Optional[VisionClient]:
@@ -152,7 +164,12 @@ class MediaPipeline:
             key = getattr(config, "openai_api_key", "")
             model = override or getattr(config, "openai_model", "")
             base = getattr(config, "openai_base_url", "")
-            disable_thinking = False
+            # The ``openai`` backend also covers proxies that front a
+            # reasoning model (one such proxy reported every image as
+            # ``finish_reason=length`` with empty content, 19 of 22).  Ask
+            # for reasoning off here too; a real OpenAI endpoint rejects the
+            # field and the client drops it for the rest of the run.
+            disable_thinking = True
         else:
             # Claude's vision API is shaped differently; skip rather than
             # guess.  Emoji still degrade to "[表情]".
@@ -229,8 +246,8 @@ class MediaPipeline:
             return f"[图片] {description}"
         self._stats["failed"] += 1
         logger.warning(
-            "MediaPipeline: vision gave no text for %s (model=%s)",
-            image.name, getattr(self._vision, "_model", "?"),
+            "MediaPipeline: vision gave no text for %s (model=%s): %s",
+            image.name, self._vision_model(), self._vision_error(),
         )
         return None
 
@@ -296,6 +313,10 @@ class MediaPipeline:
         image = self._emoji.fetch(xml)
         if not image:
             self._stats["failed"] += 1
+            logger.warning(
+                "MediaPipeline: emoji image not found (chat=%s, msg=%s)",
+                msg.get("chat_id", "?"), msg.get("message_id", "?"),
+            )
             return None
 
         description = self._vision.describe(image)
@@ -303,6 +324,10 @@ class MediaPipeline:
             self._stats["described"] += 1
             return f"[表情] {description}"
         self._stats["failed"] += 1
+        logger.warning(
+            "MediaPipeline: vision gave no text for emoji %s (model=%s): %s",
+            image.name, self._vision_model(), self._vision_error(),
+        )
         return None
 
     def _reduce_binary(self, msg: dict, local_type: int) -> Optional[str]:

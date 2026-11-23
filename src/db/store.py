@@ -75,6 +75,31 @@ class MessageStore:
                 )
                 return False
 
+    def update_message_content(self, message_id: str, content: str) -> bool:
+        """Replace a stored message's content.  Returns True if a row changed.
+
+        Used by the media backfill: a message whose media could not be
+        described at the moment it was received is stored as a bare
+        placeholder, and once the picture becomes readable it must be
+        rewritten in place — otherwise every later prompt keeps seeing
+        ``[图片]`` even though the bot has since seen the picture.
+        """
+        if not message_id or not content:
+            return False
+        with self._lock:
+            try:
+                with self.conn:
+                    cursor = self.conn.execute(
+                        "UPDATE messages SET content = ? WHERE message_id = ?",
+                        (str(content), str(message_id)),
+                    )
+                return cursor.rowcount > 0
+            except Exception:
+                logger.exception(
+                    "Failed to update message content (msg_id=%s)", message_id,
+                )
+                return False
+
     def log_trigger(self, chat_id: str, requester_id: str,
                     trigger_msg_id: str) -> None:
         """Record a trigger event for deduplication.

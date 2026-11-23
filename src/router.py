@@ -73,6 +73,10 @@ class MessageRouter:
         self._nicks = nickname_service
         self._config = config
         self._feishu_export = feishu_export_service
+        # Filled in by :meth:`attach_media_backfill` once the WeChat backend
+        # exists (the router is built first, and only the backend can read
+        # the raw XML an old media message needs).
+        self._media_backfill = None
         self._proactive = ProactiveGate(config)
         self._sticky = StickyMentionTracker(
             ttl_sec=config.sticky_mention_ttl_sec,
@@ -346,6 +350,35 @@ class MessageRouter:
 
     # ── Memory helper ────────────────────────────────────────────
 
+    def attach_media_backfill(self, backfill) -> None:
+        """Enable on-demand re-description of old media messages.
+
+        Called once by :class:`~src.bot.Bot` after the WeChat backend exists:
+        only the backend can read the raw XML an old image or sticker still
+        carries, and the router is constructed before it.
+        """
+        self._media_backfill = backfill
+
+    def _backfill_media(self, chat_id: str, messages: list[dict]) -> None:
+        """Describe bare ``[图片]`` / ``[表情]`` in *messages*, in place.
+
+        This is what makes a picture from *before* the current run usable:
+        the description is written back to the database, so every later prompt
+        sees it too.  Bounded and non-fatal by design — see
+        :mod:`src.media.backfill`.
+        """
+        if not self._media_backfill or not messages:
+            return
+        try:
+            recovered = self._media_backfill.refresh(chat_id, messages)
+            if recovered:
+                logger.info(
+                    "Chat context: recovered %d media description(s) for %s",
+                    recovered, chat_id[:24],
+                )
+        except Exception:
+            logger.exception("Media backfill failed (continuing)")
+
     def _get_group_memory(self, chat_id: str) -> str:
         """Return the group's memory text, or empty string if none."""
         mem = self._store.get_group_memory(chat_id)
@@ -535,6 +568,10 @@ class MessageRouter:
                 custom = self._nicks.resolve_name(m["sender_id"])
                 if custom != m["sender_id"]:
                     m["sender_name"] = custom
+            # A picture sent before this run — or one whose description
+            # failed when it arrived — is stored as a bare placeholder.
+            # Re-describe it now, so the answer below can actually see it.
+            self._backfill_media(msg["chat_id"], context)
             logger.info(
                 "Chat context: %d messages for '%s'",
                 len(context), display_name,

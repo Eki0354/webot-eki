@@ -313,6 +313,21 @@ class Bot:
         self._backend = backend
         self.backend = backend   # public ref for lifecycle control
 
+        # Media messages whose description failed when they arrived are
+        # stored as bare placeholders and would stay that way forever.  Give
+        # the router a way to re-describe the ones it is about to put in a
+        # prompt — only the backend can read the raw XML they still carry.
+        try:
+            from .media.backfill import MediaBackfill
+            router.attach_media_backfill(MediaBackfill(
+                store=store,
+                pipeline_provider=getattr(backend, "media_pipeline", lambda: None),
+                raw_message_fetcher=getattr(backend, "raw_messages",
+                                            lambda chat_id, limit: []),
+            ))
+        except Exception as e:
+            logger.warning("Media backfill unavailable: %s", e)
+
         # Register backend with web server for stop/restart (explicit
         # API — no monkey-patching needed).
         try:

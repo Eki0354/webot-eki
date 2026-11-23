@@ -97,6 +97,7 @@ a = Analysis(
         'src.wechat.native', 'src.wechat.native.injector',
         'src.media', 'src.media.appmsg', 'src.media.blob',
         'src.media.emoji', 'src.media.pipeline', 'src.media.vision',
+        'src.media.backfill',
         'src.media.dat_decrypt', 'src.media.wxgf',
         'src.media.image', 'src.media.keys', 'src.media.link_fetcher',
         'zstandard',

@@ -760,9 +760,21 @@ todo_delete_keywords: list[str] = [
 |---|---|---|---|
 | `detect_mime(data)` | 按魔数判断图片 MIME | `data: bytes` | `str \| None` |
 | `to_data_url(path)` | 读文件生成 `data:` URL；非图片/过大返回 None | `path: Path` | `str \| None` |
-| `VisionClient.__init__(api_key, model, base_url, disable_thinking)` | 初始化视觉客户端 | 见参数 | `None` |
+| `VisionClient.__init__(api_key, model, base_url, disable_thinking)` | 初始化视觉客户端；`disable_thinking=True` 表示一上来就关推理 | 见参数 | `None` |
 | `VisionClient.available` (property) | key 与 model 是否齐备 | 无 | `bool` |
-| `VisionClient.describe(image_path, prompt)` | 返回一句话中文描述 | `image_path: Path, prompt: str` | `str \| None` |
+| `VisionClient.model` (property) | 模型名（日志用） | 无 | `str` |
+| `VisionClient.last_error` (属性) | 最近一次失败的人类可读原因；成功时为空 | 无 | `str` |
+| `VisionClient.describe(image_path, prompt)` | 返回一句话中文描述；请求形状按需协商（截断→关推理，端点拒绝 `thinking`→永久降级） | `image_path: Path, prompt: str` | `str \| None` |
+| `VisionClient._attempts()` | 依次要尝试的 `(max_tokens, disable_thinking)` 组合 | 无 | `list[tuple[int, bool]]` |
+| `VisionClient._ask(data_url, prompt, max_tokens, disable_thinking)` | 发一次请求，返回 `(文本, 错误码)`；错误码为 `truncated` / `rejected-thinking` / 具体异常 | 见参数 | `tuple[str\|None, str]` |
+
+模块级常量：
+
+| 常量 | 值 | 说明 |
+|---|---|---|
+| `_MAX_TOKENS` | `500` | 关推理时够用的预算（实测 22 张图 19 张失败正是因为开了推理） |
+| `_MAX_TOKENS_REASONING` | `4000` | 只能开推理时留足头寸（实测 379 reasoning + 443 total） |
+| `_TRUNCATED` | `"length"` | 空 `content` + 此 `finish_reason` = 预算被推理吃光 |
 
 `src/media/dat_decrypt.py` — `.dat` 四段容器解密：
 
@@ -827,6 +839,29 @@ todo_delete_keywords: list[str] = [
 | `MediaPipeline.process(msg, chat_id="")` | 媒体消息 → 文本（占位符由调用方兜底）；图片需 `chat_id` 定位目录；引用图片走 `_describe_quoted()` | `msg: dict, chat_id: str` | `str \| None` |
 | `MediaPipeline._describe_quoted(msg, chat_id)` | 引用消息（`<refermsg>`）里被引用的图片：用其 `<img>` 载荷复用解密+视觉，输出「用户提问（引用的图片：…）」；非图片引用返回 None | `msg: dict, chat_id: str` | `str \| None` |
 | `MediaPipeline.stats()` | 计数器快照（`emoji`/`image`/`described`/`failed`） | 无 | `dict` |
+| `MediaPipeline._vision_model()` | 日志用模型名；无视觉客户端时返回 `"?"` | 无 | `str` |
+| `MediaPipeline._vision_error()` | 最近一次视觉失败的具原因文本（`vision disabled` / `VisionClient.last_error`），让 WARNING 说得清**为什么**没描述出来 | 无 | `str` |
+
+`src/media/backfill.py` — 历史媒体消息按需回填：
+
+入库时的描述只算一次，失败就永久停在裸 `[图片]`/`[表情]`。本模块在**构建 prompt 之前**把这些行重新描述并写回数据库，所以「本次运行之前的图片」也能被 AI 看到；它是拉取式而非启动全量扫描，每次 prompt 最多回填 `MAX_PER_CALL` 条，失败记忆避免一条坏表情在每次 @mention 时都重试。
+
+| 函数 | 描述 | 参数 | 返回值 |
+|---|---|---|---|
+| `MediaBackfill.__init__(store, pipeline_provider, raw_message_fetcher)` | 初始化回填器；`pipeline_provider` 懒取 `MediaPipeline`（关闭媒体时为 None），`raw_message_fetcher` 为 `(chat_id, limit) -> list[dict]` 的原始 WCDB 消息读取器 | 见参数 | `None` |
+| `MediaBackfill.refresh(chat_id, messages)` | 就地改写 *messages* 里的裸占位符，返回回填成功的条数；写回数据库供后续 prompt 复用；任何异常都吞掉（不打断正在等待的回复） | `chat_id: str, messages: list[dict]` | `int` |
+| `MediaBackfill.stats` (property) | 诊断计数：`recovered` / `given_up` | 无 | `dict` |
+| `MediaBackfill._needs_backfill(msg)` | 只对 `msg_type ∈ {3,47}` 且整条内容就是裸 `[图片]`/`[表情]` 的消息回填；已被描述过的、已放弃的都跳过 | `msg: dict` | `bool` |
+| `MediaBackfill._raw_index(chat_id)` | 读最近 `_RAW_PAGE_LIMIT`(200) 条原始消息并按 `raw_message_id()` 建索引（库里的 `message_id` 就是这个哈希） | `chat_id: str` | `dict[str, dict]` |
+| `MediaBackfill._remember_failure(msg_id)` | 记住不可描述的消息（上限 500 条，超限清空），避免反复请求视觉接口 | `msg_id: str` | `None` |
+
+模块级常量：
+
+| 常量 | 值 | 说明 |
+|---|---|---|
+| `MAX_PER_CALL` | `3` | 单次 prompt 最多回填几条（每条都是真实视觉请求，要花钱和几秒） |
+| `_BACKFILLABLE_TYPES` | `{3, 47}` | 只有图片和表情有视觉路径；视频/文件回填只会白费时间 |
+| `_RAW_PAGE_LIMIT` | `200` | 回读原始消息的条数上限 |
 
 模块级常量：
 
@@ -2035,7 +2070,8 @@ MacHybridBackend
 | `dat_decrypt.py` | `src/media/dat_decrypt.py` | `.dat` 四段容器解析 (AES-128-ECB 头 + 明文 + XOR 尾) |
 | `wxgf.py` | `src/media/wxgf.py` | `wxgf`/HEVC 容器解包 (PyAV 可选) |
 | `keys.py` | `src/media/keys.py` | 图片密钥来源解析 (`env` / `file`) |
-| `vision.py` | `src/media/vision.py` | 图片描述 (OpenAI 兼容接口) |
+| `vision.py` | `src/media/vision.py` | 图片描述 (OpenAI 兼容接口，请求形状按需协商) |
+| `backfill.py` | `src/media/backfill.py` | 历史裸占位符按需重描述并写回 DB |
 
 #### 调用链
 

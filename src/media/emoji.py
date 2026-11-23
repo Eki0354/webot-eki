@@ -74,7 +74,19 @@ class EmojiStore:
         if md5:
             cached = self._cache_dir / md5
             if cached.is_file() and cached.stat().st_size > 0:
-                return cached
+                # A download that was interrupted, or an older run's bad
+                # fetch, can leave a non-image behind.  Serving it would
+                # fail the vision call and keep failing forever, because the
+                # file is never looked at again — so verify and drop it.
+                if self._is_image(cached):
+                    return cached
+                logger.info(
+                    "Emoji cache entry is not an image, refetching: %s", cached
+                )
+                try:
+                    cached.unlink()
+                except OSError:
+                    logger.debug("Cannot remove %s", cached, exc_info=True)
 
             local = self._find_local(md5)
             if local:
@@ -144,6 +156,15 @@ class EmojiStore:
         if not data or len(data) > _MAX_DOWNLOAD_BYTES:
             logger.debug("Emoji download rejected (md5=%s, %d bytes)",
                          md5, len(data))
+            return None
+
+        # An error page or a truncated stream is not an emoji.  Caching it
+        # would poison the cache for every later run of this same sticker.
+        if detect_mime(data[:16]) is None:
+            logger.info(
+                "Emoji download is not an image (md5=%s, %d bytes)",
+                md5, len(data),
+            )
             return None
 
         name = md5 or f"emoji_{abs(hash(cdnurl))}"

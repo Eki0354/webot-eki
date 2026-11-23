@@ -962,6 +962,33 @@ class WcdbBackend(AbstractWeChatBackend):
             logger.exception("MediaPipeline.process failed")
             return None
 
+    # -- Public media access (used by the on-demand backfill) ----------
+
+    def media_pipeline(self):
+        """The MediaPipeline, or None when media handling is disabled."""
+        media = self._get_media()
+        return media or None
+
+    def raw_messages(self, chat_id: str, limit: int = 200) -> list[dict]:
+        """Read raw WCDB messages for a chat, newest page included.
+
+        Unlike the stored rows, these still carry the ``<img>`` / emoji XML a
+        media message needs to be located and described, which is why the
+        backfill has to come back to the database for them.
+        """
+        if self._client is None:
+            return []
+        try:
+            with self._client_lock:
+                return list(
+                    self._client.get_messages(talker=chat_id, limit=limit) or []
+                )
+        except Exception:
+            logger.debug(
+                "Cannot read raw messages for %s", chat_id, exc_info=True,
+            )
+            return []
+
     def _blob_text(self, msg: dict) -> str:
         """Decode a non-media BLOB body to plain chat text.
 
