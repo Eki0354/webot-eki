@@ -119,7 +119,7 @@ class MediaPipeline:
             return self._describe_image(msg, chat_id)
 
         if local_type == LOCAL_TYPE_EMOJI:
-            return self._describe_emoji(msg)
+            return self._describe_emoji(msg, chat_id)
 
         if is_binary(msg) or local_type >= LOCAL_TYPE_SYSTEM:
             # A reply carries the quoted message inside <refermsg>.  For an
@@ -147,6 +147,22 @@ class MediaPipeline:
         if self._vision is None:
             return "vision disabled"
         return getattr(self._vision, "last_error", "") or "unknown reason"
+
+    @staticmethod
+    def _msg_id(msg: dict) -> str:
+        """Best available id for a log line.
+
+        Raw WCDB messages have no ``message_id`` — that is assigned later,
+        during standardization.  Reading only that key logged ``msg=?`` for
+        every failure, which made a specific broken sticker impossible to
+        find in the log.
+        """
+        return str(
+            msg.get("message_id")
+            or msg.get("server_id")
+            or msg.get("local_id")
+            or "?"
+        )
 
     # -- Internals ---------------------------------------------------------
 
@@ -252,19 +268,27 @@ class MediaPipeline:
         return None
 
     def _describe_quoted(self, msg: dict, chat_id: str) -> Optional[str]:
-        """Describe an image this message quotes, if it quotes one.
+        """Describe the media this message quotes, if it quotes any.
 
         WeChat 4.x sends a reply as an appmsg whose ``<refermsg>`` block
-        holds the original message.  For an image, that block is the only
-        place the picture's payload appears — the reply's own body carries
-        just the sender's wording.  So the quoted ``<img>`` XML is fed back
-        through the normal locate → decrypt → describe path.
+        holds the original message.  For media, that block is the only place
+        the payload appears — the reply's own body carries just the sender's
+        wording.  So the quoted ``<img>`` / ``<emoji>`` XML is fed back
+        through the same locate → decrypt → describe path a standalone
+        message takes.
+
+        Both media kinds that a member actually quotes are handled.  A
+        sticker is the one people ask about most ("这张表情包什么内容"),
+        and it arrives as ``<refermsg><type>47</type>`` carrying an
+        ``<emoji md5=…>`` payload.  Handling only ``type=3`` images made
+        the reply reduce to the sender's own words with no media in it at
+        all, so the model could only answer that it saw no picture.
 
         Returns:
-            The sender's wording plus the picture's content, or None when
-            this message quotes no image.
+            The sender's wording plus the media's content, or None when this
+            message quotes no describable media.
         """
-        if not self._image or not self._vision or not self._vision.available:
+        if not self._vision or not self._vision.available:
             return None
 
         xml = self._body_xml(msg)
@@ -272,13 +296,29 @@ class MediaPipeline:
             return None
         body = strip_sender_prefix(xml)
         refer = extract_refermsg(body)
-        if not refer or refer.get("type") != LOCAL_TYPE_IMAGE:
+        if not refer:
             return None
         quoted_xml = refer.get("content") or ""
         if not quoted_xml:
             return None
 
-        # Present the quoted picture as if it were its own message.  The
+        kind = int(refer.get("type") or 0)
+        # A sticker payload is recognisable on its own: some clients report
+        # the quote's type as the reply envelope's, but the ``<emoji>`` tag
+        # is unambiguous.  Checking the payload as well keeps a sticker from
+        # being dropped when only its type field is odd.
+        if kind == LOCAL_TYPE_EMOJI or "<emoji" in quoted_xml:
+            label, prefix, describe = (
+                "表情包", "[表情] ", self._describe_emoji
+            )
+        elif kind == LOCAL_TYPE_IMAGE:
+            if not self._image:
+                return None
+            label, prefix, describe = "图片", "[图片] ", self._describe_image
+        else:
+            return None
+
+        # Present the quoted media as if it were its own message.  The
         # session and timestamp still come from the reply, which is what
         # names the account folder and month directory.
         proxy = dict(msg)
@@ -287,20 +327,20 @@ class MediaPipeline:
         proxy.pop("content", None)
 
         title = appmsg_title(body)
-        description = self._describe_image(proxy, chat_id)
+        description = describe(proxy, chat_id)
         if not description:
             logger.warning(
-                "MediaPipeline: quoted image not described (chat=%s, msg=%s)",
-                chat_id or "?", msg.get("message_id", "?"),
+                "MediaPipeline: quoted %s not described (chat=%s, msg=%s)",
+                label, chat_id or "?", self._msg_id(msg),
             )
-            return f"{title}（引用的图片没能解析，看不到内容）".strip()
+            return f"{title}（引用的{label}没能解析，看不到内容）".strip()
 
         detail = description
-        if detail.startswith("[图片] "):
-            detail = detail[len("[图片] "):]
-        return f"{title}（引用的图片：{detail}）".strip()
+        if detail.startswith(prefix):
+            detail = detail[len(prefix):]
+        return f"{title}（引用的{label}：{detail}）".strip()
 
-    def _describe_emoji(self, msg: dict) -> Optional[str]:
+    def _describe_emoji(self, msg: dict, chat_id: str = "") -> Optional[str]:
         """Download/locate the emoji image and describe it."""
         if not self._vision or not self._vision.available or not self._emoji:
             return None
@@ -315,7 +355,7 @@ class MediaPipeline:
             self._stats["failed"] += 1
             logger.warning(
                 "MediaPipeline: emoji image not found (chat=%s, msg=%s)",
-                msg.get("chat_id", "?"), msg.get("message_id", "?"),
+                chat_id or msg.get("chat_id") or "?", self._msg_id(msg),
             )
             return None
 
