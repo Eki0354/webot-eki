@@ -662,6 +662,20 @@ todo_delete_keywords: list[str] = [
 |---|---|---|---|
 | `setup_logging(level, log_file)` | 配置日志系统 | `level: str, log_file: str \| None` | `None` |
 
+### 2.32b `src/utils/subprocess_win.py` (静默子进程)
+
+打包版是 `console=False`（`build.spec`），Windows 会给每个控制台子进程新开一个黑窗口 —— 一次视频抽帧 = 1 次时长探测 + 每帧 1 次抽取，屏幕上连闪 4 个窗口。本模块给出统一的隐藏参数，**非 Windows 返回 `{}`**，所以调用方无需平台分支：
+
+```python
+subprocess.run(cmd, capture_output=True, timeout=30, **hidden_kwargs())
+```
+
+| 函数 | 描述 | 参数 | 返回值 |
+|---|---|---|---|
+| `hidden_kwargs()` | 返回让子进程不显窗口的 `subprocess` 关键字参数：`creationflags=CREATE_NO_WINDOW` + `startupinfo`（`STARTF_USESHOWWINDOW` / `SW_HIDE`）；两者同时给，因为部分第三方启动器会忽略创建标志。非 Windows 返回 `{}`；属性缺失时逐项降级、绝不抛异常 | 无 | `dict[str, Any]` |
+
+消费位置：`src/media/video.py:probe_duration()`、`src/media/video.py:extract_frames()`、`src/voice/decoder.py:SilkDecoder._decode_amr()`。
+
 ### 2.33 `src/web/server.py` (核心 API 模块)
 
 | 函数 | 描述 | 参数 | 返回值 |
@@ -927,6 +941,7 @@ todo_delete_keywords: list[str] = [
 | `Article.to_prompt_block(max_text=1800)` | 单篇渲染：`[链接正文] 标题 — URL` + 正文 | `Article` | `str` |
 | `Article.video_urls` (字段) | 页内视频地址元组（`masterUrl` 优先）——**必须取自同一次响应**：小红书视频笔记第二次请求会退化成 23 KB 空壳，事后回查会静默丢掉每个视频 | `Article` | `tuple[str, ...]` |
 | `_video_urls(page)` | 从刚抓到的页面里抽媒体地址；函数内导入 `src.media.video`（`video` 反向依赖本模块的 `is_public_url`，模块级导入会成环）；无 ffmpeg 也照常记录 | `page: str` | `list[str]` |
+| `_judge_page(url, page, raw_len, content_type)` | 判定页面是否可读：非文本 → `non-textual`；验证墙/空壳 → `blocked`；正文够长则成 `Article`；**正文不足 `_MIN_USABLE_TEXT` 但页内有视频地址**时，返回 `text=""` 的纯视频 `Article`（只喂抽帧链路，`format_link_context` 会跳过空正文）；否则 `stub`/`empty` | 见参数 | `tuple[Article \| None, str]` |
 | `clear_cache()` | 清空页面缓存（测试用） | 无 | `None` |
 
 重定向经 `_GuardedRedirectHandler` 逐跳复检（公网 URL 可 302 到 `127.0.0.1`），链长上限 3。

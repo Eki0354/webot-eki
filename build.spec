@@ -132,6 +132,9 @@ a = Analysis(
         'src.todo', 'src.todo.store', 'src.todo.handler',
         'src.nickname', 'src.admin', 'src.fun',
         'src.utils', 'src.utils.logging_config',
+        # Hides the console window of every ffmpeg child.  Imported by
+        # src.media.video (lazy) and src.voice.decoder.
+        'src.utils.subprocess_win',
         'dotenv', 'anthropic', 'openai', 'pydantic',
         'uiautomation',
         'webview', 'webview.platforms', 'webview.platforms.edgechromium',

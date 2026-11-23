@@ -1069,17 +1069,32 @@ def _judge_page(
         )
         return None, "blocked"
 
-    if text:
-        if len(text) < _MIN_USABLE_TEXT:
-            logger.warning(
-                "Link skipped: only %d chars in %s — that is a stub, "
-                "not an article", len(text), url[:80],
-            )
-            return None, "stub"
+    if text and len(text) >= _MIN_USABLE_TEXT:
         return Article(
             url=url, title=title, text=text,
             video_urls=tuple(_video_urls(page)),
         ), ""
+
+    # Too little prose to call an article — but a video *note* often ships
+    # exactly that: a title, a caption of a few characters and the clip's
+    # address.  Dropping the page here used to throw the address away with
+    # it, so a shared clip that the site describes in one line could never
+    # be sampled.  The Article carries no text (``format_link_context``
+    # skips empty bodies) and only feeds the frame path.
+    video_urls = tuple(_video_urls(page))
+    if video_urls:
+        logger.info(
+            "Link has a video address but only %d chars of text: %s "
+            "(%d candidate(s))", len(text), url[:80], len(video_urls),
+        )
+        return Article(url=url, title=title, text="", video_urls=video_urls), ""
+
+    if text:
+        logger.warning(
+            "Link skipped: only %d chars in %s — that is a stub, "
+            "not an article", len(text), url[:80],
+        )
+        return None, "stub"
 
     logger.warning(
         "Link skipped: no readable body in %s (%d bytes, content-type=%s)",

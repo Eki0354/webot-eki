@@ -1120,6 +1120,60 @@ class MobileRetryTests(unittest.TestCase):
         self.assertEqual(len(asked), 2)
 
 
+class VideoOnlyPageTests(unittest.TestCase):
+    """A clip with almost no prose must still reach the frame sampler.
+
+    Reported live: the bot answered "就看得到标题，视频本身加载不出来" for a
+    note whose caption is one line.  ``_judge_page`` used to reject any page
+    under ``_MIN_USABLE_TEXT`` as a stub, which threw the media address away
+    along with the (nonexistent) article body — so no frames were ever
+    sampled.  A page that names a video is now kept as a video-only Article.
+    """
+
+    _URL = "https://www.xiaohongshu.com/discovery/item/6b0348dc000000001b01c79d"
+    _PAGE = (
+        "<html><head><title>随手拍的一段</title></head><body>"
+        "<p>今天随手拍的一段</p>"
+        '<script>window.__INITIAL_STATE__ = {"masterUrl":'
+        ' "https:\\u002F\\u002Fcdn.example.com\\u002Fa.mp4?sign=1"}'
+        '</script></body></html>'
+    )
+
+    def setUp(self):
+        from src.media import link_fetcher
+
+        self.fetcher = link_fetcher
+        link_fetcher.clear_cache()
+        self.addCleanup(link_fetcher.clear_cache)
+        original_public = link_fetcher.is_public_url
+        link_fetcher.is_public_url = lambda url, **kw: True
+        self.addCleanup(setattr, link_fetcher, "is_public_url", original_public)
+
+    def _serve(self, page: str):
+        original = self.fetcher._build_opener
+        self.fetcher._build_opener = lambda host="": type(
+            "Opener", (), {"open": lambda *a, **k: _FakeResponse(page)}
+        )()
+        self.addCleanup(setattr, self.fetcher, "_build_opener", original)
+
+    def test_short_caption_with_a_video_address_is_kept(self):
+        self._serve(self._PAGE)
+        article = self.fetcher.fetch_article(self._URL)
+        self.assertIsNotNone(article)
+        self.assertEqual(article.title, "随手拍的一段")
+        # No prose means no [链接正文] block; the frames are the whole answer.
+        self.assertEqual(article.text, "")
+        self.assertEqual(
+            article.video_urls, ("https://cdn.example.com/a.mp4?sign=1",)
+        )
+
+    def test_short_page_without_a_video_is_still_a_stub(self):
+        self._serve(
+            "<html><head><title>某站</title></head><body><p>短。</p></body></html>"
+        )
+        self.assertIsNone(self.fetcher.fetch_article(self._URL))
+
+
 class PromptDocumentationTests(unittest.TestCase):
     """The prompt must mention the block the code now inserts."""
 

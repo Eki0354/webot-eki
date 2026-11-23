@@ -38,6 +38,7 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
+from ..utils.subprocess_win import hidden_kwargs
 from .link_fetcher import is_public_url
 
 logger = logging.getLogger(__name__)
@@ -303,6 +304,9 @@ def probe_duration(video: Path, *, ffmpeg: Optional[str] = None) -> float:
         proc = subprocess.run(
             [exe, "-hide_banner", "-i", str(video)],
             capture_output=True, timeout=_PROBE_TIMEOUT_SEC,
+            # The packaged bot has no console of its own, so Windows would
+            # give this child a fresh black window on screen.
+            **hidden_kwargs(),
         )
     except (OSError, subprocess.SubprocessError):
         logger.debug("ffmpeg probe failed for %s", video, exc_info=True)
@@ -368,6 +372,7 @@ def extract_frames(
                     str(dest),
                 ],
                 capture_output=True, timeout=_FFMPEG_TIMEOUT_SEC,
+                **hidden_kwargs(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             logger.warning(

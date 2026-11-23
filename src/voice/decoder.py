@@ -14,6 +14,8 @@ import wave
 from pathlib import Path
 from typing import Optional
 
+from ..utils.subprocess_win import hidden_kwargs
+
 logger = logging.getLogger(__name__)
 
 # WeChat SILK sample rate (standard for WeChat voice messages)
@@ -126,6 +128,9 @@ class SilkDecoder:
                 capture_output=True,
                 check=True,
                 timeout=10,
+                # No console window should flash up when a voice message is
+                # decoded; see src/utils/subprocess_win.py.
+                **hidden_kwargs(),
             )
         except FileNotFoundError:
             raise DecodeError("ffmpeg not found — install ffmpeg to decode AMR files")
