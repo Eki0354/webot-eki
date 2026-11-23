@@ -66,6 +66,15 @@ a = Analysis(
         (str(PROJECT_ROOT / 'native' / 'windows' / 'VCRUNTIME140.dll'), 'native/windows'),
         (str(PROJECT_ROOT / 'native' / 'windows' / 'VCRUNTIME140_1.dll'), 'native/windows'),
         (str(PROJECT_ROOT / 'native' / 'windows' / 'wx_key.dll'), 'native/windows'),
+        # NOTE: native/windows/ffmpeg.exe is deliberately NOT listed here.
+        # It is a 121 MB binary and embedding it would grow the EXE from ~56 MB
+        # to ~180 MB for a feature (shared-video frame sampling) that the
+        # reply path only touches when someone asks about a video link.
+        # src/media/video.py instead looks for it *beside* the EXE
+        # (dist/native/windows/ffmpeg.exe); copy it there after packing:
+        #   cp native/windows/ffmpeg.exe dist/native/windows/
+        # Without it the bot degrades to the text-only answer, which is the
+        # same trade-off as voice recognition.
     ],
     datas=[
         ('ui/dist', 'ui/dist'),
@@ -100,6 +109,10 @@ a = Analysis(
         'src.media.backfill',
         'src.media.dat_decrypt', 'src.media.wxgf',
         'src.media.image', 'src.media.keys', 'src.media.link_fetcher',
+        # Frame sampling.  Imported lazily inside MediaPipeline.describe_video
+        # and link_fetcher._video_urls, so the static scan cannot see it;
+        # without this line the frozen EXE silently answers "看不到视频".
+        'src.media.video',
         'zstandard',
         # AES-128-ECB for the .dat image container.  PyAV (HEVC) is
         # deliberately excluded below: wxgf images then degrade to the

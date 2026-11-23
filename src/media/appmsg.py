@@ -44,6 +44,15 @@ _APPMSG_LINK_TYPE = "5"
 #: a bare link and asks about it, so this payload must be read too.
 _APPMSG_TEXT_TYPE = 1
 
+#: ``localType`` of an appmsg — a link, video, file or mini-program card.
+#: A reply that quotes such a card reports *this* type in ``<refermsg>``, and
+#: the card's own numbering (``5`` = link, ``4`` = video …) lives inside the
+#: quoted ``<content>``.  Checking only the inner numbering made every quoted
+#: card look unquotable: the payload was dropped and the question reached the
+#: model with no title and no URL at all, so it could only answer that it saw
+#: nothing.  Measured on a Xiaohongshu video share.
+_APPMSG_LOCAL_TYPE = 49
+
 #: Label used when the message quotes another message.
 _QUOTE_LABEL = "[引用]"
 
@@ -212,14 +221,51 @@ def _quoted_text_summary(content: str) -> str:
     return " ".join(parts) if len(parts) > 1 else ""
 
 
+def _quoted_card_summary(content: str) -> str:
+    """One-line summary of a quoted appmsg card (link, video, file …).
+
+    The card's *own* ``<type>`` picks the label and its ``<title>`` / ``<url>``
+    carry the content.  Both live inside the quoted payload, which may be a
+    bare ``<appmsg>`` or wrapped in a whole ``<msg>`` block — the search is
+    unanchored, so either shape works.
+
+    Returns:
+        ``"[链接] 标题 URL"`` (or the card's own label), or "" when the
+        payload carries neither a title nor a URL.
+    """
+    if not content:
+        return ""
+    type_match = _APPTYPE_RE.search(content)
+    label = _APPMSG_LABELS.get(
+        type_match.group(1) if type_match else "", _DEFAULT_LABEL
+    )
+
+    title_match = _TITLE_RE.search(content)
+    title = _clean(title_match.group(1) if title_match else "")
+    url = appmsg_url(content)
+
+    parts = [label]
+    if title:
+        parts.append(title)
+    if url:
+        parts.append(url)
+    return " ".join(parts) if len(parts) > 1 else ""
+
+
 def _quoted_summary(xml: str) -> str:
     """One-line summary of the message a reply quotes.
 
-    Links and plain text are both summarised: quoting a shared article card
-    and quoting a pasted URL are the same question to the person asking.
+    Links, cards and plain text are all summarised: quoting a shared article
+    card and quoting a pasted URL are the same question to the person asking.
     A quoted image is handled earlier by :meth:`MediaPipeline._describe_quoted`,
     and the remaining kinds carry nothing the model can use — inventing a
     label for them would be worse than saying nothing.
+
+    A card is reported by the reply as ``<refermsg><type>49</type>`` (the
+    appmsg envelope), not by the card's own numbering, which sits *inside*
+    the quoted payload.  Accepting only the inner numbering is what made a
+    quoted Xiaohongshu video share reduce to the sender's question alone —
+    title and URL both dropped, so the model could only say it saw nothing.
 
     Returns:
         ``"[链接] 标题 URL"`` for a quoted card, ``"[原文] 文本 URL"`` for a
@@ -237,18 +283,10 @@ def _quoted_summary(xml: str) -> str:
     if kind == _APPMSG_TEXT_TYPE:
         return _quoted_text_summary(content)
 
-    if kind != int(_APPMSG_LINK_TYPE):
-        return ""
+    if kind in (_APPMSG_LOCAL_TYPE, int(_APPMSG_LINK_TYPE)):
+        return _quoted_card_summary(content)
 
-    title_match = _TITLE_RE.search(content)
-    title = _clean(title_match.group(1) if title_match else "")
-    url = appmsg_url(content)
-    parts = [_APPMSG_LABELS[_APPMSG_LINK_TYPE]]
-    if title:
-        parts.append(title)
-    if url:
-        parts.append(url)
-    return " ".join(parts) if len(parts) > 1 else ""
+    return ""
 
 
 def reduce_appmsg(xml: str) -> Optional[str]:

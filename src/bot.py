@@ -328,6 +328,17 @@ class Bot:
         except Exception as e:
             logger.warning("Media backfill unavailable: %s", e)
 
+        # A shared *video* link needs the same backend-owned pipeline: the
+        # page gives its text, but "你能看到这个视频吗" is about the picture,
+        # which has to be sampled from the clip.  The provider is lazy, so a
+        # media-disabled install builds nothing.
+        try:
+            router.attach_media_pipeline(
+                getattr(backend, "media_pipeline", lambda: None)
+            )
+        except Exception as e:
+            logger.warning("Video description unavailable: %s", e)
+
         # Register backend with web server for stop/restart (explicit
         # API — no monkey-patching needed).
         try:

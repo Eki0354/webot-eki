@@ -28,6 +28,7 @@ What is supported, and why:
 """
 
 import logging
+import shutil
 from typing import Callable, Optional
 
 from src.config import PROJECT_ROOT, resolve_wechat_data_dir
@@ -51,6 +52,12 @@ logger = logging.getLogger(__name__)
 LOCAL_TYPE_IMAGE = 3
 LOCAL_TYPE_EMOJI = 47
 LOCAL_TYPE_SYSTEM = 10000
+
+#: Candidate media addresses tried per clip.  A page usually lists the same
+#: rendition on two CDNs; the first is what the site itself plays, the second
+#: is worth one retry when it refuses the request.  More than that only adds
+#: latency to a reply.
+_MAX_VIDEO_SOURCES = 2
 
 
 class MediaPipeline:
@@ -84,7 +91,7 @@ class MediaPipeline:
             self._create_image(config) if self._vision else None
         )
         self._stats = {
-            "emoji": 0, "image": 0, "described": 0, "failed": 0,
+            "emoji": 0, "image": 0, "video": 0, "described": 0, "failed": 0,
         }
         if self._vision_on:
             logger.info(
@@ -149,6 +156,73 @@ class MediaPipeline:
                 return quoted
             return self._reduce_binary(msg, local_type)
 
+        return None
+
+    def describe_video(
+        self, video_urls: tuple[str, ...] | list[str], page_url: str,
+    ) -> Optional[str]:
+        """Sample a shared clip's frames and describe what it shows.
+
+        A chat completion receives text only, so "你能看到这个视频吗" used to
+        be answered with "看不到" even when the page's media address was
+        right there.  The frames are the only thing vision can look at, and
+        they go to the model in one request so it narrates the clip rather
+        than three unrelated stills.
+
+        Every step degrades to None instead of raising: this runs inside the
+        reply path, and a clip that will not download must not cost the
+        answer.
+
+        Args:
+            video_urls: Candidate media addresses, best first (from
+                :class:`~src.media.link_fetcher.Article` — they must come
+                from the response that carried the page text).
+            page_url: The page they were found on; used as referer.
+
+        Returns:
+            A short description of the clip, or None when there is no
+            decoder, nothing downloads, or the model returns no text.
+        """
+        if not self._vision or not self._vision.available:
+            return None
+        try:
+            # Imported lazily: the module locates ffmpeg at first use, and a
+            # build without the binary must still work for text links.
+            from .video import available, frames_from_urls
+        except Exception:
+            logger.debug("video module unavailable", exc_info=True)
+            return None
+        if not available():
+            return None
+
+        urls = [u for u in video_urls if u][:_MAX_VIDEO_SOURCES]
+        if not urls:
+            return None
+
+        self._stats["video"] += 1
+        frames = frames_from_urls(urls, page_url)
+        if not frames:
+            self._stats["failed"] += 1
+            logger.warning(
+                "MediaPipeline: video frames unavailable for %s", page_url[:80],
+            )
+            return None
+
+        try:
+            description = self._vision.describe_frames(frames)
+        finally:
+            # ``frames_from_urls`` hands over a per-call temp directory; the
+            # caller owns it (see its note).
+            shutil.rmtree(frames[0].parent, ignore_errors=True)
+
+        if description:
+            self._stats["described"] += 1
+            return description
+        self._stats["failed"] += 1
+        logger.warning(
+            "MediaPipeline: vision gave no text for video frames "
+            "(model=%s): %s", self._vision_model(), self._vision_error(),
+        )
         return None
 
     def stats(self) -> dict:

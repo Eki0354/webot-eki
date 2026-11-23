@@ -139,6 +139,7 @@ grep "文件名" CODEBASE_REFERENCE.md
 | `MEDIA_VISION_ENABLED` | `bool` | `False` | `src/config.py` | `src/media/pipeline.py:MediaPipeline.__init__()` |
 | `MEDIA_VISION_MODEL` | `str` | `""` | `src/config.py` | `src/media/pipeline.py:MediaPipeline._create_vision()` |
 | `LINK_FETCH_ENABLED` | `bool` | `True` | `src/config.py` | `src/router.py:_link_context()`、`src/web/server.py:_fetch_link_context()` |
+| `FFMPEG_PATH` | `str` | `""` | 环境变量（不经 `config.py`） | `src/media/video.py:_candidate_binaries()`；指定 `ffmpeg.exe` 绝对路径，优先于随包位置 |
 | `IMAGE_XOR_KEY` | `str` | `""` | `src/config.py` | `src/media/keys.py:resolve_image_keys()` |
 | `IMAGE_AES_KEY` | `str` | `""` | `src/config.py` | `src/media/keys.py:resolve_image_keys()` |
 | `IMAGE_KEY_PROVIDER` | `str` | `"env"` | `src/config.py` | `src/media/keys.py:resolve_image_keys()` |
@@ -779,6 +780,7 @@ todo_delete_keywords: list[str] = [
 | `VisionClient.describe(image_path, prompt)` | 返回一句话中文描述；请求形状按需协商（截断→关推理，端点拒绝 `thinking`→永久降级） | `image_path: Path, prompt: str` | `str \| None` |
 | `VisionClient._attempts()` | 依次要尝试的 `(max_tokens, disable_thinking)` 组合 | 无 | `list[tuple[int, bool]]` |
 | `VisionClient._ask(data_url, prompt, max_tokens, disable_thinking)` | 发一次请求，返回 `(文本, 错误码)`；错误码为 `truncated` / `rejected-thinking` / 具体异常 | 见参数 | `tuple[str\|None, str]` |
+| `VisionClient.describe_frames(frames, prompt=FRAME_PROMPT)` | 把一短视频的若干帧**一次性**送进同一请求，让模型叙述整段的动作，而不是三张互不相干的静图；`FRAME_PROMPT` 说明这些画面来自同一段视频 | `frames: list[Path], prompt: str` | `str \| None` |
 
 模块级常量：
 
@@ -850,11 +852,36 @@ todo_delete_keywords: list[str] = [
 | `MediaPipeline.__init__(config)` | 初始化媒体管道 | `config` | `None` |
 | `MediaPipeline.process(msg, chat_id="")` | 媒体消息 → 文本（占位符由调用方兜底）；图片需 `chat_id` 定位目录；引用图片走 `_describe_quoted()` | `msg: dict, chat_id: str` | `str \| None` |
 | `MediaPipeline._describe_quoted(msg, chat_id)` | 引用消息（`<refermsg>`）里被引用的图片：用其 `<img>` 载荷复用解密+视觉，输出「用户提问（引用的图片：…）」；非图片引用返回 None | `msg: dict, chat_id: str` | `str \| None` |
-| `MediaPipeline.stats()` | 计数器快照（`emoji`/`image`/`described`/`failed`） | 无 | `dict` |
+| `MediaPipeline.describe_video(video_urls, page_url)` | 抽帧描述分享视频：「你能看到这个视频吗」在只收文本的 chat completion 里原本只能答「看不到」；候选地址取自同一次响应的 `Article.video_urls`（`page_url` 作 Referer），3 帧一次性送给视觉模型让它叙述整段而非三个孤立画面；任一步失败（无 ffmpeg / 下载失败 / 模型无输出）都返回 None，绝不抛异常 | `video_urls: tuple[str, ...] \| list[str], page_url: str` | `str \| None` |
+| `MediaPipeline.stats()` | 计数器快照（`emoji`/`image`/`video`/`described`/`failed`） | 无 | `dict` |
 | `MediaPipeline.set_emoji_url_lookup(lookup)` | 安装表情下载地址回查回调（精简表情体没有 `cdnurl` 时用） | `lookup: Callable[[str, str], str\|None] \| None` | `None` |
 | `MediaPipeline.remember_emoji_urls(entries)` | 把采集到的 `md5 → cdnurl` 交给 `EmojiStore` 持久化 | `entries: dict[str, str]` | `None` |
 | `MediaPipeline._vision_model()` | 日志用模型名；无视觉客户端时返回 `"?"` | 无 | `str` |
 | `MediaPipeline._vision_error()` | 最近一次视觉失败的具原因文本（`vision disabled` / `VisionClient.last_error`），让 WARNING 说得清**为什么**没描述出来 | 无 | `str` |
+
+`src/media/video.py` — 分享视频抽帧（子进程调用 `ffmpeg.exe`，不新增 Python 依赖）：
+
+聊天接口只收文本，「你能看到这个视频吗」原本只能答「看不到」。本模块把分享链接里的视频下载下来、抽几帧交给视觉模型。**ffmpeg 是可选的**：找不到二进制时 `available()` 返回 False，调用方降级为纯文字回答。
+
+| 函数 | 描述 | 参数 | 返回值 |
+|---|---|---|---|
+| `ffmpeg_path()` | 定位可执行的 `ffmpeg.exe`：`FFMPEG_PATH` → 冻结包的 `_MEIPASS`/EXE 旁 `native/windows/` → 仓库 `native/windows/` → `PATH`。结果（含失败）只算一次 | 无 | `str \| None` |
+| `available()` | 能否抽帧（等价于找到了 ffmpeg） | 无 | `bool` |
+| `video_urls_from_page(page, limit=4)` | 从页面抽视频地址，`masterUrl` 优先；去重、只留 http(s)、按 pattern 顺序决定优先级 | `page: str, limit: int` | `list[str]` |
+| `download_video(url, dest_dir, referer="", max_bytes=_MAX_VIDEO_BYTES)` | 下载到 `dest_dir/clip.mp4`；先过 `is_public_url()`，超 `max_bytes` 或小于 1 KB 即丢弃；失败清理残留。多个 CDN 拒绝无 Referer 的请求，故需传来源页 | 见参数 | `Path \| None` |
+| `probe_duration(video, ffmpeg=None)` | 读 `Duration:` 得片长；读不出返回 `0.0`（不算错误，调用方改采开头几秒） | `video: Path, ffmpeg: str \| None` | `float` |
+| `frame_timestamps(duration, count)` | 把片长切成 count 等份、各取中点；时长未知时采开头 | `duration: float, count: int` | `list[float]` |
+| `extract_frames(video, dest_dir, count=DEFAULT_FRAME_COUNT)` | 按时间点抽帧并压到 `_MAX_FRAME_WIDTH`(720)，JPEG 约 50–70 KB/帧 | 见参数 | `list[Path]` |
+| `frames_from_urls(urls, page_url, count=DEFAULT_FRAME_COUNT)` | 依次试候选地址：下载 → 抽帧 → 删掉大文件；成功即返回，全失败清掉临时目录返回 `[]`。**地址必须来自同一次响应**（二次请求小红书会退化成 23 KB 空壳） | 见参数 | `list[Path]` |
+| `frames_from_page(page, page_url, count=…)` | 从给定 HTML 抽地址再走 `frames_from_urls`（供已有页面正文的场景） | 见参数 | `list[Path]` |
+
+模块级常量：
+
+| 常量 | 值 | 说明 |
+|---|---|---|
+| `DEFAULT_FRAME_COUNT` | `3` | 送给视觉模型的帧数：够看出场景切换，又足够便宜 |
+| `_MAX_FRAME_WIDTH` | `720` | 上传前降采样宽度 |
+| `_MAX_VIDEO_BYTES` | `48 MB` | 传输上限，拒绝误标的巨型文件而卡住回复 |
 
 `src/media/backfill.py` — 历史媒体消息按需回填：
 
@@ -898,6 +925,8 @@ todo_delete_keywords: list[str] = [
 | `fetch_for_question(text, max_links=2, budget_sec=8)` | 抓取一个提问里的链接；整批共享一个截止时间（两个死链不会各耗一次超时） | `text: str` | `list[Article]` |
 | `format_link_context(articles)` | 渲染成 prompt 块，带 `[链接正文]` 标记与「直接据此回答，不要说你打不开」的指令 | `articles: list[Article]` | `str` |
 | `Article.to_prompt_block(max_text=1800)` | 单篇渲染：`[链接正文] 标题 — URL` + 正文 | `Article` | `str` |
+| `Article.video_urls` (字段) | 页内视频地址元组（`masterUrl` 优先）——**必须取自同一次响应**：小红书视频笔记第二次请求会退化成 23 KB 空壳，事后回查会静默丢掉每个视频 | `Article` | `tuple[str, ...]` |
+| `_video_urls(page)` | 从刚抓到的页面里抽媒体地址；函数内导入 `src.media.video`（`video` 反向依赖本模块的 `is_public_url`，模块级导入会成环）；无 ffmpeg 也照常记录 | `page: str` | `list[str]` |
 | `clear_cache()` | 清空页面缓存（测试用） | 无 | `None` |
 
 重定向经 `_GuardedRedirectHandler` 逐跳复检（公网 URL 可 302 到 `127.0.0.1`），链长上限 3。
@@ -2084,7 +2113,8 @@ MacHybridBackend
 | `dat_decrypt.py` | `src/media/dat_decrypt.py` | `.dat` 四段容器解析 (AES-128-ECB 头 + 明文 + XOR 尾) |
 | `wxgf.py` | `src/media/wxgf.py` | `wxgf`/HEVC 容器解包 (PyAV 可选) |
 | `keys.py` | `src/media/keys.py` | 图片密钥来源解析 (`env` / `file`) |
-| `vision.py` | `src/media/vision.py` | 图片描述 (OpenAI 兼容接口，请求形状按需协商) |
+| `vision.py` | `src/media/vision.py` | 图片/视频帧描述 (OpenAI 兼容接口，请求形状按需协商) |
+| `video.py` | `src/media/video.py` | 分享视频抽帧 (下载 + 外挂 ffmpeg.exe，可选依赖) |
 | `backfill.py` | `src/media/backfill.py` | 历史裸占位符按需重描述并写回 DB |
 
 #### 调用链
@@ -2121,11 +2151,39 @@ WcdbBackend._standardize(msg)
   └── 其他 BLOB（localType=1 文本、10000 系统、49-family appmsg、复合 localType）
         └── _try_media(msg) or _blob_text(msg)
               ├── 引用消息（appmsg 含 <refermsg>，localType 如 244813135921 = 57<<32|49）
-              │     └── _describe_quoted()：refermsg.type==3 时用其 <img> 载荷
-              │           → "[图片] …" → 输出「用户提问（引用的图片：…）」
+              │     ├── refermsg.type==47 或载荷含 <emoji> → 表情：复用 _describe_emoji()
+              │     ├── refermsg.type==3  → 用其 <img> 载荷 → "[图片] …"
+              │     └── refermsg.type==49(卡片) / 5(链接) / 1(纯文本)
+              │           → appmsg._quoted_card_summary() / _quoted_text_summary()
+              │             产出 "[引用] 用户的话 [链接] 标题 URL"（链接因此能进 _link_context）
+              │             输出「用户提问（引用的图片/表情包：…）」
               ├── appmsg XML  → "[链接] 标题 URL"（reduce_appmsg；引用则为 "[引用] 用户的话 [链接] 标题 URL"）
               ├── sysmsg XML  → None（丢弃）
               └── 纯文本      → 原文（"哈哈哈哈哈哈哈"）
+```
+
+链接 → 视频画面的另一条链（与上面的媒体归约并行，在构建 prompt 时触发）：
+
+```
+MessageRouter._handle_chat(msg, clean_content)
+  └── _link_context(clean_content)
+        ├── link_fetcher.fetch_for_question(text) → list[Article]
+        │     └── fetch_article(url) → _judge_page()
+        │           ├── extract_article(html) → (title, text)
+        │           ├── _blocked_marker(title, text) → 验证墙/空壳页则丢弃
+        │           └── Article(video_urls=_video_urls(page))
+        │                 └── video.video_urls_from_page(page) — masterUrl 优先
+        ├── format_link_context(articles) → "[链接正文] …" 块
+        └── _video_context(articles)
+              └── MediaPipeline.describe_video(article.video_urls, article.url)
+                    ├── video.available() → ffmpeg_path() 定位外挂 ffmpeg.exe
+                    ├── video.frames_from_urls(urls, page_url)
+                    │     ├── download_video(url, workdir, referer=page_url)
+                    │     │     └── is_public_url(url) 校验 + 48MB 上限
+                    │     ├── probe_duration(clip) → frame_timestamps()
+                    │     └── extract_frames(clip, workdir, count=3) → 720px JPEG
+                    ├── VisionClient.describe_frames(frames) — 3 帧同一请求
+                    └── shutil.rmtree(临时目录) → "[视频画面] 标题 — URL\n<描述>"
 ```
 
 #### 各类型支持状态
@@ -2290,7 +2348,10 @@ WCDB_KEY=
 # hiddenimports: 显式列出 src.* 各模块 + 第三方包 (dotenv/anthropic/openai/
 #   pydantic/webview/psutil/PIL/comtypes/uiautomation) + src.media 与 zstandard
 #   + Crypto (Crypto.Cipher.AES, 用于 .dat 图片头段 AES-128-ECB)
+#   + src.media.video (抽帧；ffmpeg.exe 本身不进包，见下)
 # 排除: faster_whisper, ctranslate2, numpy, onnxruntime, pysilk, tkinter, matplotlib, scipy
+# 注意: native/windows/ffmpeg.exe 刻意不 embed (121MB)，打包后手动复制到
+#       dist/native/windows/ffmpeg.exe；缺失时视频链路降级为纯文字回答
 ```
 
 `src/media` 与 `zstandard` 必须留在 `hiddenimports` 里：`MediaPipeline` 是在

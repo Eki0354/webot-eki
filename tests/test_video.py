@@ -1,0 +1,276 @@
+"""Reading a shared *video*: find its address, sample frames, describe the clip.
+
+Reported bug: a member quotes a Xiaohongshu video note and asks "你能看到这个
+视频吗".  The reply was "就看到个标题，视频本身加载不出来" — honest, because a
+chat completion receives text only and nothing ever turned the clip into
+something the model could look at.
+
+Two halves are pinned down here:
+
+* ``video_urls_from_page`` must find the media address in the *same* response
+  that carried the page text.  Measured on the real note: a second request
+  answers with a degraded 23 KB shell that has no ``masterUrl`` at all, so a
+  re-fetch silently loses every clip.
+* ``MediaPipeline.describe_video`` and ``Router._video_context`` must degrade
+  to "no picture" rather than raising, and the description has to end up in
+  the chat prompt with a label that stops the model from denying it saw it.
+
+No network, no ffmpeg, no AI calls: every boundary is patched.
+"""
+
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.media.video import frame_timestamps, video_urls_from_page
+from src.media.link_fetcher import Article
+
+
+#: The shape Xiaohongshu embeds: addresses escaped as ``\u002F``, in a JSON
+#: state block, with a low- and a high-bitrate rendition of the same clip.
+_XHS_PAGE = (
+    '<html><script>window.__INITIAL_STATE__ = {'
+    '"note": {"video": {"media": {"stream": {"h264": [{'
+    '"masterUrl": "http:\\u002F\\u002Fsns-video-v3.xhscdn.com\\u002Fstream\\u002Fa_259.mp4?sign=1&amp;t=2",'
+    '"backupUrl": "http:\\u002F\\u002Fsns-video-v3.xhscdn.com\\u002Fstream\\u002Fa_537.mp4?sign=3"'
+    '}]}}}}}</script></html>'
+)
+
+
+class VideoUrlExtractionTests(unittest.TestCase):
+    def test_escaped_addresses_are_unescaped(self):
+        urls = video_urls_from_page(_XHS_PAGE)
+        self.assertEqual(len(urls), 2)
+        self.assertTrue(urls[0].startswith("http://sns-video-v3.xhscdn.com/"))
+        # ``&amp;`` in markup is ``&`` in the query, or the request 404s.
+        self.assertIn("sign=1&t=2", urls[0])
+        self.assertNotIn("\\u002F", urls[0])
+
+    def test_master_url_comes_first(self):
+        """The rendition the site itself plays must lead the retry order."""
+        urls = video_urls_from_page(_XHS_PAGE)
+        self.assertIn("_259.mp4", urls[0])
+
+    def test_duplicates_are_dropped(self):
+        page = (
+            '<video src="https://cdn.example.com/a.mp4"></video>'
+            '<source src="https://cdn.example.com/a.mp4">'
+        )
+        self.assertEqual(
+            video_urls_from_page(page), ["https://cdn.example.com/a.mp4"]
+        )
+
+    def test_limit_is_honoured(self):
+        page = "".join(
+            f'<video src="https://cdn.example.com/{i}.mp4"></video>'
+            for i in range(6)
+        )
+        self.assertEqual(len(video_urls_from_page(page, limit=2)), 2)
+
+    def test_non_http_entries_are_skipped(self):
+        page = '<video src="blob:https://example.com/abc"></video>'
+        self.assertEqual(video_urls_from_page(page), [])
+
+    def test_empty_page_yields_nothing(self):
+        self.assertEqual(video_urls_from_page(""), [])
+
+
+class FrameTimestampTests(unittest.TestCase):
+    """Frames are spread across the clip, never bunched at a black fade-in."""
+
+    def test_moments_are_centred_in_equal_slices(self):
+        self.assertEqual(frame_timestamps(20.0, 3), [3.33, 10.0, 16.67])
+
+    def test_unknown_length_samples_the_opening(self):
+        self.assertEqual(frame_timestamps(0.0, 2), [0.5, 1.5])
+
+    def test_count_is_at_least_one(self):
+        self.assertEqual(len(frame_timestamps(10.0, 0)), 1)
+
+
+def _pipeline(vision=True):
+    from src.media.pipeline import MediaPipeline
+
+    config = MagicMock()
+    config.media_vision_enabled = vision
+    config.media_vision_model = ""
+    config.wechat_data_dir = ""
+    config.ai_backend = "deepseek"
+    config.deepseek_api_key = "sk-test"
+    config.deepseek_model = "deepseek-v4-flash"
+    config.deepseek_base_url = "https://api.deepseek.com"
+    config.image_xor_key = ""
+    config.image_aes_key = ""
+    config.image_key_provider = "env"
+    return MediaPipeline(config)
+
+
+_VIDEO_URLS = ("https://cdn.example.com/a.mp4",)
+
+
+class DescribeVideoTests(unittest.TestCase):
+    """Every failure must return None — this runs inside the reply path."""
+
+    def test_without_vision_there_is_nothing_to_ask(self):
+        self.assertIsNone(
+            _pipeline(vision=False).describe_video(_VIDEO_URLS, "https://x.com/p")
+        )
+
+    def test_missing_decoder_is_not_an_error(self):
+        pipeline = _pipeline()
+        with patch("src.media.video.available", return_value=False):
+            self.assertIsNone(
+                pipeline.describe_video(_VIDEO_URLS, "https://x.com/p")
+            )
+        self.assertEqual(pipeline.stats()["video"], 0)
+
+    def test_no_addresses_skips_the_download(self):
+        pipeline = _pipeline()
+        with patch("src.media.video.available", return_value=True):
+            self.assertIsNone(pipeline.describe_video((), "https://x.com/p"))
+
+    def test_undownloadable_clip_is_counted_and_reported(self):
+        pipeline = _pipeline()
+        with patch("src.media.video.available", return_value=True), \
+             patch("src.media.video.frames_from_urls", return_value=[]), \
+             patch("src.media.pipeline.logger"):
+            self.assertIsNone(
+                pipeline.describe_video(_VIDEO_URLS, "https://x.com/p")
+            )
+        stats = pipeline.stats()
+        self.assertEqual(stats["video"], 1)
+        self.assertEqual(stats["failed"], 1)
+
+    def test_frames_are_described_and_the_temp_dir_removed(self):
+        pipeline = _pipeline()
+        workdir = Path(tempfile.mkdtemp(prefix="webot_video_test_"))
+        frame = workdir / "frame_0.jpg"
+        frame.write_bytes(b"jpg")
+
+        with patch("src.media.video.available", return_value=True), \
+             patch("src.media.video.frames_from_urls", return_value=[frame]), \
+             patch.object(
+                 pipeline._vision, "describe_frames",
+                 return_value="一个女生在客厅里跳舞，然后镜头转向一屋子盒子。",
+             ):
+            text = pipeline.describe_video(_VIDEO_URLS, "https://x.com/p")
+
+        self.assertIn("跳舞", text)
+        self.assertEqual(pipeline.stats()["described"], 1)
+        # ``frames_from_urls`` hands the directory over; retaining it would
+        # leak a clip-sized temp dir per shared video.
+        self.assertFalse(workdir.exists())
+
+    def test_empty_model_answer_is_a_failure_not_a_crash(self):
+        pipeline = _pipeline()
+        workdir = Path(tempfile.mkdtemp(prefix="webot_video_test_"))
+        frame = workdir / "frame_0.jpg"
+        frame.write_bytes(b"jpg")
+
+        with patch("src.media.video.available", return_value=True), \
+             patch("src.media.video.frames_from_urls", return_value=[frame]), \
+             patch.object(pipeline._vision, "describe_frames",
+                          return_value=None), \
+             patch("src.media.pipeline.logger"):
+            self.assertIsNone(
+                pipeline.describe_video(_VIDEO_URLS, "https://x.com/p")
+            )
+        self.assertEqual(pipeline.stats()["failed"], 1)
+        self.assertFalse(workdir.exists())
+
+
+class RouterVideoContextTests(unittest.TestCase):
+    """The description has to reach the prompt labelled as already seen."""
+
+    def _router(self, pipeline=None, provider=None):
+        from src.router import MessageRouter
+
+        class _Cfg:
+            link_fetch_enabled = True
+
+        router = MessageRouter.__new__(MessageRouter)
+        router._config = _Cfg()
+        router._media_pipeline_provider = (
+            provider if provider is not None else (lambda: pipeline)
+        )
+        return router
+
+    def test_no_pipeline_attached_is_quiet(self):
+        from src.router import MessageRouter
+
+        router = MessageRouter.__new__(MessageRouter)
+        router._config = type("C", (), {"link_fetch_enabled": True})()
+        self.assertEqual(router._video_context([Article(
+            url="https://x.com/p", title="t", text="x",
+            video_urls=_VIDEO_URLS,
+        )]), "")
+
+    def test_text_only_article_never_calls_the_pipeline(self):
+        pipeline = MagicMock()
+        pipeline.describe_video.side_effect = AssertionError("must not sample")
+        router = self._router(pipeline)
+        self.assertEqual(
+            router._video_context([Article(url="https://x.com/p", title="t", text="x")]),
+            "",
+        )
+
+    def test_description_is_labelled_as_already_watched(self):
+        pipeline = MagicMock()
+        pipeline.describe_video.return_value = "一段 20 秒的搞笑短片。"
+        router = self._router(pipeline)
+
+        block = router._video_context([Article(
+            url="https://x.com/p", title="视频标题", text="正文",
+            video_urls=_VIDEO_URLS,
+        )])
+
+        self.assertIn("[视频画面]", block)
+        self.assertIn("视频标题", block)
+        self.assertIn("一段 20 秒的搞笑短片。", block)
+        # Without this instruction the model denies seeing it — the bug.
+        self.assertIn("不要说你打不开视频", block)
+
+    def test_failure_degrades_to_empty(self):
+        pipeline = MagicMock()
+        pipeline.describe_video.side_effect = RuntimeError("ffmpeg died")
+        router = self._router(pipeline)
+        with patch("src.router.logger"):
+            self.assertEqual(
+                router._video_context([Article(
+                    url="https://x.com/p", title="t", text="x",
+                    video_urls=_VIDEO_URLS,
+                )]),
+                "",
+            )
+
+    def test_link_context_carries_text_and_frames_together(self):
+        """The copy answers "讲了啥", the frames answer "能看到视频吗"."""
+        pipeline = MagicMock()
+        pipeline.describe_video.return_value = "画面里在展示一屋子游戏机。"
+        router = self._router(pipeline)
+
+        from src.media import link_fetcher
+
+        article = Article(
+            url="https://x.com/p", title="视频笔记", text="正文内容。" * 20,
+            video_urls=_VIDEO_URLS,
+        )
+        original = link_fetcher.fetch_for_question
+        link_fetcher.fetch_for_question = lambda text, **kw: [article]
+        try:
+            block = router._link_context("https://x.com/p 这是啥")
+        finally:
+            link_fetcher.fetch_for_question = original
+
+        self.assertIn("[链接正文]", block)
+        self.assertIn("[视频画面]", block)
+        self.assertIn("画面里在展示一屋子游戏机。", block)
+
+
+if __name__ == "__main__":
+    unittest.main()

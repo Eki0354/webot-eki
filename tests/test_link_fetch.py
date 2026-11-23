@@ -1004,6 +1004,122 @@ class BlockedPageTests(unittest.TestCase):
         self.assertEqual(wall, "环境异常")
 
 
+class ScriptOnlyShellTests(unittest.TestCase):
+    """A JavaScript shell still carries the note in its meta tags."""
+
+    def test_og_description_is_the_body_when_there_is_no_prose(self):
+        from src.media.link_fetcher import extract_article
+
+        html = (
+            '<html><head><title>小红书 - 你的生活兴趣社区</title>'
+            '<meta property="og:title" content="GTA6教会我最重要的一件事就是 - 小红书">'
+            '<meta property="og:description" content="'
+            '一段关系里对方的人格底色很重要。当外界环境极度高压、常规道德和'
+            '社会规则统统失效时，一个人最真实的人格底色就会彻底暴露出来。'
+            '好的搭档，是一起找出路，不是一起往深渊加速。">'
+            '</head><body><div id="app"></div><script>render()</script></body></html>'
+        )
+        title, text = extract_article(html)
+        self.assertEqual(title, "GTA6教会我最重要的一件事就是 - 小红书")
+        self.assertIn("人格底色很重要", text)
+        self.assertIn("一起找出路", text)
+
+    def test_real_prose_beats_og_description(self):
+        """The meta summary must not replace an article we can actually read."""
+        from src.media.link_fetcher import extract_article
+
+        html = (
+            "<html><head>"
+            '<meta property="og:description" content="这是站点摘要，不是正文。">'
+            "</head><body><p>真正的正文第一段，讲的是性能提升 30%。</p></body></html>"
+        )
+        _, text = extract_article(html)
+        self.assertIn("真正的正文第一段", text)
+        self.assertNotIn("站点摘要", text)
+
+
+class MobileRetryTests(unittest.TestCase):
+    """Some sites serve a shell to desktops and the content to phones.
+
+    Measured on a Xiaohongshu video share: the desktop request answered 37 KB
+    with no title and no body, the iPhone request answered 71 KB with both.
+    Treating the first answer as final is what made the bot say it could not
+    see the video at all.
+    """
+
+    _SHELL = (
+        '<html><head><title>小红书 - 你的生活兴趣社区</title></head>'
+        '<body><div id="app"></div><script>render()</script></body></html>'
+    )
+    _MOBILE = (
+        '<html><head><title>GTA6教会我最重要的一件事就是 - 小红书</title>'
+        '<meta property="og:description" content="'
+        '一段关系里对方的人格底色很重要。当外界环境极度高压、常规道德和'
+        '社会规则统统失效时，一个人最真实的人格底色就会彻底暴露出来。'
+        '好的搭档，是一起找出路，不是一起往深渊加速。">'
+        '</head><body></body></html>'
+    )
+    _URL = "https://www.xiaohongshu.com/discovery/item/6b0348dc000000001b01c79d"
+
+    def setUp(self):
+        from src.media import link_fetcher
+
+        self.fetcher = link_fetcher
+        link_fetcher.clear_cache()
+        self.addCleanup(link_fetcher.clear_cache)
+        original_public = link_fetcher.is_public_url
+        link_fetcher.is_public_url = lambda url, **kw: True
+        self.addCleanup(setattr, link_fetcher, "is_public_url", original_public)
+
+    def _serve(self, pages):
+        """Serve *pages* keyed by User-Agent and record which were asked."""
+        asked = []
+        original = self.fetcher._request_page
+
+        def _fake(url, *, ua, timeout, host=""):
+            asked.append(ua)
+            page = pages[ua]
+            return page, len(page), "text/html; charset=utf-8"
+
+        self.fetcher._request_page = _fake
+        self.addCleanup(setattr, self.fetcher, "_request_page", original)
+        return asked
+
+    def test_desktop_shell_is_retried_as_a_phone(self):
+        asked = self._serve({
+            self.fetcher._UA: self._SHELL,
+            self.fetcher._MOBILE_UA: self._MOBILE,
+        })
+        article = self.fetcher.fetch_article(self._URL)
+        self.assertIsNotNone(article)
+        self.assertIn("人格底色很重要", article.text)
+        self.assertEqual(asked, [self.fetcher._UA, self.fetcher._MOBILE_UA])
+
+    def test_readable_desktop_page_costs_one_request(self):
+        asked = self._serve({
+            self.fetcher._UA: (
+                "<html><head><title>真文章</title></head><body><div id='js_content'>"
+                "<p>第一段：这篇文章讲的是推理成本的变化，性能提升 30%，延迟更稳定，"
+                "适合在群里做实时回复。</p>"
+                "<p>第二段：部署时需要注意证书链、超时、编码和内存占用这几个常见坑，"
+                "否则线上会悄悄失败。</p>"
+                "</div></body></html>"
+            ),
+            self.fetcher._MOBILE_UA: self._MOBILE,
+        })
+        article = self.fetcher.fetch_article(self._URL)
+        self.assertIsNotNone(article)
+        self.assertEqual(asked, [self.fetcher._UA])
+
+    def test_mobile_retry_that_is_also_empty_still_fails_honestly(self):
+        asked = self._serve({
+            self.fetcher._UA: self._SHELL,
+            self.fetcher._MOBILE_UA: self._SHELL,
+        })
+        self.assertIsNone(self.fetcher.fetch_article(self._URL))
+        self.assertEqual(len(asked), 2)
+
+
 class PromptDocumentationTests(unittest.TestCase):
     """The prompt must mention the block the code now inserts."""
 

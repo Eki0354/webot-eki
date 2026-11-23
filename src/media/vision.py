@@ -52,6 +52,16 @@ PROMPT = (
     "像跟朋友说话那样，不要罗列元素，不要加引号。"
 )
 
+#: Prompt for a shared video, described from frames sampled across the clip.
+#: The frames are the *only* thing the model sees, so it must be told they
+#: are ordered stills of one clip — otherwise it narrates three unrelated
+#: pictures ("第一张……第二张……") instead of what the video shows.
+FRAME_PROMPT = (
+    "这是群聊里分享的一段短视频，按时间顺序抽了几帧。"
+    "用两三句中文说说这段视频大概拍了什么、在讲什么事，"
+    "像跟朋友转述那样，不要把每帧分开描述，不要罗列元素，不要加引号。"
+)
+
 #: Error text meaning "this endpoint does not accept the ``thinking`` field".
 #: Matching stays loose: providers word it differently ("unknown parameter",
 #: "extra fields not permitted", "unrecognized request argument"), but all of
@@ -153,10 +163,43 @@ class VisionClient:
         if not data_url:
             self.last_error = f"not a readable image: {image_path.name}"
             return None
+        return self._describe([data_url], prompt)
+
+    def describe_frames(
+        self, frames: list[Path], prompt: str = FRAME_PROMPT
+    ) -> Optional[str]:
+        """Describe a clip from frames sampled across it, or None.
+
+        The frames go in *one* request: the model has to see them together to
+        say what happens over the clip, and three separate calls would cost
+        three times as much to produce three disjoint captions.
+
+        Args:
+            frames: Ordered stills, first to last.
+            prompt: Wording that tells the model these are one clip.
+
+        Returns:
+            A short description, or None when there is no client or the
+            frames cannot be read.
+        """
+        data_urls = [u for u in (to_data_url(f) for f in frames) if u]
+        if not data_urls:
+            self.last_error = "no readable frame"
+            return None
+        return self._describe(data_urls, prompt)
+
+    def _describe(self, data_urls: list[str], prompt: str) -> Optional[str]:
+        """Ask about one or more images, negotiating the request shape."""
+        if not self.available:
+            self.last_error = "no api key or model configured"
+            return None
+        if not data_urls:
+            self.last_error = "no image to describe"
+            return None
 
         self.last_error = ""
         for max_tokens, disable_thinking in self._attempts():
-            text, error = self._ask(data_url, prompt, max_tokens,
+            text, error = self._ask(data_urls, prompt, max_tokens,
                                     disable_thinking)
             if text:
                 self._remember(disable_thinking)
@@ -194,26 +237,31 @@ class VisionClient:
         if disable_thinking and self._thinking_supported:
             self._thinking_disabled = True
 
-    def _ask(self, data_url: str, prompt: str, max_tokens: int,
+    def _ask(self, data_urls: list[str], prompt: str, max_tokens: int,
              disable_thinking: bool) -> tuple[Optional[str], str]:
-        """One request.  Returns ``(text, error)``; error is "" on success."""
+        """One request.  Returns ``(text, error)``; error is "" on success.
+
+        *data_urls* is a list so a video's frames travel in a single request:
+        several ``image_url`` parts with one prompt is the shape every
+        multimodal endpoint accepts, and the model needs them side by side to
+        describe what happens across the clip.
+        """
         if disable_thinking and not self._thinking_supported:
             return None, "rejected-thinking"
 
         extra_body = (
             {"thinking": {"type": "disabled"}} if disable_thinking else None
         )
+        content: list[dict] = [{"type": "text", "text": prompt}]
+        content.extend(
+            {"type": "image_url", "image_url": {"url": url}}
+            for url in data_urls
+        )
         try:
             response = self._get_client().chat.completions.create(
                 model=self._model,
                 max_tokens=max_tokens,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": data_url}},
-                    ],
-                }],
+                messages=[{"role": "user", "content": content}],
                 extra_body=extra_body,
             )
         except Exception as exc:

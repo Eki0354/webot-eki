@@ -31,7 +31,9 @@ This module does network I/O but no AI calls and no config reading.
 """
 
 import gzip
+import html
 import ipaddress
+import json
 import logging
 import re
 import socket
@@ -119,6 +121,23 @@ _UA = (
     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 )
 
+#: Second User-Agent tried when the desktop page comes back as an empty shell.
+#: Measured on a Xiaohongshu video share: the desktop UA gets a 37 KB
+#: JavaScript shell — no text, no ``og:title``, no ``og:description`` — while
+#: the iPhone UA gets 71 KB carrying the note's title and its whole copy in
+#: ``og:description``.  The site decides by UA, so asking as a phone is the
+#: only way to read it without a browser engine.
+_MOBILE_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+    "Mobile/15E148 Safari/604.1"
+)
+
+#: Timeout for the mobile retry.  It only runs when the first request already
+#: answered quickly with a shell, so this is a small extra cost — kept short
+#: anyway so one page cannot eat the whole per-question fetch budget.
+_MOBILE_TIMEOUT_SEC = 3
+
 #: Elements whose *text* is noise (code, styling) or not prose at all.
 _SKIP_TAGS = frozenset({
     "script", "style", "noscript", "svg", "iframe", "template", "canvas",
@@ -158,6 +177,20 @@ _URL_IN_TEXT_RE = re.compile(
 #: repeatedly so "https://x.com/a)." loses both.
 _TRAILING_JUNK = ".,;:!?)]}'\"…"
 
+#: A single JSON string value, e.g. ``"desc":"一段关系…"``.  Chinese text is
+#: carried escaped (``\n``, ``\u002F``), so the value is decoded afterwards
+#: rather than used raw.  The value may contain any escape, hence the alternation.
+_JSON_VALUE_PATTERN = r'"%s"\s*:\s*"((?:[^"\\]|\\.)*)"'
+
+#: Keys that hold a page's prose in an embedded JSON state.  ``desc`` is what
+#: Xiaohongshu calls a note's copy; ``description``/``content`` cover the
+#: common alternatives.  Ordered by how likely each is to be the real text.
+_JSON_BODY_KEYS = ("desc", "description", "content", "text")
+
+#: Keys that hold a page's headline in an embedded JSON state.  Used only
+#: when the markup itself carried no usable title.
+_JSON_TITLE_KEYS = ("title", "noteTitle", "headline")
+
 #: How many links one question may pull.  Each costs a blocking fetch, and a
 #: message with five links is a link dump, not a question about one article.
 _MAX_LINKS_PER_QUESTION = 2
@@ -169,11 +202,19 @@ _FETCH_BUDGET_SEC = 8
 
 @dataclass(frozen=True)
 class Article:
-    """What a fetched page gave us: where, what it is called, what it says."""
+    """What a fetched page gave us: where, what it is called, what it says.
+
+    ``video_urls`` carries the media addresses found in *this same response*.
+    It has to be captured here rather than re-derived later: measured on a
+    Xiaohongshu video note, a second request for the same page answers with a
+    degraded 23 KB shell that no longer contains ``masterUrl``, so hunting
+    for the video after the fact silently loses every clip.
+    """
 
     url: str
     title: str
     text: str
+    video_urls: tuple[str, ...] = ()
 
     def to_prompt_block(self, max_text: int = _MAX_TEXT) -> str:
         """Render as the block inserted into the prompt.
@@ -356,6 +397,7 @@ class _Extractor(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.title = ""
         self.og_title = ""
+        self.og_description = ""
         self._in_title = False
         self._skip_depth = 0
         self._main_depth = 0
@@ -390,6 +432,11 @@ class _Extractor(HTMLParser):
             ).lower()
             if key in ("og:title", "twitter:title") and not self.og_title:
                 self.og_title = (attrs_d.get("content") or "").strip()
+            elif (
+                key in ("og:description", "twitter:description", "description")
+                and not self.og_description
+            ):
+                self.og_description = (attrs_d.get("content") or "").strip()
             return
         if tag == "title":
             self._in_title = True
@@ -489,6 +536,55 @@ def _blocked_marker(title: str, text: str) -> str:
     return ""
 
 
+def _decode_json_value(raw: str) -> str:
+    """Decode the body of a JSON string literal (``\\n``, ``\\u002F`` …).
+
+    Sites embed their state as JSON inside ``<script>``, so the prose arrives
+    escaped: a line break is ``\\n`` and Xiaohongshu's CDN hosts are written
+    ``\\u002F``.  Falls back to HTML unescaping when the literal does not
+    round-trip through :mod:`json` — some pages carry bare ``undefined``.
+    """
+    try:
+        value = json.loads(f'"{raw}"')
+    except Exception:
+        value = raw
+    return html.unescape(value) if isinstance(value, str) else ""
+
+
+def _embedded_state_text(page: str, keys: tuple[str, ...]) -> str:
+    """Pull the longest readable value of *keys* out of an embedded state.
+
+    Tried only after the HTML itself yielded nothing usable: a site that
+    paints its page with JavaScript leaves the prose in a JSON blob and ships
+    only UI labels as markup.  Measured on a Xiaohongshu video note — the
+    mobile page's markup was 36 characters of "发弹幕 / App内打开" while the
+    note's whole copy sat in ``"desc"``.
+
+    Keys are tried in the caller's priority order and the first one that
+    yields a body-length value wins, so the very generic ``"text"`` cannot
+    beat the specific ``"desc"``.
+
+    Args:
+        page: Whole HTML document.
+        keys: Candidate JSON keys, most specific first.
+
+    Returns:
+        The decoded text, or "" when no key carries a usable body.
+    """
+    if not page:
+        return ""
+    for key in keys:
+        pattern = re.compile(_JSON_VALUE_PATTERN % re.escape(key))
+        best = ""
+        for match in pattern.finditer(page):
+            value = _decode_json_value(match.group(1)).strip()
+            if len(value) > len(best):
+                best = value
+        if len(best) >= _MIN_USABLE_TEXT:
+            return best
+    return ""
+
+
 def extract_article(html_text: str) -> tuple[str, str]:
     """Return ``(title, text)`` from an HTML page.
 
@@ -514,7 +610,23 @@ def extract_article(html_text: str) -> tuple[str, str]:
     # header do not, and pasting a JSON blob into the prompt helps nobody.
     if body[:1] in ("{", "["):
         logger.debug("Link skipped: body looks like data, not prose")
-        return title, ""
+        body = ""
+
+    # A script-only shell: the article is painted by JavaScript, so the parsed
+    # body is empty or a strip of UI labels.  Sites that do this still ship the
+    # real text in a meta summary or an embedded JSON state, and either beats
+    # reporting the link as unreadable — measured on a Xiaohongshu video note,
+    # where markup held 36 characters of button labels and the note's copy sat
+    # in ``"desc"``.
+    if len(body) < _MIN_USABLE_TEXT:
+        lede = parser.og_description or _embedded_state_text(html_text,
+                                                             _JSON_BODY_KEYS)
+        if len(lede) > len(body):
+            body = _tidy(lede, _MAX_TEXT)
+        if not title:
+            title = _tidy(
+                _embedded_state_text(html_text, _JSON_TITLE_KEYS), _MAX_TITLE
+            )
     return title, body
 
 
@@ -864,10 +976,128 @@ def _http_fallback(url: str) -> str:
     )
 
 
+def _request_page(
+    url: str, *, ua: str, timeout: float, host: str = ""
+) -> tuple[str, int, str]:
+    """GET *url* and decode it.  Raises on transport failure.
+
+    Args:
+        url: Page to read.
+        ua: User-Agent to present.  Which one is sent is the whole point of
+            the mobile retry — see :data:`_MOBILE_UA`.
+        timeout: Socket timeout in seconds.
+        host: Passed to :func:`_build_opener` to enable chain repair.
+
+    Returns:
+        ``(page_text, raw_byte_count, content_type)``.
+    """
+    request = urllib.request.Request(url, headers={
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5",
+        # Ask for an uncompressed body; the decode path still handles gzip.
+        "Accept-Encoding": "identity",
+    })
+    with _build_opener(host).open(request, timeout=timeout) as response:
+        content_type = response.headers.get("Content-Type", "")
+        if not _is_textual(content_type):
+            # Do not read the body: a 4 GB video with a text-ish URL must not
+            # be pulled into memory just to be rejected.
+            return "", 0, content_type
+        raw = response.read(_MAX_BYTES + 1)[:_MAX_BYTES]
+        charset = response.headers.get_content_charset() or ""
+        page = _decode(
+            _decompress(raw, response.headers.get("Content-Encoding", "")),
+            charset,
+        )
+        if not charset:
+            meta = _META_CHARSET_RE.search(page[:4096])
+            if meta:
+                page = _decode(raw, meta.group(1))
+    return page, len(raw), content_type
+
+
+def _video_urls(page: str) -> list[str]:
+    """Media addresses a page embeds, taken from *this* response.
+
+    Imported inside the call: :mod:`src.media.video` imports
+    ``is_public_url`` from here, so a module-level import would be circular.
+    Extracting the addresses costs only a few regex passes and does not need
+    ffmpeg, so a build without the binary still records them; sampling the
+    frames later is what degrades.
+
+    Args:
+        page: The page HTML that was just fetched.
+
+    Returns:
+        Candidate media URLs, possibly empty.
+    """
+    try:
+        from .video import video_urls_from_page
+    except Exception:  # pragma: no cover - import cannot realistically fail
+        logger.debug("video module unavailable", exc_info=True)
+        return []
+    return video_urls_from_page(page)
+
+
+def _judge_page(
+    url: str, page: str, *, raw_len: int, content_type: str
+) -> tuple[Optional[Article], str]:
+    """Turn a fetched page into an article, or say why not.
+
+    Returns:
+        ``(article, "")`` when the page is readable, otherwise
+        ``(None, reason)`` where *reason* is one of ``"non-textual"``,
+        ``"blocked"``, ``"stub"``, ``"empty"``.
+    """
+    if not _is_textual(content_type):
+        logger.warning(
+            "Link skipped: non-textual %s (%s)", content_type, url[:80],
+        )
+        return None, "non-textual"
+
+    title, text = extract_article(page)
+    blocked = _blocked_marker(title, text)
+    if blocked:
+        # The site answered 200 with a verification wall, a "page not found"
+        # template or an app-launch notice.  Treating that as a read article
+        # is what made the bot summarise "环境异常，完成验证后即可继续访问"
+        # as if it were the article's content.
+        logger.warning(
+            "Link blocked by the site: %s (%r) — %s", url[:80],
+            blocked, "not passing page furniture to the model",
+        )
+        return None, "blocked"
+
+    if text:
+        if len(text) < _MIN_USABLE_TEXT:
+            logger.warning(
+                "Link skipped: only %d chars in %s — that is a stub, "
+                "not an article", len(text), url[:80],
+            )
+            return None, "stub"
+        return Article(
+            url=url, title=title, text=text,
+            video_urls=tuple(_video_urls(page)),
+        ), ""
+
+    logger.warning(
+        "Link skipped: no readable body in %s (%d bytes, content-type=%s)",
+        url[:80], raw_len, content_type,
+    )
+    return None, "empty"
+
+
 def _fetch_once(
     url: str, *, host: str = ""
 ) -> tuple[Optional[Article], Optional[BaseException]]:
     """One fetch attempt.  Returns ``(article, error)`` and never raises.
+
+    Two requests at most: the page as a desktop browser would see it, and —
+    only when that yields nothing readable — the same page as a phone.  Some
+    sites serve a JavaScript shell to desktops and real content to mobile
+    clients; measured on a Xiaohongshu video note, where the desktop page had
+    no title and no body at all and the mobile page carried both.
 
     Args:
         url: Page to read.
@@ -880,63 +1110,51 @@ def _fetch_once(
         nothing readable in it — the last case must not trigger repairs,
         because the connection was fine.
     """
-    request = urllib.request.Request(url, headers={
-        "User-Agent": _UA,
-        "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5",
-        # Ask for an uncompressed body; the decode path still handles gzip.
-        "Accept-Encoding": "identity",
-    })
     try:
-        with _build_opener(host).open(request, timeout=_TIMEOUT_SEC) as response:
-            if not _is_textual(response.headers.get("Content-Type", "")):
-                logger.warning(
-                    "Link skipped: non-textual %s (%s)",
-                    response.headers.get("Content-Type"), url[:80],
-                )
-                return None, None
-            raw = response.read(_MAX_BYTES + 1)[:_MAX_BYTES]
-            charset = response.headers.get_content_charset() or ""
-            page = _decode(
-                _decompress(raw, response.headers.get("Content-Encoding", "")),
-                charset,
-            )
-            if not charset:
-                meta = _META_CHARSET_RE.search(page[:4096])
-                if meta:
-                    page = _decode(raw, meta.group(1))
-            title, text = extract_article(page)
-            blocked = _blocked_marker(title, text)
-            if blocked:
-                # The site answered 200 with a verification wall, a "page not
-                # found" template or an app-launch notice.  Treating that as a
-                # read article is what made the bot summarise "环境异常，完成
-                # 验证后即可继续访问" as if it were the article's content.
-                logger.warning(
-                    "Link blocked by the site: %s (%r) — %s", url[:80],
-                    blocked, "not passing page furniture to the model",
-                )
-                return None, None
-            if text:
-                if len(text) < _MIN_USABLE_TEXT:
-                    logger.warning(
-                        "Link skipped: only %d chars in %s — that is a stub, "
-                        "not an article", len(text), url[:80],
-                    )
-                    return None, None
-                return Article(url=url, title=title, text=text), None
-            logger.warning(
-                "Link skipped: no readable body in %s (%d bytes, "
-                "content-type=%s)", url[:80], len(raw),
-                response.headers.get("Content-Type"),
-            )
-            return None, None
+        page, raw_len, content_type = _request_page(
+            url, ua=_UA, timeout=_TIMEOUT_SEC, host=host,
+        )
     except urllib.error.HTTPError as exc:
         # The server answered, it just refused: no repair or fallback helps.
         logger.warning("Link fetch HTTP %s: %s", exc.code, url[:80])
         return None, None
     except Exception as exc:
         return None, exc
+
+    article, reason = _judge_page(url, page, raw_len=raw_len,
+                                  content_type=content_type)
+    if article is not None or reason == "non-textual":
+        return article, None
+
+    # The desktop view was a wall, a stub or a shell.  Ask again as a phone:
+    # that is what turns "读不到" into the note's title and copy.
+    try:
+        mobile_page, mobile_raw, mobile_type = _request_page(
+            url, ua=_MOBILE_UA, timeout=_MOBILE_TIMEOUT_SEC, host=host,
+        )
+    except urllib.error.HTTPError as exc:
+        logger.info(
+            "Link fetch: mobile retry answered HTTP %s for %s, giving up",
+            exc.code, url[:80],
+        )
+        return None, None
+    except Exception as exc:
+        # The first request already failed to give usable content; a failed
+        # retry is not worth escalating into a TLS repair.
+        logger.info(
+            "Link fetch: mobile retry failed for %s (%s)",
+            url[:80], type(exc).__name__,
+        )
+        return None, None
+
+    article, _ = _judge_page(url, mobile_page, raw_len=mobile_raw,
+                             content_type=mobile_type)
+    if article is not None:
+        logger.info(
+            "Link fetched with a mobile User-Agent: %s (%d chars, title=%r)",
+            url[:80], len(article.text), article.title[:40],
+        )
+    return article, None
 
 
 def fetch_article(url: str) -> Optional[Article]:

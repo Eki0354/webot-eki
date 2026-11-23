@@ -77,6 +77,9 @@ class MessageRouter:
         # exists (the router is built first, and only the backend can read
         # the raw XML an old media message needs).
         self._media_backfill = None
+        # Filled in by :meth:`attach_media_pipeline`; used to turn a shared
+        # video link into a description of what the clip shows.
+        self._media_pipeline_provider = None
         self._proactive = ProactiveGate(config)
         self._sticky = StickyMentionTracker(
             ttl_sec=config.sticky_mention_ttl_sec,
@@ -492,6 +495,64 @@ class MessageRouter:
 
     # ── AI Chat handler ──────────────────────────────────────────
 
+    def attach_media_pipeline(self, provider) -> None:
+        """Enable describing what a shared video's frames show.
+
+        Called once by :class:`~src.bot.Bot` for the same reason as
+        :meth:`attach_media_backfill`: the pipeline lives on the WeChat
+        backend, and the router is built before it.  *provider* is a
+        zero-argument callable returning the pipeline (or None/False when
+        media handling is off), called lazily so a text-only install never
+        builds one.
+        """
+        self._media_pipeline_provider = provider
+
+    def _video_context(self, articles: list) -> str:
+        """Describe the clip behind each article that has a video address.
+
+        A chat completion receives text only.  Without this, "你能看到这个
+        视频吗" gets answered with "看不到" even though the page's media
+        address was captured alongside its text — the exact complaint this
+        exists to fix.
+
+        Only articles that actually carried a media address are sampled, so
+        an ordinary article costs nothing here.  Every failure degrades to a
+        log line: the text part of the prompt still answers the question.
+        """
+        if not getattr(self, "_media_pipeline_provider", None):
+            return ""
+        try:
+            pipeline = self._media_pipeline_provider()
+        except Exception:
+            logger.debug("media pipeline unavailable", exc_info=True)
+            return ""
+        if not pipeline:
+            return ""
+
+        blocks: list[str] = []
+        for article in articles:
+            urls = getattr(article, "video_urls", ()) or ()
+            if not urls:
+                continue
+            try:
+                description = pipeline.describe_video(urls, article.url)
+            except Exception:
+                logger.exception("Video description failed for %s", article.url[:80])
+                continue
+            if not description:
+                continue
+            head = (
+                f"[视频画面] {getattr(article, 'title', '') or '（无标题）'}"
+                f" — {article.url}"
+            )
+            blocks.append(f"{head}\n{description}")
+        if not blocks:
+            return ""
+        return (
+            "这个视频你抽帧看过了，画面内容如下（直接据此回答，"
+            "不要说你打不开视频）：\n" + "\n\n".join(blocks)
+        )
+
     def _link_context(self, text: str) -> str:
         """Fetch the pages *text* links to, rendered for the chat prompt.
 
@@ -538,7 +599,14 @@ class MessageRouter:
         logger.info(
             "Link context: %d article(s) for '%s'", len(articles), text[:40],
         )
-        return format_link_context(articles)
+        # The text and the frames answer different halves of the same
+        # question, so both travel: "这篇讲了啥" needs the copy, "你能看到
+        # 这个视频吗" needs the picture.  Either may be empty.
+        parts = [block for block in (
+            format_link_context(articles),
+            self._video_context(articles),
+        ) if block]
+        return "\n\n".join(parts)
 
     def _handle_chat(self, msg: dict, clean_content: str) -> str | None:
         """Handle a conversational @bot mention."""

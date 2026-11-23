@@ -89,6 +89,10 @@ src/wechat/bin/
 # Native DLL binaries (tracked via releases)
 native/windows/*.dll
 
+# ffmpeg (121 MB) ships beside the EXE, not inside it and not in git.
+# src/media/video.py looks for it next to the executable.
+native/windows/*.exe
+
 # Ghidra reverse engineering
 ghidra_project/
 
