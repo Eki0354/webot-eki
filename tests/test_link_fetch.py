@@ -91,6 +91,29 @@ class AppmsgUrlTests(unittest.TestCase):
         self.assertEqual(appmsg_url(xml), long_url)
         self.assertIn(long_url, reduce_appmsg(xml))
 
+    def test_escaped_ampersands_are_unescaped(self):
+        """A shared card stores its URL HTML-escaped; ``&amp;`` is not a query separator.
+
+        Reported live: a WeChat article card arrived as
+        ``...?__biz=X&amp;mid=Y&amp;idx=1``.  Sending that literally makes the
+        server see one parameter whose *name* is ``amp;mid``, so every query
+        argument after the first is silently dropped (measured:
+        ``?a=1&amp;b=2`` parses as ``{'a': '1', 'amp;b': '2'}``).
+        """
+        from src.media.appmsg import appmsg_url, reduce_appmsg
+
+        url = "https://mp.weixin.qq.com/s?__biz=MzI5&amp;mid=2247&amp;idx=1"
+        xml = f'<msg><appmsg><title>新政</title><url>{url}</url><type>5</type></appmsg></msg>'
+        expected = "https://mp.weixin.qq.com/s?__biz=MzI5&mid=2247&idx=1"
+
+        self.assertEqual(appmsg_url(xml), expected)
+        reduced = reduce_appmsg(xml)
+        self.assertIn(expected, reduced)
+        self.assertNotIn("&amp;", reduced)
+        # The fetcher must see real separators, or the request is mangled.
+        from src.media.link_fetcher import extract_urls
+        self.assertEqual(extract_urls(reduced), [expected])
+
     def test_file_url_does_not_match_the_url_tag(self):
         """``<cdnattachurl>`` must not be mistaken for ``<url>``."""
         from src.media.appmsg import appmsg_url
@@ -879,6 +902,106 @@ class FetchAttemptTests(unittest.TestCase):
             self.fetcher.fetch_article("https://matrix67.com/blog/archives/336")
         )
         self.assertEqual(calls, ["https://matrix67.com/blog/archives/336"])
+
+
+class _FakeHeaders:
+    def __init__(self, mapping):
+        self._m = {k.lower(): v for k, v in mapping.items()}
+
+    def get(self, key, default=""):
+        return self._m.get(key.lower(), default)
+
+    def get_content_charset(self):
+        return "utf-8"
+
+
+class _FakeResponse:
+    def __init__(self, body: str, content_type="text/html"):
+        self._raw = body.encode("utf-8")
+        self.headers = _FakeHeaders({
+            "Content-Type": content_type,
+            "Content-Encoding": "identity",
+        })
+
+    def read(self, n=-1):
+        return self._raw
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class BlockedPageTests(unittest.TestCase):
+    """A verification wall or page furniture must not read as an article.
+
+    Reported live: asking about a shared WeChat article produced the reply
+    "环境异常，完成验证后即可继续访问…" — because the anti-bot page was
+    extracted, injected under "你已经读过了", and summarised.  Saying the link
+    could not be read is the honest answer and the one the model can act on.
+    """
+
+    def setUp(self):
+        from src.media import link_fetcher
+
+        self.fetcher = link_fetcher
+        link_fetcher.clear_cache()
+
+    def tearDown(self):
+        self.fetcher.clear_cache()
+
+    def _serve(self, page: str):
+        original = self.fetcher._build_opener
+        self.fetcher._build_opener = lambda host="": type(
+            "Opener", (), {"open": lambda *a, **k: _FakeResponse(page)}
+        )()
+        self.addCleanup(setattr, self.fetcher, "_build_opener", original)
+
+    def test_wechat_verification_wall_is_a_failure(self):
+        self._serve(
+            "<html><head><title></title></head><body>"
+            "<div>环境异常</div><div>当前环境异常，完成验证后即可继续访问。</div>"
+            "<a>去验证</a></body></html>"
+        )
+        self.assertIsNone(self.fetcher.fetch_article("https://mp.weixin.qq.com/s/abc"))
+
+    def test_deleted_page_notice_is_a_failure(self):
+        self._serve(
+            "<html><head><title>该内容已被发布者删除</title></head>"
+            "<body><p>该内容已被发布者删除</p></body></html>"
+        )
+        self.assertIsNone(self.fetcher.fetch_article("https://mp.weixin.qq.com/s/abc"))
+
+    def test_footer_only_page_is_a_failure(self):
+        """A 200 with a few dozen characters of footer is not an article."""
+        self._serve(
+            "<html><head><title>某站</title></head><body>"
+            "<footer>© 2014-2026 某公司 地址：某路 电话：9501-3888</footer>"
+            "</body></html>"
+        )
+        self.assertIsNone(self.fetcher.fetch_article("https://example.com/gone"))
+
+    def test_real_article_still_reads(self):
+        """The guard must not reject a page that is a real article."""
+        self._serve(
+            "<html><head><title>一篇真文章</title></head><body>"
+            "<div id='js_content'>"
+            "<p>第一段：这篇文章讲的是模型推理成本的变化，性能提升 30%。</p>"
+            "<p>第二段：推理成本明显下降，同时延迟也更稳定，适合在群里做实时回复。</p>"
+            "<p>第三段：文章还讨论了部署时需要注意的几个细节和常见坑。</p>"
+            "</div></body></html>"
+        )
+        article = self.fetcher.fetch_article("https://matrix67.com/blog/archives/336")
+        self.assertIsNotNone(article)
+        self.assertIn("性能提升 30%", article.text)
+
+    def test_marker_deep_in_a_long_body_is_not_a_wall(self):
+        body = "正文。" * 400
+        plain = self.fetcher._blocked_marker("标题", body + "完成验证")
+        self.assertEqual(plain, "")
+        wall = self.fetcher._blocked_marker("", "环境异常 " + body)
+        self.assertEqual(wall, "环境异常")
 
 
 class PromptDocumentationTests(unittest.TestCase):

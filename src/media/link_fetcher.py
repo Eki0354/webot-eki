@@ -65,6 +65,41 @@ _MAX_TEXT = 1800
 #: Titles are one line; longer means we picked up the wrong tag.
 _MAX_TITLE = 120
 
+#: Floor on a usable body.  A page that yields less than this is a footer, a
+#: redirect stub or a "open this in the app" notice, not an article — measured
+#: on real shares: a Bilibili short link yields 14 characters ("*以选手发布
+#: 直播预约时间为准").  Handing that to the model as "你已经读过了" makes it
+#: answer from page furniture, which is worse than admitting the page could not
+#: be read, so the fetch is reported as a failure instead.
+_MIN_USABLE_TEXT = 80
+
+#: Phrases a site serves *instead of* the content when it refuses a scripted
+#: request.  Measured: WeChat article pages answer every User-Agent tried
+#: (including the real WeChat clients') with "环境异常，完成验证后即可继续
+#: 访问"; Xiaohongshu titles the page "你访问的页面不见了".  Both used to be
+#: reported as successful reads, so the prompt said the article had been read
+#: and the model summarised a verification wall.
+#:
+#: Checked against title *and* body: Xiaohongshu's marker sits in the title,
+#: while WeChat's sits in the body.
+_BLOCKED_MARKERS = (
+    "环境异常",
+    "完成验证",
+    "安全验证",
+    "滑动验证",
+    "访问的页面不见了",
+    "该内容已被发布者删除",
+    "请在微信客户端打开",
+    "参数错误",
+    "access denied",
+    "403 forbidden",
+    "checking your browser",
+    "enable javascript",
+    "just a moment",
+    "verify you are human",
+    "unusual traffic",
+)
+
 _CACHE_TTL_SEC = 600
 _CACHE_MAX = 64
 
@@ -423,6 +458,35 @@ def _tidy(text: str, limit: int) -> str:
             continue
         lines.append(line)
     return "\n".join(lines)[:limit].strip()
+
+
+def _blocked_marker(title: str, text: str) -> str:
+    """Return the phrase that marks *title*/*text* as a blocked page, or "".
+
+    A site that refuses a scripted request almost always answers HTTP 200 with
+    a template instead of the article, so the transport looks fine and the
+    extracted text is non-empty.  Without this check that template is injected
+    into the prompt as "对方提到的链接你已经读过了", which makes the model
+    summarise a verification wall — measurably worse than saying nothing, and
+    the reason a WeChat article question got the answer "环境异常，完成验证后
+    即可继续访问".
+
+    Args:
+        title: Page title as extracted.
+        text: Page body as extracted.
+
+    Returns:
+        The matched marker (for the log line), or "" when the page looks like
+        real content.
+    """
+    haystack = f"{title}\n{text}".lower()
+    # Only the head is inspected: a real article may quote "完成验证" in its
+    # prose, and a marker found deep in a long body is the topic, not a wall.
+    head = haystack[:600]
+    for marker in _BLOCKED_MARKERS:
+        if marker.lower() in head:
+            return marker
+    return ""
 
 
 def extract_article(html_text: str) -> tuple[str, str]:
@@ -842,7 +906,24 @@ def _fetch_once(
                 if meta:
                     page = _decode(raw, meta.group(1))
             title, text = extract_article(page)
+            blocked = _blocked_marker(title, text)
+            if blocked:
+                # The site answered 200 with a verification wall, a "page not
+                # found" template or an app-launch notice.  Treating that as a
+                # read article is what made the bot summarise "环境异常，完成
+                # 验证后即可继续访问" as if it were the article's content.
+                logger.warning(
+                    "Link blocked by the site: %s (%r) — %s", url[:80],
+                    blocked, "not passing page furniture to the model",
+                )
+                return None, None
             if text:
+                if len(text) < _MIN_USABLE_TEXT:
+                    logger.warning(
+                        "Link skipped: only %d chars in %s — that is a stub, "
+                        "not an article", len(text), url[:80],
+                    )
+                    return None, None
                 return Article(url=url, title=title, text=text), None
             logger.warning(
                 "Link skipped: no readable body in %s (%d bytes, "

@@ -160,11 +160,20 @@ def appmsg_url(xml: str) -> str:
     The URL is the only thing a fetcher can act on, so it has to survive
     reduction.  ``reduce_appmsg`` used to keep the title and drop this, which
     left the model unable to even name the page it was asked about.
+
+    The value is HTML-escaped in the stored XML — every query separator
+    arrives as ``&amp;``.  Passing that through unchanged made the fetcher
+    request a literal ``&amp;`` in the query, so a site that does not ignore
+    it silently dropped every parameter after the first one (measured:
+    ``?a=1&amp;b=2`` parses as ``{'a': '1', 'amp;b': '2'}``).  WeChat's own
+    pages happened to tolerate it; other sites do not.
     """
     if not xml:
         return ""
     match = _URL_RE.search(xml)
-    return _clean(match.group(1), _MAX_URL) if match else ""
+    if not match:
+        return ""
+    return _clean(html.unescape(match.group(1)), _MAX_URL)
 
 
 def _quoted_text_summary(content: str) -> str:
