@@ -1461,6 +1461,100 @@ class VideoIntentTests(unittest.TestCase):
         self.assertEqual(plain.video_urls, ())
 
 
+class BilibiliApiFallbackTests(unittest.TestCase):
+    """When rendering yields no address, Bilibili is asked through its API.
+
+    Measured case: in the VM the headless renderer exited 0 in about a second
+    with an empty DOM, so a shared Bilibili clip had no address at all and the
+    answer described a video it never saw.  The site's JSON API answers the
+    stream addresses with no browser involved.
+    """
+
+    _URL = "https://b23.tv/2qF8lis"
+    _CLIP = "https://mirror.bilivideo.com/upgcxcode/a.m4s"
+
+    _PAGE = (
+        "<html><head><title>现场画面，英伟达员工欢庆黄仁勋回归</title></head>"
+        "<body><article><p>"
+        + "现场的画面里，员工们在走廊两侧排开，掌声一直没停，气氛很热烈。" * 5
+        + "</p></article></body></html>"
+    )
+
+    def setUp(self):
+        from src.media import link_fetcher, video
+
+        self.fetcher = link_fetcher
+        self.video = video
+        link_fetcher.clear_cache()
+        self.addCleanup(link_fetcher.clear_cache)
+
+        originals = {
+            "is_public_url": link_fetcher.is_public_url,
+            "_render_page": link_fetcher._render_page,
+        }
+        link_fetcher.is_public_url = lambda url, **kw: True
+        link_fetcher._render_page = lambda url, *, timeout=12.0: None
+        for name, original in originals.items():
+            self.addCleanup(setattr, link_fetcher, name, original)
+
+        page = self._PAGE
+        original_opener = link_fetcher._build_opener
+        link_fetcher._build_opener = lambda host="": type(
+            "Opener", (), {"open": lambda *a, **k: _FakeResponse(page)}
+        )()
+        self.addCleanup(setattr, link_fetcher, "_build_opener", original_opener)
+
+        self.api_calls: list[str] = []
+        original_api = video.bilibili_video_urls
+        self.addCleanup(setattr, video, "bilibili_video_urls", original_api)
+
+    def _serve_api(self, urls):
+        def _fake_api(page_url):
+            self.api_calls.append(page_url)
+            return list(urls)
+
+        self.video.bilibili_video_urls = _fake_api
+
+    def test_api_address_is_used_when_rendering_finds_nothing(self):
+        self._serve_api([self._CLIP])
+        article = self.fetcher.fetch_article(self._URL, render=True, want_video=True)
+        self.assertIsNotNone(article)
+        self.assertEqual(article.video_urls, (self._CLIP,))
+        self.assertEqual(self.api_calls, [self._URL])
+        # The static prose still wins: the API contributes the address only.
+        self.assertIn("掌声一直没停", article.text)
+
+    def test_rendered_address_does_not_cost_an_api_call(self):
+        from src.media.link_fetcher import Article
+
+        rendered = Article(
+            url=self._URL, title="现场画面", text="",
+            video_urls=("https://cdn.example.com/rendered.m4s",),
+        )
+        self.fetcher._render_page = lambda url, *, timeout=12.0: rendered
+        self._serve_api([self._CLIP])
+
+        article = self.fetcher.fetch_article(self._URL, render=True, want_video=True)
+        self.assertEqual(
+            article.video_urls, ("https://cdn.example.com/rendered.m4s",),
+        )
+        self.assertEqual(self.api_calls, [])
+
+    def test_empty_api_answer_leaves_the_article_without_media(self):
+        self._serve_api([])
+        article = self.fetcher.fetch_article(self._URL, render=True, want_video=True)
+        self.assertIsNotNone(article)
+        self.assertEqual(article.video_urls, ())
+        self.assertEqual(self.api_calls, [self._URL])
+
+    def test_api_is_not_asked_for_a_plain_question(self):
+        self._serve_api([self._CLIP])
+        article = self.fetcher.fetch_article(self._URL, render=True)
+        self.assertIsNotNone(article)
+        self.assertEqual(self.api_calls, [])
+        self.assertEqual(article.video_urls, ())
+
+
 class WantsVideoTests(unittest.TestCase):
     """Only a question that names the medium may buy a browser start."""
 

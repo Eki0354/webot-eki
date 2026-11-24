@@ -1182,17 +1182,38 @@ def _with_video_urls(
     Only ``video_urls`` is borrowed.  The static prose is kept because it is
     the fuller of the two: a rendered dump of a scripted page routinely paints
     less text than the server sent, and the answer summarises that text.
+
+    Bilibili is asked through its JSON API when rendering yields nothing.
+    The browser is the unreliable half there: it has been seen to exit 0
+    with an empty DOM in about a second, where its own API answers the
+    stream addresses without any browser at all (see
+    :func:`~src.media.video.bilibili_video_urls`).
     """
     if article.video_urls:
         return article
     rendered = _render_page(url, timeout=timeout)
-    if rendered is None or not rendered.video_urls:
+    if rendered is not None and rendered.video_urls:
+        logger.info(
+            "Video address found by rendering: %s (%d candidate(s))",
+            url[:80], len(rendered.video_urls),
+        )
+        return replace(article, video_urls=rendered.video_urls)
+
+    # Imported here: ``video`` imports this module for its URL fence, so a
+    # module-level import would be circular.
+    try:
+        from .video import bilibili_video_urls
+    except Exception:  # pragma: no cover - import cannot fail in practice
+        logger.debug("video module unavailable", exc_info=True)
+        return article
+    api_urls = bilibili_video_urls(url)
+    if not api_urls:
         return article
     logger.info(
-        "Video address found by rendering: %s (%d candidate(s))",
-        url[:80], len(rendered.video_urls),
+        "Video address found through the Bilibili API: %s (%d candidate(s))",
+        url[:80], len(api_urls),
     )
-    return replace(article, video_urls=rendered.video_urls)
+    return replace(article, video_urls=tuple(api_urls))
 
 
 def _fetch_once(

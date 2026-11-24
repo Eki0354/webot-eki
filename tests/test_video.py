@@ -174,6 +174,149 @@ class MediaRefererTests(unittest.TestCase):
         self.assertEqual(captured["referer"], "https://www.bilibili.com/")
 
 
+class BilibiliApiTests(unittest.TestCase):
+    """Bilibili's own JSON API is the path that works without a browser.
+
+    Measured case: in the VM the headless renderer exits 0 with an empty DOM
+    in about a second, so a shared Bilibili clip had no frames.  The site's
+    API answered the cid and four DASH renditions to a plain desktop request,
+    which is why this route exists alongside the renderer rather than instead
+    of it.  No network here: both boundaries are patched.
+    """
+
+    _BVID = "BV1xx411c7mD"
+    _PAGE = f"https://www.bilibili.com/video/{_BVID}?share_source=copy"
+
+    def test_bvid_is_read_out_of_a_full_page_url(self):
+        from src.media.video import _bili_bvid
+
+        self.assertEqual(_bili_bvid(self._PAGE), self._BVID)
+
+    def test_share_link_is_resolved_by_one_refused_redirect(self):
+        """``b23.tv`` carries no id; the Location header does."""
+        from src.media import video as video_mod
+
+        asked = []
+        bvid = self._BVID
+
+        class _Opener:
+            def open(self, request, timeout=0):
+                asked.append(request.full_url)
+                raise video_mod.urllib.error.HTTPError(
+                    request.full_url, 302, "Found",
+                    {"Location": f"https://www.bilibili.com/video/{bvid}"},
+                    None,
+                )
+
+        with patch.object(
+            video_mod.urllib.request, "build_opener",
+            side_effect=lambda *handlers: _Opener(),
+        ):
+            self.assertEqual(
+                video_mod._bili_bvid("https://b23.tv/2qF8lis"), self._BVID,
+            )
+        # The share link itself was asked, and the body was never fetched.
+        self.assertEqual(asked, ["https://b23.tv/2qF8lis"])
+
+    def test_a_stranger_host_never_reaches_the_api(self):
+        """An ``…/BV…`` path on someone else's domain is not an invitation."""
+        from src.media import video as video_mod
+
+        started = []
+
+        with patch.object(
+            video_mod.urllib.request, "build_opener",
+            side_effect=lambda *a: started.append(a),
+        ):
+            self.assertEqual(
+                video_mod._bili_bvid(f"https://evil.example/video/{self._BVID}"),
+                "",
+            )
+        self.assertEqual(started, [])
+
+    def test_unresolvable_share_link_is_empty_not_an_exception(self):
+        from src.media import video as video_mod
+
+        class _Opener:
+            def open(self, request, timeout=0):
+                raise OSError("network down")
+
+        with patch.object(
+            video_mod.urllib.request, "build_opener",
+            side_effect=lambda *a: _Opener(),
+        ):
+            self.assertEqual(video_mod._bili_bvid("https://b23.tv/x"), "")
+
+    def test_api_failure_degrades_to_none(self):
+        """This runs behind a reply: an API hiccup must not fail the answer."""
+        from src.media import video as video_mod
+
+        with patch.object(
+            video_mod.urllib.request, "urlopen",
+            side_effect=OSError("connection reset"),
+        ):
+            self.assertIsNone(video_mod._bili_json("/x/web-interface/view?bvid=x"))
+
+    def test_dash_renditions_are_ordered_standard_port_first(self):
+        """Odd-port addresses are refused by the SSRF fence, so they go last."""
+        from src.media import video as video_mod
+
+        view = {"code": 0, "data": {"cid": 12345}}
+        play = {
+            "code": 0,
+            "data": {
+                "dash": {
+                    "video": [
+                        {
+                            "baseUrl": "https://upos.example:4483/a.m4s",
+                            "backupUrl": ["https://mirror.bilivideo.com/a.m4s"],
+                        },
+                        {
+                            "baseUrl": "https://upos.example:8082/b.m4s",
+                            "backupUrl": [],
+                        },
+                    ],
+                },
+            },
+        }
+
+        def _fake_json(path):
+            return view if "view" in path else play
+
+        with patch.object(video_mod, "_bili_json", side_effect=_fake_json):
+            urls = video_mod.bilibili_video_urls(self._PAGE)
+
+        self.assertEqual(urls, [
+            "https://mirror.bilivideo.com/a.m4s",
+            "https://upos.example:4483/a.m4s",
+            "https://upos.example:8082/b.m4s",
+        ])
+
+    def test_duplicate_addresses_appear_once(self):
+        from src.media import video as video_mod
+
+        same = "https://upos.example/a.m4s"
+        view = {"code": 0, "data": {"cid": 1}}
+        play = {"data": {"dash": {"video": [
+            {"baseUrl": same, "backupUrl": [same]},
+            {"baseUrl": same, "backupUrl": []},
+        ]}}}
+
+        with patch.object(
+            video_mod, "_bili_json",
+            side_effect=lambda path: view if "view" in path else play,
+        ):
+            self.assertEqual(video_mod.bilibili_video_urls(self._PAGE), [same])
+
+    def test_no_cid_means_no_addresses(self):
+        from src.media import video as video_mod
+
+        with patch.object(
+            video_mod, "_bili_json", return_value={"code": -404, "data": {}},
+        ):
+            self.assertEqual(video_mod.bilibili_video_urls(self._PAGE), [])
+
+
 def _pipeline(vision=True):
     from src.media.pipeline import MediaPipeline
 

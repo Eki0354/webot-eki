@@ -27,12 +27,14 @@ Design constraints, all load-bearing:
 This module does network and process I/O but no AI calls and no config reads.
 """
 
+import json
 import logging
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -147,6 +149,159 @@ def _media_referer(media_url: str, page_url: str) -> str:
         if host == suffix or host.endswith("." + suffix):
             return root
     return page_url
+
+
+# ── Bilibili official API ────────────────────────────────────────────
+#
+# Why this exists: Bilibili builds its player in JavaScript, so the media
+# address is in no static response, and the headless-browser fallback is
+# unreliable — it has been seen to exit 0 with no DOM at all in a VM,
+# returning nothing in about a second where a real render takes 7-15 s.
+# The site's own JSON API needs no browser and no signing for the two
+# endpoints used here: measured on a share link, ``view`` answered the cid
+# and ``playurl`` answered four DASH renditions, from which a 1.5 MB clip
+# downloaded and three frames were sampled.  Both endpoints accept an
+# unauthenticated desktop request that carries the site root as referer.
+
+_BILI_API = "https://api.bilibili.com"
+_BILI_API_TIMEOUT_SEC = 8.0
+_BILI_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+_BVID_RE = re.compile(r"(BV[0-9A-Za-z]{10})")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Surface a 3xx instead of following it.
+
+    A share link has to be resolved to its real page to learn the video id,
+    and letting ``urllib`` follow the redirect would download the whole page
+    for one substring of its URL.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _bili_json(path: str) -> Optional[dict]:
+    """GET a Bilibili API path and return the decoded body, or None.
+
+    Never raises: this runs behind a reply, and an API hiccup must degrade to
+    "no frames" rather than fail the answer.
+    """
+    request = urllib.request.Request(
+        _BILI_API + path,
+        headers={
+            "User-Agent": _BILI_UA,
+            "Referer": "https://www.bilibili.com/",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_BILI_API_TIMEOUT_SEC) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception as exc:
+        logger.info(
+            "Bilibili API failed: %s (%s: %s)", path[:60],
+            type(exc).__name__, exc,
+        )
+        return None
+
+
+def _bili_bvid(page_url: str) -> str:
+    """Video id (``BV…``) for *page_url*, or "".
+
+    The id is read straight out of a full page URL.  A share link is the
+    short ``b23.tv`` form and carries no id, so one redirect hop is resolved
+    — headers only, body discarded — to find the real URL.
+
+    Only Bilibili hosts are considered.  An ``…/BV1…`` path on a stranger's
+    domain must not send this machine to Bilibili's API on its say-so.
+    """
+    text = page_url or ""
+    try:
+        host = (urllib.parse.urlsplit(text).hostname or "").lower()
+    except ValueError:
+        return ""
+    if not (
+        host == "bilibili.com" or host.endswith(".bilibili.com")
+        or host == "b23.tv" or host.endswith(".b23.tv")
+    ):
+        return ""
+    match = _BVID_RE.search(text)
+    if match:
+        return match.group(1)
+    if not (host == "b23.tv" or host.endswith(".b23.tv")):
+        return ""
+    opener = urllib.request.build_opener(_NoRedirect)
+    location = ""
+    try:
+        with opener.open(
+            urllib.request.Request(text, headers={"User-Agent": _BILI_UA}),
+            timeout=_BILI_API_TIMEOUT_SEC,
+        ) as resp:
+            location = resp.geturl()
+    except urllib.error.HTTPError as exc:
+        # The 302 we asked for: ``urllib``'s redirect handler refuses it, so
+        # it arrives as an error carrying the ``Location`` header.
+        headers = exc.headers or {}
+        location = headers.get("Location", "") or exc.geturl() or ""
+    except Exception as exc:
+        logger.info(
+            "Bilibili share link failed to resolve: %s (%s: %s)",
+            text[:60], type(exc).__name__, exc,
+        )
+        return ""
+    match = _BVID_RE.search(location)
+    return match.group(1) if match else ""
+
+
+def bilibili_video_urls(page_url: str) -> list[str]:
+    """Media addresses for the Bilibili video behind *page_url*, best first.
+
+    Uses the site's public JSON API instead of rendering the page, so it works
+    where a headless browser does not.  DASH splits video and audio; only the
+    video renditions matter here, because frames are all that get sampled.
+
+    Args:
+        page_url: A ``bilibili.com/video/BV…`` page or a ``b23.tv`` share
+            link.
+
+    Returns:
+        Candidate video-stream addresses, standard-port copies first, or an
+        empty list when the id cannot be resolved or the API refuses.
+    """
+    bvid = _bili_bvid(page_url)
+    if not bvid:
+        return []
+    view = _bili_json(f"/x/web-interface/view?bvid={bvid}")
+    data = (view or {}).get("data") or {}
+    cid = data.get("cid")
+    if not cid:
+        logger.info("Bilibili API: no cid for %s (code=%s)", bvid,
+                    (view or {}).get("code"))
+        return []
+    play = _bili_json(
+        f"/x/player/playurl?bvid={bvid}&cid={cid}&qn=64&fnval=16&fourk=1"
+    )
+    dash = ((play or {}).get("data") or {}).get("dash") or {}
+    found: list[str] = []
+    seen: set[str] = set()
+    for rendition in dash.get("video") or []:
+        for candidate in [rendition.get("baseUrl"), *(rendition.get("backupUrl") or [])]:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            found.append(candidate)
+    # Same reasoning as :func:`_port_rank`: a rendition served on 4483 is
+    # unreachable to this module by design, and it must not be tried first.
+    found.sort(key=_port_rank)
+    if found:
+        logger.info(
+            "Bilibili API: %d video address(es) for %s", len(found), bvid,
+        )
+    return found
 
 
 #: ``Duration: 00:00:20.06`` in ffmpeg's banner.

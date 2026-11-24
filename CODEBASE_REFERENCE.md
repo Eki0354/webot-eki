@@ -879,11 +879,18 @@ subprocess.run(cmd, capture_output=True, timeout=30, **hidden_kwargs())
 
 聊天接口只收文本，「你能看到这个视频吗」原本只能答「看不到」。本模块把分享链接里的视频下载下来、抽几帧交给视觉模型。**ffmpeg 是可选的**：找不到二进制时 `available()` 返回 False，调用方降级为纯文字回答。
 
+取地址按可靠性依次尝试三条路。静态页面能读到 `<video src>` / `masterUrl` 时直接用；读不到时 `link_fetcher` 先试无头渲染；**渲染也拿不到就改问 B 站官方 JSON API**（`bilibili_video_urls()`）。之所以要第三条路：VM 里实测无头浏览器 1 秒内**退出码 0 且 stdout 全空**，B 站分享视频因此长期没有画面；而 B 站的 `view` + `playurl` 两个端点无需浏览器、无需签名，用桌面 UA 加站点根 Referer 就能拿到 DASH 渲染列表。
+
 | 函数 | 描述 | 参数 | 返回值 |
 |---|---|---|---|
 | `ffmpeg_path()` | 定位可执行的 `ffmpeg.exe`：`FFMPEG_PATH` → 冻结包的 `_MEIPASS`/EXE 旁 `native/windows/` → 仓库 `native/windows/` → `PATH`。结果（含失败）只算一次 | 无 | `str \| None` |
 | `available()` | 能否抽帧（等价于找到了 ffmpeg） | 无 | `bool` |
 | `video_urls_from_page(page, limit=4)` | 从页面抽视频地址，`masterUrl` 优先；去重、只留 http(s)、按 pattern 顺序决定优先级；最后按 `_port_rank` 稳定排序，标准端口（80/443）副本排在 4483/8082 这类非常规端口之前（后者过不了 `is_public_url` 的 SSRF 围栏） | `page: str, limit: int` | `list[str]` |
+| `_port_rank(url)` | 排序键：`0` 常规端口（`None`/80/443）、`1` 非常规端口、`2` 解析失败。B 站 `baseUrl` 走 4483/8082，`backupUrl` 有 443 副本，把后者排前面即可在**不放松** SSRF 规则的前提下取到可用地址 | `url: str` | `int` |
+| `bilibili_video_urls(page_url)` | **B 站官方 API 取流**：短链 `b23.tv` → 一次拒绝跟随的 302 拿 `Location` → 正则取 `BV…` → `/x/web-interface/view` 拿 `cid` → `/x/player/playurl?qn=64&fnval=16&fourk=1` 拿 DASH 渲染列表，取 `baseUrl` + `backupUrl` 去重后按 `_port_rank` 排序。无需浏览器、无需签名。解析不出 BVID 或 API 报错时返回 `[]` | `page_url: str` | `list[str]` |
+| `_bili_bvid(page_url)` | 从完整页面 URL 直接正则取 `BV…`；只有 `b23.tv` 短链才做一次重定向解析（只读响应头，不下载正文）。**仅接受 `bilibili.com` / `b23.tv` 及其子域**——陌生人域名下的 `…/BV…` 路径不得让本机去打 B 站 API | `page_url: str` | `str` |
+| `_bili_json(path)` | GET `https://api.bilibili.com` + *path*，返回解析后的 JSON（`dict`）；带桌面 UA、`Referer: https://www.bilibili.com/`、`Accept: application/json`。**从不抛异常**——它跑在回复链路上，API 抖动只能降级成「没有画面」 | `path: str` | `dict \| None` |
+| `_NoRedirect.redirect_request(…)` | 恒返回 `None`，把 3xx 变成 `HTTPError` 抛出，`Location` 从 `exc.headers` 取。避免为了一小段路径把整页下载下来 | 见签名 | `None` |
 | `_media_referer(media_url, page_url)` | 计算下载该媒体应带的 Referer：命中 `_ROOT_REFERER_HOSTS`（`bilivideo.com` / `bilivideo.cn` / `bilibili.com` 及其子域）时返回站点根 `https://www.bilibili.com/`，其余原样返回 `page_url`。**B 站实测：用 `b23.tv` 短链或空 Referer 一律 403，站点根返回 206** | `media_url: str, page_url: str` | `str` |
 | `download_video(url, dest_dir, referer="", max_bytes=_MAX_VIDEO_BYTES)` | 下载到 `dest_dir/clip.mp4`；先过 `is_public_url()`，超 `max_bytes` 或小于 1 KB 即丢弃；失败清理残留。多个 CDN 拒绝无 Referer 的请求，故需传来源页；实际发送的 Referer 经 `_media_referer()` 修正 | 见参数 | `Path \| None` |
 | `probe_duration(video, ffmpeg=None)` | 读 `Duration:` 得片长；读不出返回 `0.0`（不算错误，调用方改采开头几秒） | `video: Path, ffmpeg: str \| None` | `float` |
@@ -899,6 +906,11 @@ subprocess.run(cmd, capture_output=True, timeout=30, **hidden_kwargs())
 | `DEFAULT_FRAME_COUNT` | `3` | 送给视觉模型的帧数：够看出场景切换，又足够便宜 |
 | `_MAX_FRAME_WIDTH` | `720` | 上传前降采样宽度 |
 | `_MAX_VIDEO_BYTES` | `48 MB` | 传输上限，拒绝误标的巨型文件而卡住回复 |
+| `_STANDARD_PORTS` | `(None, 80, 443)` | `_port_rank` 认定的常规端口；其余端口（B 站 4483/8082）过不了 `is_public_url` 的围栏 |
+| `_BILI_API` | `"https://api.bilibili.com"` | B 站 API 根，`_bili_json` 拼路径用 |
+| `_BILI_API_TIMEOUT_SEC` | `8.0` | 单次 API / 短链解析的墙钟上限 |
+| `_BILI_UA` | 桌面 Chrome UA | B 站 API 与短链解析都要求像浏览器；换 UA 前先在真机上验证 |
+| `_BVID_RE` | `r"(BV[0-9A-Za-z]{10})"` | 从页面 URL 或 `Location` 里取视频 id |
 
 **为什么是完整下载，而不是让 ffmpeg 直连 URL 边读边抽**（实测记录，别再「优化」回去）。同一段 2.5 MB / 60 秒测试片抽 3 帧：
 
@@ -919,9 +931,11 @@ subprocess.run(cmd, capture_output=True, timeout=30, **hidden_kwargs())
 |---|---|---|---|
 | `browser_path()` | 定位可用 Chromium：`WEBOT_BROWSER_PATH` → Windows 的 Edge/Chrome（Edge 优先，Win10/11 自带）/ POSIX 的常见路径与 `PATH`。结果（含失败）只算一次 | 无 | `str \| None` |
 | `available()` | 能否渲染（等价于找到了浏览器） | 无 | `bool` |
-| `render_html(url, timeout=_RENDER_TIMEOUT_SEC, budget_ms=_VIRTUAL_TIME_BUDGET_MS)` | `--headless=new --dump-dom` 跑一遍页面；Chromium < 112 拒绝新拼写时，用旧版 `--headless` 重试一次；每次用独立临时 profile 并在 `finally` 里删掉（共用 profile 会附着到已运行实例、返回空）；DOM 超 `_MAX_DOM_BYTES` 截断。非 HTTP(S) 输入直接返回 None，**不做** 主机解析（URL 已由调用方校验过，这里再做一次会引入时序不同的第二次解析） | 见参数 | `str \| None` |
+| `render_html(url, timeout=_RENDER_TIMEOUT_SEC, budget_ms=_VIRTUAL_TIME_BUDGET_MS)` | `--headless=new --dump-dom` 跑一遍页面；**只要没拿到 DOM 文本（而非只看退出码）**就用旧版 `--headless` 重试一次——实测存在「退出码 0、stdout 全空」的浏览器，旧的 `returncode != 0` 判据恰好跳过了这种情况，回退从未在需要时执行；每次用独立临时 profile 并在 `finally` 里删掉（共用 profile 会附着到已运行实例、返回空）；DOM 超 `_MAX_DOM_BYTES` 截断。非 HTTP(S) 输入直接返回 None，**不做** 主机解析（URL 已由调用方校验过，这里再做一次会引入时序不同的第二次解析） | 见参数 | `str \| None` |
 | `reset_browser_cache()` | 忘掉已定位的浏览器（仅供改变搜索路径的测试用） | 无 | `None` |
-| `_run_browser(exe, args, profile, timeout)` | 启动一次浏览器，返回 `(stdout, returncode)`；带 `hidden_kwargs()`，否则每次渲染都会闪一个黑窗口 | 见参数 | `tuple \| None` |
+| `_run_browser(exe, args, profile, timeout)` | 启动一次浏览器，返回 `(stdout, returncode, stderr)`；带 `hidden_kwargs()`，否则每次渲染都会闪一个黑窗口。**stderr 一并带回而不就地打日志**：真正难查的是「启动成功、正常退出、什么都没打印」，只有浏览器自己的抱怨能解释它 | 见参数 | `tuple \| None` |
+| `_usable(result)` | 一次运行是否可用：仅当 `stdout` 有非空白内容才算成功。**刻意不用 `returncode == 0`**——`--dump-dom` 打不开页面、或该构建忽略了这个参数时，浏览器会退出码 0 且一行不输出，把它当成功正是失败被掩盖的原因 | `result: tuple \| None` | `bool` |
+| `_stderr_hint(result)` | 取 stderr 最后一行非空文本（截断 200 字符），用于失败日志；无 stderr 时返回 `""` | `result: tuple \| None` | `str` |
 
 模块级常量：
 
@@ -980,6 +994,7 @@ subprocess.run(cmd, capture_output=True, timeout=30, **hidden_kwargs())
 | `_video_urls(page)` | 从刚抓到的页面里抽媒体地址；函数内导入 `src.media.video`（`video` 反向依赖本模块的 `is_public_url`，模块级导入会成环）；无 ffmpeg 也照常记录 | `page: str` | `list[str]` |
 | `_judge_page(url, page, raw_len, content_type)` | 判定页面是否可读：非文本 → `non-textual`；验证墙/空壳 → `blocked`；正文够长则成 `Article`；**正文不足 `_MIN_USABLE_TEXT` 但页内有视频地址**时，返回 `text=""` 的纯视频 `Article`（只喂抽帧链路，`format_link_context` 会跳过空正文）；否则 `stub`/`empty` | 见参数 | `tuple[Article \| None, str]` |
 | `_render_page(url, timeout)` | 用无头浏览器执行页面脚本后判定 DOM：`_judge_page` 走的是与静态路径**同一套**判据，所以渲染出来的验证墙仍是 `blocked`，不会被当成正文注入 prompt。函数内导入 `src.media.browser_render`，任何失败都返回 `None` | `url: str, timeout: float` | `Article \| None` |
+| `_with_video_urls(article, url, timeout)` | 只为「正文可读但页面没有媒体地址」的提问补 `video_urls`，正文保留静态那份。渲染拿到地址即返回；渲染无果时**改问 B 站官方 API**（`video.bilibili_video_urls`，函数内导入以免成环）。两者都空则原样返回。**实测：VM 里无头渲染 1 秒内退出码 0 且 DOM 为空，B 站分享视频因此一直没有画面——API 这条路不依赖浏览器** | `article: Article` + 关键字 | `Article` |
 | `set_render_enabled(enabled)` | 直接调用 `fetch_article` 的场合（测试、一次性工具）设置模块默认开关；线上路径显式传 `render=` | `enabled: bool` | `None` |
 | `clear_cache()` | 清空页面缓存（测试用） | 无 | `None` |
 
@@ -2169,7 +2184,7 @@ MacHybridBackend
 | `wxgf.py` | `src/media/wxgf.py` | `wxgf`/HEVC 容器解包 (PyAV 可选) |
 | `keys.py` | `src/media/keys.py` | 图片密钥来源解析 (`env` / `file`) |
 | `vision.py` | `src/media/vision.py` | 图片/视频帧描述 (OpenAI 兼容接口，请求形状按需协商) |
-| `video.py` | `src/media/video.py` | 分享视频抽帧 (下载 + 外挂 ffmpeg.exe，可选依赖) |
+| `video.py` | `src/media/video.py` | 分享视频抽帧 (下载 + 外挂 ffmpeg.exe，可选依赖) + B 站官方 API 取流 (无浏览器) |
 | `browser_render.py` | `src/media/browser_render.py` | 无头 Edge/Chrome 执行页面脚本后取 DOM (不新增依赖，可选) |
 | `backfill.py` | `src/media/backfill.py` | 历史裸占位符按需重描述并写回 DB |
 
@@ -2227,8 +2242,14 @@ MessageRouter._handle_chat(msg, clean_content)
         │     └── fetch_article(url) → _judge_page()
         │           ├── extract_article(html) → (title, text)
         │           ├── _blocked_marker(title, text) → 验证墙/空壳页则丢弃
-        │           └── Article(video_urls=_video_urls(page))
-        │                 └── video.video_urls_from_page(page) — masterUrl 优先
+        │           ├── Article(video_urls=_video_urls(page))
+        │           │     └── video.video_urls_from_page(page) — masterUrl 优先
+        │           └── _with_video_urls(article, url, timeout)   ← 仅 want_video 时
+        │                 ├── _render_page(url) → 有地址则用渲染那份
+        │                 └── video.bilibili_video_urls(url)      ← 渲染无果时的兜底
+        │                       ├── _bili_bvid(url) → b23.tv 一次 302 → 正则取 BV…
+        │                       ├── _bili_json("/x/web-interface/view?bvid=") → cid
+        │                       └── _bili_json("/x/player/playurl?…fnval=16") → dash
         ├── format_link_context(articles) → "[链接正文] …" 块
         └── _video_context(articles)
               └── MediaPipeline.describe_video(article.video_urls, article.url)

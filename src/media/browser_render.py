@@ -180,7 +180,13 @@ def available() -> bool:
 
 
 def _run_browser(exe: str, args: list, profile: Path, timeout: float):
-    """Start the browser once.  Returns ``(stdout, returncode)`` or None."""
+    """Start the browser once.
+
+    Returns ``(stdout, returncode, stderr)`` or None when it could not run at
+    all.  ``stderr`` is carried back rather than logged here because the
+    interesting case — a browser that starts and exits cleanly having printed
+    nothing — is only diagnosable from what it complained about.
+    """
     command = [exe, *args, f"--user-data-dir={profile}"]
     try:
         proc = subprocess.run(
@@ -199,7 +205,27 @@ def _run_browser(exe: str, args: list, profile: Path, timeout: float):
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("Page render failed: %s: %s", type(exc).__name__, exc)
         return None
-    return proc.stdout, proc.returncode
+    return proc.stdout, proc.returncode, proc.stderr
+
+
+def _usable(result) -> bool:
+    """True when a run produced DOM text.
+
+    Deliberately not "returncode == 0": a browser can exit 0 having printed
+    nothing (``--dump-dom`` against a page that never finished loading, or a
+    build that ignored the flag), and treating that as success is what hid
+    the failure.  Output is the only thing the caller can use.
+    """
+    return bool(result and result[0] and result[0].strip())
+
+
+def _stderr_hint(result) -> str:
+    """Last line of the browser's stderr, for the failure log."""
+    if not result or len(result) < 3 or not result[2]:
+        return ""
+    text = result[2].decode("utf-8", errors="replace").strip()
+    lines = [line for line in text.splitlines() if line.strip()]
+    return lines[-1][:200] if lines else ""
 
 
 def render_html(
@@ -240,10 +266,16 @@ def render_html(
         ]
         result = _run_browser(exe, args, profile, timeout)
 
-        # Chromium older than 112 rejects ``--headless=new``.  One retry with
-        # the legacy spelling costs nothing on the failure path that is the
-        # only place it can happen.
-        if result is None or (result[1] != 0 and not result[0].strip()):
+        # Retry with the legacy spelling of the headless flag whenever the
+        # first run produced no DOM — not only when it exited non-zero.  A
+        # browser that ignored ``--headless=new`` has been measured to exit
+        # **0** with nothing on stdout, and the old ``returncode != 0`` test
+        # skipped the retry on exactly that shape, so the fallback never ran
+        # where it was needed.  Chromium older than 112 rejects the new
+        # spelling outright; both that and the silent variant are covered by
+        # asking the only question that matters — did we get DOM text?
+        if not _usable(result):
+            first_hint = _stderr_hint(result)
             args = [
                 "--headless",
                 *[a for a in _BASE_ARGS if not a.startswith("--dump-dom")],
@@ -252,8 +284,12 @@ def render_html(
                 url,
             ]
             retry = _run_browser(exe, args, profile, timeout)
-            if retry is not None and retry[0].strip():
+            if _usable(retry):
                 result = retry
+            elif first_hint:
+                logger.info(
+                    "Page render: --headless=new said: %s", first_hint,
+                )
     finally:
         # A Chromium profile is a directory tree with locks; leaking one per
         # rendered page would fill the temp dir.
@@ -261,11 +297,13 @@ def render_html(
 
     if result is None:
         return None
-    stdout, returncode = result
+    stdout, returncode = result[0], result[1]
     dom = stdout.decode("utf-8", errors="replace") if stdout else ""
     if not dom.strip():
+        hint = _stderr_hint(result)
         logger.warning(
-            "Page render produced no DOM for %s (exit %s)", url[:80], returncode,
+            "Page render produced no DOM for %s (exit %s)%s",
+            url[:80], returncode, f": {hint}" if hint else "",
         )
         return None
     if len(dom) > _MAX_DOM_BYTES:

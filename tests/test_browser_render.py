@@ -98,14 +98,14 @@ class _RenderHtmlTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def _stub_run(self, stdout: bytes, returncode: int = 0):
+    def _stub_run(self, stdout: bytes, returncode: int = 0, stderr: bytes = b""):
         """Replace the browser run and record every call it receives."""
         calls = []
 
         def _fake(exe, args, profile, timeout):
             calls.append({"exe": exe, "args": list(args),
                           "profile": Path(profile), "timeout": timeout})
-            return stdout, returncode
+            return stdout, returncode, stderr
 
         patcher = mock.patch.object(self.module, "_run_browser", side_effect=_fake)
         patcher.start()
@@ -181,6 +181,51 @@ class _RenderHtmlTests(unittest.TestCase):
         self.module.render_html(self._URL)
         self.assertEqual(len(calls), 1)
 
+    def test_silent_zero_exit_is_still_retried(self):
+        """Measured in the VM: exit 0 with empty stdout, in about a second.
+
+        The old retry test was ``returncode != 0``, so this exact shape — a
+        browser that ignored ``--headless=new`` and printed nothing — skipped
+        the legacy-spelling fallback and returned None.  Output is the only
+        thing the caller can use, so an empty run is a failure regardless of
+        exit status.
+        """
+        calls = []
+
+        def _fake(exe, args, profile, timeout):
+            calls.append(list(args))
+            if "--headless=new" in args:
+                return b"", 0  # exited cleanly, said nothing
+            return b"<html><video src='a.mp4'></video></html>", 0, b""
+
+        with mock.patch.object(self.module, "_run_browser", side_effect=_fake):
+            dom = self.module.render_html(self._URL)
+        self.assertIsNotNone(dom)
+        self.assertIn("a.mp4", dom)
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("--headless=new", calls[1])
+
+    def test_stderr_of_the_failed_spelling_is_logged(self):
+        """The failure log has to carry what the browser complained about."""
+        message = b"[ERROR] unknown flag --headless=new\r\n"
+
+        def _fake(exe, args, profile, timeout):
+            if "--headless=new" in args:
+                return b"", 0, message
+            return b"", 0, message
+
+        with mock.patch.object(self.module, "_run_browser", side_effect=_fake):
+            with self.assertLogs(self.module.logger, level="INFO") as logs:
+                self.assertIsNone(self.module.render_html(self._URL))
+        text = "\n".join(logs.output)
+        self.assertIn("unknown flag --headless=new", text)
+
+    def test_stderr_is_absent_from_the_log_when_the_browser_said_nothing(self):
+        self._stub_run(b"", returncode=0)
+        with self.assertLogs(self.module.logger, level="WARNING") as logs:
+            self.assertIsNone(self.module.render_html(self._URL))
+        self.assertNotIn(": ", logs.output[-1].split("(exit 0)")[-1])
+
     def test_timeout_is_a_quiet_none(self):
         """A hung page degrades to "no frames", not a stuck reply path."""
         with mock.patch.object(self.module, "_run_browser", return_value=None):
@@ -211,6 +256,7 @@ class _RenderHtmlTests(unittest.TestCase):
         class _Proc:
             stdout = b"<html>ok</html>"
             returncode = 0
+            stderr = b""
 
         def _fake_run(command, **kwargs):
             captured.update(kwargs)
