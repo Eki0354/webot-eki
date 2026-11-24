@@ -883,8 +883,9 @@ subprocess.run(cmd, capture_output=True, timeout=30, **hidden_kwargs())
 |---|---|---|---|
 | `ffmpeg_path()` | 定位可执行的 `ffmpeg.exe`：`FFMPEG_PATH` → 冻结包的 `_MEIPASS`/EXE 旁 `native/windows/` → 仓库 `native/windows/` → `PATH`。结果（含失败）只算一次 | 无 | `str \| None` |
 | `available()` | 能否抽帧（等价于找到了 ffmpeg） | 无 | `bool` |
-| `video_urls_from_page(page, limit=4)` | 从页面抽视频地址，`masterUrl` 优先；去重、只留 http(s)、按 pattern 顺序决定优先级 | `page: str, limit: int` | `list[str]` |
-| `download_video(url, dest_dir, referer="", max_bytes=_MAX_VIDEO_BYTES)` | 下载到 `dest_dir/clip.mp4`；先过 `is_public_url()`，超 `max_bytes` 或小于 1 KB 即丢弃；失败清理残留。多个 CDN 拒绝无 Referer 的请求，故需传来源页 | 见参数 | `Path \| None` |
+| `video_urls_from_page(page, limit=4)` | 从页面抽视频地址，`masterUrl` 优先；去重、只留 http(s)、按 pattern 顺序决定优先级；最后按 `_port_rank` 稳定排序，标准端口（80/443）副本排在 4483/8082 这类非常规端口之前（后者过不了 `is_public_url` 的 SSRF 围栏） | `page: str, limit: int` | `list[str]` |
+| `_media_referer(media_url, page_url)` | 计算下载该媒体应带的 Referer：命中 `_ROOT_REFERER_HOSTS`（`bilivideo.com` / `bilivideo.cn` / `bilibili.com` 及其子域）时返回站点根 `https://www.bilibili.com/`，其余原样返回 `page_url`。**B 站实测：用 `b23.tv` 短链或空 Referer 一律 403，站点根返回 206** | `media_url: str, page_url: str` | `str` |
+| `download_video(url, dest_dir, referer="", max_bytes=_MAX_VIDEO_BYTES)` | 下载到 `dest_dir/clip.mp4`；先过 `is_public_url()`，超 `max_bytes` 或小于 1 KB 即丢弃；失败清理残留。多个 CDN 拒绝无 Referer 的请求，故需传来源页；实际发送的 Referer 经 `_media_referer()` 修正 | 见参数 | `Path \| None` |
 | `probe_duration(video, ffmpeg=None)` | 读 `Duration:` 得片长；读不出返回 `0.0`（不算错误，调用方改采开头几秒） | `video: Path, ffmpeg: str \| None` | `float` |
 | `frame_timestamps(duration, count)` | 把片长切成 count 等份、各取中点；时长未知时采开头 | `duration: float, count: int` | `list[float]` |
 | `extract_frames(video, dest_dir, count=DEFAULT_FRAME_COUNT)` | 按时间点抽帧并压到 `_MAX_FRAME_WIDTH`(720)，JPEG 约 50–70 KB/帧 | 见参数 | `list[Path]` |

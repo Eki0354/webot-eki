@@ -205,6 +205,16 @@ _FETCH_BUDGET_SEC = 8
 #: static attempts have already come back empty.
 _RENDER_TIMEOUT_SEC = 12.0
 
+#: Least remaining budget worth starting a browser with.  A render that is
+#: killed halfway returns nothing, so the gate cannot be "the full timeout
+#: still fits" — that was the bug: the batch budget (8s) was smaller than the
+#: render timeout (12s), so ``left >= render_timeout`` was never true and the
+#: renderer never ran on the live path, in any configuration.  What actually
+#: matters is whether the render can finish: the timeout handed down is
+#: clamped to what is left, and below this floor even a clamped run cannot
+#: paint a page, so the browser is not started at all.
+_MIN_RENDER_BUDGET_SEC = 3.0
+
 #: Words that mean the asker expects *moving pictures* from the link.  Only a
 #: question carrying one of these may spend a browser start on a page whose
 #: static HTML already had readable prose: the static read is the cheap path
@@ -1539,7 +1549,15 @@ def fetch_for_question(
         # the render happens last, so it only runs when the batch can still
         # afford it.  Starting a browser this deadline will kill is worse than
         # not starting it: the reply pays the wait and gets nothing.
-        allowance = left >= render_timeout
+        #
+        # The gate is "enough left for a *clamped* render", not "the full
+        # timeout still fits".  Comparing against ``render_timeout`` made the
+        # two defaults self-cancelling — 8s of batch budget never covers a 12s
+        # timeout, so ``allowance`` was False on every live question and the
+        # renderer was dead code in production.  ``render_timeout`` is clamped
+        # to ``left`` below, so a short remainder is usable as long as it
+        # clears the floor.
+        allowance = left >= min(render_timeout, _MIN_RENDER_BUDGET_SEC)
         article = fetch_article(
             url,
             render=render if render is not None else None,

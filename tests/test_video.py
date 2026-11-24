@@ -93,6 +93,87 @@ class FrameTimestampTests(unittest.TestCase):
         self.assertEqual(len(frame_timestamps(10.0, 0)), 1)
 
 
+class MediaRefererTests(unittest.TestCase):
+    """A CDN that pins its referer gets that root, not the page it came from.
+
+    Bilibili is the measured case: a chat share link is ``b23.tv``, and the
+    CDN answers 403 to that referer (and to none), while
+    ``https://www.bilibili.com/`` answers 206.  Every Bilibili clip was
+    refused before this, so the frames never reached the model.
+    """
+
+    def test_bilibili_cdn_gets_the_site_root(self):
+        from src.media.video import _media_referer
+
+        self.assertEqual(
+            _media_referer(
+                "https://upos-sz-mirrorcoso1.bilivideo.com/upgcxcode/a.m4s",
+                "https://b23.tv/2qF8lis",
+            ),
+            "https://www.bilibili.com/",
+        )
+
+    def test_subdomains_of_the_pinned_host_match(self):
+        from src.media.video import _media_referer
+
+        self.assertEqual(
+            _media_referer("https://x.bilivideo.cn/a.m4s", "https://b23.tv/x"),
+            "https://www.bilibili.com/",
+        )
+
+    def test_other_cdns_keep_the_page_referer(self):
+        from src.media.video import _media_referer
+
+        self.assertEqual(
+            _media_referer(
+                "https://sns-video-v3.xhscdn.com/stream/a.mp4",
+                "https://www.xiaohongshu.com/explore/x",
+            ),
+            "https://www.xiaohongshu.com/explore/x",
+        )
+
+    def test_a_lookalike_host_is_not_matched(self):
+        from src.media.video import _media_referer
+
+        # ``evil-bilivideo.com`` must not inherit the root referer.
+        self.assertEqual(
+            _media_referer("https://evil-bilivideo.com/a.m4s", "https://page/x"),
+            "https://page/x",
+        )
+
+    def test_download_sends_the_corrected_referer(self):
+        from src.media import video as video_mod
+
+        captured = {}
+
+        class _Resp:
+            def __init__(self):
+                self._chunks = [b"x" * 4096, b""]
+
+            def read(self, _n=-1):
+                return self._chunks.pop(0)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, timeout=0):
+            captured["referer"] = request.get_header("Referer")
+            return _Resp()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(video_mod.urllib.request, "urlopen", fake_urlopen):
+                got = video_mod.download_video(
+                    "https://upos-sz-mirrorcoso1.bilivideo.com/a.m4s",
+                    Path(tmp),
+                    referer="https://b23.tv/2qF8lis",
+                )
+            self.assertIsNotNone(got)
+        self.assertEqual(captured["referer"], "https://www.bilibili.com/")
+
+
 def _pipeline(vision=True):
     from src.media.pipeline import MediaPipeline
 

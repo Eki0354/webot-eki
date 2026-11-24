@@ -67,14 +67,87 @@ _MIN_FRAME_BYTES = 2048
 #: ``backupUrl`` inside its embedded state; other sites use a ``<video>`` or
 #: ``<source>`` tag.  The last pattern is the general "any .mp4 URL in the
 #: markup" fallback, which is what catches a player configured by script.
+#:
+#: Bilibili is the reason the array spellings exist: its ``window.__playinfo__``
+#: writes ``"baseUrl": "…m4s"`` and ``"backupUrl": ["…", "…"]``, so a pattern
+#: that only accepts ``"backupUrl": "…"`` matches nothing at all there
+#: (measured: 0 hits in a 1.5 MB rendered DOM that carried 9 baseUrl and 9
+#: backupUrl arrays).
 _URL_PATTERNS = (
     re.compile(r'"masterUrl"\s*:\s*"((?:[^"\\]|\\.)*)"'),
     re.compile(r'"backupUrl"\s*:\s*"((?:[^"\\]|\\.)*)"'),
+    # Arrays: take the first entry, which is the rendition the site plays.
+    re.compile(r'"backupUrl"\s*:\s*\[\s*"((?:[^"\\]|\\.)*)"'),
     re.compile(r'"videoUrl"\s*:\s*"((?:[^"\\]|\\.)*)"'),
+    # Bilibili/clone players: snake_case alongside the camelCase spelling.
+    re.compile(r'"baseUrl"\s*:\s*"((?:[^"\\]|\\.)*)"'),
+    re.compile(r'"base_url"\s*:\s*"((?:[^"\\]|\\.)*)"'),
     re.compile(r'<video[^>]*\bsrc\s*=\s*["\']([^"\']+)["\']', re.I),
     re.compile(r'<source[^>]*\bsrc\s*=\s*["\']([^"\']+)["\']', re.I),
     re.compile(r'(https?:(?:\\u002F|\\/|/){2}[^"\'\\\s]+?\.mp4[^"\'\\\s]*)', re.I),
 )
+
+#: Ports :func:`~src.media.link_fetcher.is_public_url` will fetch.  Kept in
+#: sync by name rather than imported, because the fence that matters is the
+#: ordering decision below, not the list itself.
+_STANDARD_PORTS = (None, 80, 443)
+
+
+def _port_rank(url: str) -> int:
+    """Sort key: 0 for a standard port, 1 for an odd one, 2 for unparsable.
+
+    Bilibili hands out ``baseUrl`` on CDN ports 4483 and 8082 — addresses
+    that *work* but that :func:`is_public_url` refuses, by design, as a probe
+    fence.  The same clip is listed on ``upos-sz-mirror*.bilivideo.com`` under
+    the ``backupUrl`` array on port 443, which the fence allows (measured: the
+    odd-port copy 403s the fence, the standard-port copy downloads 1.6 MB and
+    samples three frames).  Ordering the standard-port copies first lets the
+    sampler reach the working address without relaxing the SSRF rule at all.
+    """
+    try:
+        port = urllib.parse.urlsplit(url).port
+    except ValueError:
+        return 2
+    return 0 if port in _STANDARD_PORTS else 1
+
+#: Hosts whose CDN refuses a referer other than the site root.  Bilibili is
+#: the measured case: the share link a chat carries is the short ``b23.tv``
+#: form, and passing it through as the referer answers 403 — as does sending
+#: none at all.  ``https://www.bilibili.com/`` answers 206 and the clip
+#: downloads whole (measured: 1.6 MB, 26.3 s, three frames sampled).  So for
+#: these hosts the referer is the site root, never the page the link came
+#: from.
+_ROOT_REFERER_HOSTS = {
+    "bilivideo.com": "https://www.bilibili.com/",
+    "bilivideo.cn": "https://www.bilibili.com/",
+    "bilibili.com": "https://www.bilibili.com/",
+}
+
+
+def _media_referer(media_url: str, page_url: str) -> str:
+    """Referer to send when downloading *media_url*.
+
+    Most CDNs accept the page URL, and that is what the caller passes.  A
+    few pin the referer to their own root and reject anything else — Bilibili
+    among them — so those hosts get their fixed root instead.  Without this,
+    every Bilibili clip is fetched with a ``b23.tv`` referer and refused.
+
+    Args:
+        media_url: The media address being downloaded.
+        page_url: The page the address was found on.
+
+    Returns:
+        The referer to send, possibly empty when *page_url* was.
+    """
+    try:
+        host = (urllib.parse.urlsplit(media_url).hostname or "").lower()
+    except ValueError:
+        return page_url
+    for suffix, root in _ROOT_REFERER_HOSTS.items():
+        if host == suffix or host.endswith("." + suffix):
+            return root
+    return page_url
+
 
 #: ``Duration: 00:00:20.06`` in ffmpeg's banner.
 _DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
@@ -183,6 +256,12 @@ def video_urls_from_page(page: str, *, limit: int = 4) -> list[str]:
     entries are dropped and the order of the patterns decides priority:
     ``masterUrl`` is the one the site itself plays.
 
+    Within that order, standard-port copies come before odd-port ones.  The
+    reasoning is in :func:`_port_rank`: a CDN that serves the clip on port
+    4483 is unreachable to this module by design, so listing it first would
+    spend the one retry the caller can afford on an address that is certain
+    to be refused.
+
     Args:
         page: Whole HTML document.
         limit: Most addresses to return.
@@ -205,9 +284,10 @@ def video_urls_from_page(page: str, *, limit: int = 4) -> list[str]:
                 continue
             seen.add(url)
             found.append(url)
-            if len(found) >= limit:
-                return found
-    return found
+    # Stable sort: pattern order still decides among equals, which is what
+    # keeps ``masterUrl`` ahead of a generic ``.mp4`` hit.
+    found.sort(key=_port_rank)
+    return found[:limit]
 
 
 # ── Downloading ──────────────────────────────────────────────────────
@@ -230,7 +310,9 @@ def download_video(
         url: Media address taken from a page.
         dest_dir: Directory to write ``clip.mp4`` into.
         referer: Page the address came from.  Several CDNs reject a request
-            with no referer; the caller passes the article URL.
+            with no referer; the caller passes the article URL.  Hosts that
+            pin the referer to their own root (see :func:`_media_referer`)
+            get that root instead.
         max_bytes: Transfer cap.
 
     Returns:
@@ -247,8 +329,9 @@ def download_video(
         ),
         "Accept": "*/*",
     }
-    if referer:
-        headers["Referer"] = referer
+    actual_referer = _media_referer(url, referer)
+    if actual_referer:
+        headers["Referer"] = actual_referer
     request = urllib.request.Request(url, headers=headers)
 
     dest_dir.mkdir(parents=True, exist_ok=True)
