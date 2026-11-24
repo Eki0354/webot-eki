@@ -110,10 +110,31 @@ pyinstaller build.spec
 # 输出: dist/webot.exe
 ```
 
+## 运行与调试环境（重要，先读这条）
+
+**实际运行的 EXE 在虚拟机里，不在本机。**
+
+- 虚拟机运行的是 `D:\share\projects\webot\dist\webot.exe`（本机侧同一路径为
+  `/d/share/projects/webot/dist/webot.exe`，`D:\share` 是共享文件夹）。
+- 运行日志由虚拟机**同步**到 `D:\share\projects\webot\dist\data\bot.log`，
+  **同步有延迟**：日志尾部时间戳比“刚才”早几分钟是正常的，不代表程序没在跑。
+- 本机 `tasklist` 里**不会**出现 `webot.exe`，也不要去全盘搜索其它 `bot.log`。
+  这是正常的，不是进程没启动。
+
+排查顺序（照这个来，不要自由发挥）：
+
+1. 只看 `/d/share/projects/webot/dist/data/bot.log`。
+2. 若时间戳明显滞后于用户反馈的时间点，说明日志还没同步过来 —— 直接说
+   “日志还没同步”，等下一轮再看，或请用户手动同步一次。
+3. 部署新包 = 本机打包后 `cp` 到 `/d/share/projects/webot/dist/webot.exe`，
+   然后**必须提醒用户重启虚拟机里的程序**：正在运行的进程不会自动加载新代码，
+   不重启就等于没部署。
+
 ## 日志位置
 
 - 源码运行: `data/bot.log`
 - EXE 运行: `dist/data/bot.log`
+- 线上（虚拟机）: 同步到 `/d/share/projects/webot/dist/data/bot.log`
 
 ## 代码参考手册同步更新
 
