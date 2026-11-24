@@ -1,8 +1,8 @@
 """MemoryConsolidator — triggers and orchestrates group memory updates.
 
 Core logic:
-- After every N new messages (default 30), or
-- After T hours since last consolidation (default 2h),
+- After every N new messages (default 20), or
+- After T since last consolidation (default 30min),
   consolidate the new messages into the group's memory diary.
 
 Uses the DeepSeek Flash API for low-cost, low-latency consolidation.
@@ -22,9 +22,9 @@ logger = logging.getLogger(__name__)
 # ── Tuning constants ─────────────────────────────────────────────────
 
 # Trigger consolidation after this many NEW messages
-CONSOLIDATE_MSG_THRESHOLD = 50
+CONSOLIDATE_MSG_THRESHOLD = 20
 # Or after this many seconds since last consolidation (with new messages)
-CONSOLIDATE_TIME_THRESHOLD_SEC = 1 * 3600  # 1 hour
+CONSOLIDATE_TIME_THRESHOLD_SEC = 30 * 60  # 30 minutes
 # Maximum new messages to send per consolidation (limits prompt size)
 MAX_NEW_MSGS_PER_CONSOLIDATION = 400
 

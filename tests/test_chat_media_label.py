@@ -72,6 +72,7 @@ class ChatContextRenderingTests(unittest.TestCase):
 
             def _call_chat_api(self, system_prompt, messages):
                 captured["prompt"] = system_prompt
+                captured["messages"] = messages
                 return "ok"
 
         summarizer = _Capture()
@@ -87,9 +88,12 @@ class ChatContextRenderingTests(unittest.TestCase):
             group_name="Dobby测试",
         )
 
-        self.assertIn("[图片内容：一只猫在键盘上]", captured["prompt"])
+        # The surrounding chat now travels as real conversation turns, so
+        # that is where the label has to land.
+        transcript = "\n".join(m["content"] for m in captured["messages"])
+        self.assertIn("[图片内容：一只猫在键盘上]", transcript)
         # The ambiguous form must be gone, otherwise the prior can still win.
-        self.assertNotIn("Dobby: [图片] 一只猫在键盘上", captured["prompt"])
+        self.assertNotIn("Dobby: [图片] 一只猫在键盘上", transcript)
 
     def test_proactive_prompt_labels_described_media(self):
         from src.summarize.base import AbstractSummarizer

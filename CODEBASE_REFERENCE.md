@@ -172,10 +172,11 @@ grep "文件名" CODEBASE_REFERENCE.md
 | `UI_DIR` | `Path` | `ui/dist/` | `src/web/server.py` | 前端静态文件目录 |
 | `WEBSOCKET_GUID` | `bytes` | `b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"` | `src/web/server.py` | WebSocket 协议 GUID |
 | `_env_write_lock` | `threading.Lock` | `threading.Lock()` | `src/config.py` | 串行化所有 .env 写盘（`write_env_file` 内部持有；server 侧不再单独加锁） |
-| `CONSOLIDATE_MSG_THRESHOLD` | `int` | `50` | `src/memory/consolidator.py` | 触发记忆合并的消息数阈值 |
-| `CONSOLIDATE_TIME_THRESHOLD_SEC` | `int` | `3600` (1小时) | `src/memory/consolidator.py` | 触发记忆合并的时间阈值 |
+| `CONSOLIDATE_MSG_THRESHOLD` | `int` | `20` | `src/memory/consolidator.py` | 触发记忆合并的消息数阈值 |
+| `CONSOLIDATE_TIME_THRESHOLD_SEC` | `int` | `1800` (30分钟) | `src/memory/consolidator.py` | 触发记忆合并的时间阈值 |
 | `MAX_NEW_MSGS_PER_CONSOLIDATION` | `int` | `400` | `src/memory/consolidator.py` | 每次合并最多处理的消息数 |
-| `CHAT_CONTEXT_WINDOW_SEC` | `int` | `600` | `src/router.py` | AI 聊天上下文时间窗口(秒) |
+| `CHAT_CONTEXT_WINDOW_SEC` | `int` | `1800` | `src/router.py` | AI 聊天上下文时间窗口(秒) |
+| `MAX_CONTEXT_MESSAGES` | `int` | `40` | `src/router.py` | 上下文合并后的轮次上限（群消息 + bot 自己回复） |
 | `MAX_CONTENT_LENGTH` | `int` | `997` | `src/router.py` | 发送给 AI 的单条消息最大字符数 |
 | `MAX_CONTENT_LINES` | `int` | `20` | `src/router.py` | AI 聊天上下文最大行数 |
 | `AT_MENTION_MAX_AGE_SEC` | `int` | `300` | `src/router.py` | @mention 消息最大有效年龄(秒) |
@@ -294,7 +295,10 @@ todo_delete_keywords: list[str] = [
 
 | 函数 | 行号 | 描述 | 参数 | 返回值 |
 |---|---|---|---|---|
-| `chat(message, ...)` | ~20 | AI 对话响应 (@bot)；上下文行经 `label_described_media()` 渲染媒体；`link_context` 为已抓取的链接正文 | `message: str, context_messages=None, requester_name="", bot_name="", group_name="", group_memory="", link_context=""` | `str` |
+| `chat(message, ...)` | ~20 | AI 对话响应 (@bot)；上下文变成真正的多轮 messages（`is_bot` → assistant，群友 → user，相邻同角色合并），不再塞进 system prompt；`link_context` 为已抓取的链接正文，`digest` 为窗口外对话的滚动概要 | `message: str, context_messages=None, requester_name="", bot_name="", group_name="", group_memory="", link_context="", digest=""` | `str` |
+| `chat_raw(system_prompt, user_prompt)` | — | 单次纯文本调用（无聊天包装），给滚动摘要压缩用 | `system_prompt: str, user_prompt: str` | `str` |
+| `_build_chat_turns(context_messages)` | — | 把存储行转成 user/assistant 轮次 | `context_messages: list[dict]` | `list[dict]` |
+| `_merge_adjacent_turns(turns)` | — | 合并相邻同角色轮次（Anthropic 严格要求交替，首条必须 user） | `turns: list[dict]` | `list[dict]` |
 | `proactive_chat(mode, context_messages, ...)` | ~50 | 主动发言；上下文行同样经 `label_described_media()` 渲染 | `mode: ProactiveMode, context_messages: list[dict], bot_name="", group_name="", group_memory=""` | `str` |
 | `label_described_media(content)` | ~26 | 把已描述的媒体占位符改写成 `[图片内容：…]`，避免模型误判成占位符；裸占位符保持不变 | `content: str` | `str` |
 | `summarize(messages, requester_name)` | ~80 | 生成结构化摘要 | `messages: list[dict], requester_name: str` | `SummaryResult` |
@@ -529,7 +533,12 @@ todo_delete_keywords: list[str] = [
 | `get_sender_display_name(sender_id)` | 查找已知显示名 | `sender_id: str` | `str \| None` |
 | `get_user_last_timestamp(chat_id, sender_id)` | 获取用户最后发言时间 | `chat_id, sender_id: str` | `int \| None` |
 | `get_user_previous_timestamp(chat_id, sender_id, before_ts)` | 获取用户在某时间前的最后发言 | `chat_id, sender_id: str, before_ts: int` | `int \| None` |
-| `get_messages_since(chat_id, since_ts, until_ts, limit)` | 获取时间窗口内消息 | `chat_id, since_ts, until_ts, limit` | `list[dict]` |
+| `get_messages_since(chat_id, since_ts, until_ts, limit, newest)` | 获取时间窗口内消息；`newest=True` 取窗口内**最新** N 条（默认取最早 N 条） | `chat_id, since_ts, until_ts, limit, newest` | `list[dict]` |
+| `get_messages_before(chat_id, before_ts, limit)` | 取某时间点之前的消息(新→旧取 N 条后翻正序)，供滚动摘要使用 | `chat_id, before_ts, limit` | `list[dict]` |
+| `insert_bot_reply(chat_id, content, timestamp, message_id)` | 记录机器人自己发出的回复(轮询读不到自己的消息) | `chat_id, content, timestamp, message_id` | `bool` |
+| `get_bot_replies_since(chat_id, since_ts, limit, newest)` | 取机器人自己在窗口内的回复 | `chat_id, since_ts, limit, newest` | `list[dict]` |
+| `get_chat_digest(chat_id)` | 取滚动摘要缓存 | `chat_id: str` | `dict \| None` |
+| `upsert_chat_digest(chat_id, digest_text, last_message_id)` | 写入滚动摘要与已摘要游标 | `chat_id, digest_text, last_message_id` | `None` |
 | `was_recently_triggered(chat_id, window_sec)` | 检查最近是否触发过 | `chat_id: str, window_sec: int` | `bool` |
 | `get_group_memory(chat_id)` | 获取群聊记忆 | `chat_id: str` | `dict \| None` |
 | `upsert_group_memory(chat_id, memory_text, message_count, last_message_id)` | 更新/插入群聊记忆 | `chat_id, memory_text, message_count, last_message_id` | `None` |
@@ -1082,6 +1091,7 @@ desktop.py  (桌面入口)
             │       │     ├── rate_tracker.py → RateTracker (滑动窗口)
             │       │     └── sticky.py     → StickyMentionTracker (粘性@)
             │       ├── src/memory/consolidator.py  (记忆合并)
+            │       ├── src/memory/digest.py       (窗口外对话滚动摘要)
             │       ├── src/todo/  (待办)
             │       │     ├── store.py  → TodoStore (SQLite)
             │       │     └── handler.py → TodoHandler (命令解析)
@@ -1462,15 +1472,17 @@ MessageRouter.handle(msg)
   │           └── format_summary_for_reply() — 格式化为微信回复
   │
   └── [AI 对话] → _handle_chat(msg, clean_content)
-        ├── MessageStore.get_messages_since() — 获取最近 600s 上下文
+        ├── MessageRouter._merge_context() — 群消息 + bot 自己回复合并（1800s 窗口，40 轮）
         ├── NicknameService.resolve_name() — 解析发送者昵称
+        ├── ChatDigest.refresh() — 窗口外对话的滚动概要（≥30 条才重建）
         └── AbstractSummarizer.chat(
               message=clean_content,
-              context_messages=context,
+              context_messages=context,   # → 真正的 user/assistant 轮次
               requester_name=display_name,
               bot_name=config.bot_display_name,
               group_name=group_name,
               group_memory=memory,
+              digest=digest_text,
             )
 ```
 
@@ -1486,7 +1498,8 @@ MessageRouter.handle(msg)
 | `max_retries` | `3` | API 调用最大重试次数 |
 | `max_messages_for_summary` | `5000` | 摘要最大消息数 |
 | `fallback_window_hours` | `8` | 摘要回退时间窗口(小时) |
-| `CHAT_CONTEXT_WINDOW_SEC` | `600` | AI 对话上下文时间窗口(秒) |
+| `CHAT_CONTEXT_WINDOW_SEC` | `1800` | AI 对话上下文时间窗口(秒) |
+| `MAX_CONTEXT_MESSAGES` | `40` | 上下文合并后的轮次上限（群消息 + bot 自己回复） |
 | `MAX_CONTENT_LENGTH` | `997` | 单条消息最大字符数 |
 | `AT_MENTION_MAX_AGE_SEC` | `300` | @mention 最大有效年龄(秒) |
 
@@ -2050,9 +2063,11 @@ VoicePipeline.process(msg)
 | 文件 | 路径 | 角色 |
 |---|---|---|
 | `consolidator.py` | `src/memory/consolidator.py` | 记忆合并触发和编排 |
-| `store.py` | `src/db/store.py` | `group_memory` 表 CRUD |
-| `schema.py` | `src/db/schema.py` | `group_memory` 表定义 |
+| `digest.py` | `src/memory/digest.py` | 窗口外对话的滚动摘要（`chat_digest`），≥30 条才重建 |
+| `store.py` | `src/db/store.py` | `group_memory` / `bot_replies` / `chat_digest` 表 CRUD |
+| `schema.py` | `src/db/schema.py` | 三张表的定义 |
 | `prompts.py` | `src/summarize/prompts.py` | `MEMORY_CONSOLE_PROMPT` 模板 |
+| `base.py` | `src/summarize/base.py` | `chat()` 多轮 messages 构造、`chat_raw()` 给摘要用 |
 
 #### 数据库表结构
 
@@ -2065,6 +2080,25 @@ CREATE TABLE group_memory (
     last_consolidated REAL,
     created_at        REAL NOT NULL DEFAULT (unixepoch()),
     updated_at        REAL NOT NULL DEFAULT (unixepoch())
+);
+
+-- 机器人自己说过的话。微信轮询读不到自己发的消息，没有这张表就会
+-- 重复刚说过的梗、追问刚问过的问题。
+CREATE TABLE bot_replies (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id     TEXT    NOT NULL,
+    message_id  TEXT    NOT NULL DEFAULT '',
+    content     TEXT    NOT NULL DEFAULT '',
+    timestamp   INTEGER NOT NULL,
+    created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+
+-- 已经滚出实时窗口的那段对话的压缩摘要。
+CREATE TABLE chat_digest (
+    chat_id           TEXT    PRIMARY KEY,
+    digest_text       TEXT    NOT NULL DEFAULT '',
+    last_message_id   TEXT,
+    updated_at        REAL    NOT NULL DEFAULT (unixepoch())
 );
 ```
 
@@ -2079,8 +2113,8 @@ MessageRouter.handle(msg)
         ├── 统计新消息: MessageStore.get_new_message_count(chat_id, last_id)
         │
         ├── 触发条件 (任一满足):
-        │     ├── 新消息数 >= CONSOLIDATE_MSG_THRESHOLD (50)
-        │     └── 距上次合并 >= CONSOLIDATE_TIME_THRESHOLD_SEC (3600s)
+        │     ├── 新消息数 >= CONSOLIDATE_MSG_THRESHOLD (20)
+        │     └── 距上次合并 >= CONSOLIDATE_TIME_THRESHOLD_SEC (1800s)
         │
         ├── 获取新消息: MessageStore.get_messages_since_id()
         │
@@ -2102,8 +2136,8 @@ MessageRouter.handle(msg)
 
 | 参数 | 值 | 说明 |
 |---|---|---|
-| `CONSOLIDATE_MSG_THRESHOLD` | `50` | 触发合并的消息数阈值 |
-| `CONSOLIDATE_TIME_THRESHOLD_SEC` | `3600` | 触发合并的时间阈值(1小时) |
+| `CONSOLIDATE_MSG_THRESHOLD` | `20` | 触发合并的消息数阈值 |
+| `CONSOLIDATE_TIME_THRESHOLD_SEC` | `1800` | 触发合并的时间阈值(30分钟) |
 | `MAX_NEW_MSGS_PER_CONSOLIDATION` | `400` | 每次合并最多处理的消息数 |
 | 超时 | `30s` | AI 合并单次超时 |
 

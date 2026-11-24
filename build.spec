@@ -96,6 +96,9 @@ a = Analysis(
         'src.proactive', 'src.proactive.gate', 'src.proactive.modes',
         'src.proactive.rate_tracker', 'src.proactive.sticky',
         'src.memory', 'src.memory.consolidator',
+        # Imported lazily by MessageRouter (rolling digest of the chat that
+        # scrolled out of the context window), so the static scan misses it.
+        'src.memory.digest',
         'src.integrations', 'src.integrations.feishu',
         'src.integrations.feishu.client', 'src.integrations.feishu.exporter',
         'src.integrations.feishu.knowledge',

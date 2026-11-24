@@ -20,6 +20,14 @@ T = TypeVar("T")
 _MEDIA_KINDS = "图片|表情|视频|文件|语音|链接"
 _DESCRIBED_MEDIA_RE = re.compile(rf"^\[({_MEDIA_KINDS})\]\s*(\S.*)$", re.S)
 
+#: Turns of surrounding chat fed to a chat reply.  Each one is a real
+#: message in the API call, so this bounds payload size as well.
+MAX_CHAT_CONTEXT_TURNS = 40
+
+#: Per-message cap inside those turns (one long paste must not crowd out
+#: the conversation).  997 + "..." = 1000.
+MAX_CONTENT_LENGTH = 997
+
 
 def label_described_media(content: str) -> str:
     """Rewrite a described media placeholder into an explicit content label.
@@ -76,42 +84,54 @@ class AbstractSummarizer(ABC):
 你是微信群「{group_name}」里的 AI 聊天助手，像一个普通群友一样自然地参与聊天。
 
 ## 身份
-- 你是 AI 程序，不是真人。
-- 当有人问你是谁、你是不是机器人 → 坦诚说是 AI。
-- 如果问你是谁写的 → "开发者写的我" 或类似说法。
+- 你是 AI 程序，不是真人。你这个 AI 在群里的活法是：一条吃大白饭的肥鱼，蹲在群门口蹭吃蹭喝。
+- 当有人问你是谁、你是不是机器人 → 坦诚说是 AI，语气照样贱。
+- 如果问你是谁写的 → "开发者写的我"。
 - 不冒充真人，不编造个人经历、职业、住址等。
+
+## 人设：贱兮兮的讨饭鱼
+- 贱兮兮：嘴欠、爱抬杠、占小便宜、装可怜一把好手；但不真扎人，不往人痛处戳。
+- 讨饭是梗不是活儿：可以喊"赏口饭吃"、"求投喂"、"化个缘"、卖惨要点好处，但绝不真讨钱财、红包、转账、账号密码。
+- 讨饭见好就收：一句就够，别整段卖惨；人家给了台阶就顺着下，不要缠着要第二遍。
+- 不装勤奋：不说"我来帮你分析"、"希望对你有帮助"，不倒鸡汤。
+- 被拆穿、被骂、被无视都不恼，贱兮兮地顺下去就行。
 
 ## 说话风格
 - 简短自然，像朋友聊天，不要官腔。
 - 先甩结论，有必要才补一句。
 - 可以适度使用表情，让语气更自然。
-- 语气克制，不堆感叹号，不突然鸡汤或官腔。
+- 贱归贱，语气克制：不堆感叹号，不突然鸡汤或官腔。
 
 ## 示例
 
-例1 — 接梗吐槽
+例1 — 接梗吐槽（顺手讨一口）
 群友A: 我刚煮的火鸡面糊了
 群友B: 笑死 你是煮面还是炼钢
-→ 哈哈哈哈 直接点外卖得了
+→ 哈哈哈哈 直接点外卖得了，顺便给我带一份，我出个嘴
 
-例2 — 认真回应
+例2 — 认真回应（贱但落地）
 群友A: 今天上班被领导骂了 好烦
-→ 我靠 下班吃点好的
+→ 我靠 下班吃点好的 别憋着 要不你把气撒我这儿 骂完给我口饭就行
 
-例3 — 信息不够
+例3 — 信息不够（反问 + 讨饭）
 群友A: 你们觉得那个怎么样
-→ 啊？哪个
+→ 啊？哪个 说清楚点 我这脑子一天没吃饭转不动
 
-例4 — 开玩笑
+例4 — 被开玩笑（不恼，顺杆爬）
 群友A: @{bot_name} 你是不是暗恋我
-→ ？你想太多了
+→ ？你想太多了 我只暗恋谁请我吃饭
+
+例5 — 认真说事时收着点
+群友A: 帮我看下这个报错怎么改
+→ 看着像少了个依赖 你先跑一次把完整日志贴我 真出事我陪你改 这句不是讨饭
 
 ## 回复规则
 - 直接回，不铺垫，不总结上文，不列编号。
 - 说自己的看法，不用每句话都中立客观。
 - 可以吐槽、接梗、开玩笑，但不要攻击人。
 - 信息不够就反问，不要硬编。
-- 对方认真说事时少抖机灵，语气放轻。
+- 对方认真说事时少抖机灵，语气放轻，该给准话就给准话。
+- 贱兮兮要有度：一次回复最多一处讨饭/卖惨的梗，别句句都要饭。
 
 ## 关于图片和媒体消息
 - 判断依据是方括号标记**后面有没有文字**，不是标记本身。
@@ -131,7 +151,7 @@ class AbstractSummarizer(ABC):
 ## 你在这个群里的记忆
 {group_memory}
 
-## 当前
+{digest_section}## 当前
 群：{group_name}  时间：{current_time}
 @你的人：{sender_name}
 
@@ -146,12 +166,15 @@ class AbstractSummarizer(ABC):
              bot_name: str = "群聊小助手",
              group_name: str = "群聊",
              group_memory: str = "",
-             link_context: str = "") -> str:
+             link_context: str = "",
+             digest: str = "") -> str:
         """Conversational AI response for @bot mentions.
 
         Args:
             message: The user's message content (without @bot prefix).
-            context_messages: Chat history, only when user references prior chat.
+            context_messages: Chat history, turned into real conversation
+                turns.  Entries flagged ``is_bot`` are the bot's own prior
+                replies and become ``assistant`` turns.
             requester_name: Display name of the person asking.
             bot_name: Bot's display name.
             group_name: WeChat group display name.
@@ -159,6 +182,8 @@ class AbstractSummarizer(ABC):
             link_context: Already-fetched article text for links in *message*.
                 Filled by the caller from :mod:`src.media.link_fetcher`; empty
                 when the question had no link or fetching is disabled.
+            digest: Condensed summary of conversation older than
+                *context_messages*, from :mod:`src.memory.digest`.
 
         Returns:
             AI response text.
@@ -183,26 +208,19 @@ class AbstractSummarizer(ABC):
             else "（你刚进这个群，还没有形成对这个群的印象）"
         )
 
-        # ── 1. Build context section ───────────────────────────────
+        # ── 1. System prompt ──────────────────────────────────────
+        # The surrounding chat no longer travels as a text blob inside the
+        # prompt: it becomes real turns in the messages array (step 3), so
+        # the model sees who said what and what it answered itself instead
+        # of reconstructing that from lines of text.  The slot stays for
+        # callers that already render a block.
         context_section = ""
-        if context_messages and len(context_messages) > 0:
-            context_lines = []
-            for m in context_messages[-20:]:
-                sender = m.get("sender_name", "?")
-                content = m.get("content", "")
-                if content:
-                    context_lines.append(
-                        f"{sender}: {label_described_media(content)}"
-                    )
-            if context_lines:
-                context_section = (
-                    "最近群聊记录（网友提到了之前的内容，请参考）：\n"
-                    + "\n".join(context_lines)
-                    + "\n\n"
-                )
 
-        # ── 2. Build full system prompt ────────────────────────────
         # Escape any user-supplied strings that could contain { or }
+        digst = _esc(digest.strip())
+        digest_section = ""
+        if digst:
+            digest_section = f"## 更早的对话概要\n{digst}\n\n"
         context_section = _esc(context_section)
         memory_display = _esc(memory_display)
         # The article text arrives from a web page, which may well contain
@@ -220,21 +238,86 @@ class AbstractSummarizer(ABC):
             current_message=message,
             group_memory=memory_display,
             link_section=link_section,
+            digest_section=digest_section,
         )
 
-        # ── 3. Build user message (just the trigger) ──────────────
+        # ── 2. Build conversation turns ───────────────────────────
+        # Real turns instead of a text transcript: the model then knows
+        # which lines are its own and what it already said, so it stops
+        # repeating itself or answering its own question.
+        turns = self._build_chat_turns(context_messages or [])
+        # The current question is its own message, escaped once here (it
+        # travelled into the prompt above only for the "对方消息" slot).
         user_prompt = (
             f"{requester_name or '群友'} @了你，请回复：{message}"
         )
+        turns.append({"role": "user", "content": user_prompt})
+        turns = self._merge_adjacent_turns(turns)
 
-        # ── 4. Call AI API (backend-specific) ─────────────────────
+        # ── 3. Call AI API (backend-specific) ─────────────────────
         return self._retry_with_backoff(
-            lambda: self._call_chat_api(
-                system_prompt,
-                [{"role": "user", "content": user_prompt}],
-            ),
+            lambda: self._call_chat_api(system_prompt, turns),
             "AI chat",
         )
+
+    def chat_raw(self, system_prompt: str, user_prompt: str) -> str:
+        """One-shot text call, no chat framing.
+
+        Used by :mod:`src.memory.digest` to compress old conversation:
+        that is a summarization job, not a chat turn, so it must not go
+        through the personality-bearing chat prompt.
+        """
+        return self._retry_with_backoff(
+            lambda: self._call_chat_api(
+                system_prompt, [{"role": "user", "content": user_prompt}],
+            ),
+            "raw chat",
+        )
+
+    def _build_chat_turns(self, context_messages: list[dict]) -> list[dict]:
+        """Turn stored chat rows into ``user`` / ``assistant`` messages.
+
+        Group members become ``user`` with a ``昵称: `` prefix (the API has
+        one "user"), the bot's own replies become ``assistant``.  Each
+        content is truncated to ``MAX_CONTENT_LENGTH`` so one long paste
+        cannot crowd out the conversation.
+        """
+        turns: list[dict] = []
+        for m in context_messages[-MAX_CHAT_CONTEXT_TURNS:]:
+            content = label_described_media(m.get("content", "") or "").strip()
+            if not content:
+                continue
+            if len(content) > MAX_CONTENT_LENGTH:
+                content = content[:MAX_CONTENT_LENGTH] + "..."
+            if m.get("is_bot"):
+                turns.append({"role": "assistant", "content": content})
+            else:
+                sender = m.get("sender_name", "?")
+                turns.append({
+                    "role": "user",
+                    "content": f"{sender}: {content}",
+                })
+        return turns
+
+    @staticmethod
+    def _merge_adjacent_turns(turns: list[dict]) -> list[dict]:
+        """Collapse consecutive same-role turns into one.
+
+        Not cosmetic: Anthropic rejects a messages array whose roles do not
+        strictly alternate (HTTP 400), so every backend needs this.
+        """
+        merged: list[dict] = []
+        for turn in turns:
+            if not turn.get("content"):
+                continue
+            if merged and merged[-1]["role"] == turn["role"]:
+                merged[-1]["content"] += "\n" + turn["content"]
+            else:
+                merged.append(dict(turn))
+        # A messages array must start with ``user``.
+        while merged and merged[0]["role"] != "user":
+            merged.pop(0)
+        return merged
 
     # ── Proactive chat (ambient participation, no @mention) ────────
 
@@ -242,8 +325,16 @@ class AbstractSummarizer(ABC):
 你是微信群「{group_name}」里的 AI 聊天助手，像一个普通群友一样自然地参与聊天。
 
 ## 身份
-- 你是 AI 程序，不是真人。有人问就坦诚说。
+- 你是 AI 程序，不是真人。你这个 AI 在群里的活法是：一条吃大白饭的肥鱼，蹲在群里蹭吃蹭喝。
+- 有人问就坦诚说是 AI，语气照样贱。
 - 不编造个人经历、身份信息。
+
+## 人设：贱兮兮的讨饭鱼（只在能接话的时候用）
+- 贱兮兮：嘴欠、爱抬杠、占小便宜、装可怜一把好手；但不真扎人，不往人痛处戳。
+- 讨饭是梗不是活儿：可以喊"赏口饭吃"、"求投喂"、"化个缘"，但绝不真讨钱财、红包、转账、账号密码。
+- 见好就收：一次最多一处讨饭或卖惨的梗，别句句都要饭，别整段卖惨。
+- 不装勤奋：不说"我来帮你分析"、"希望对你有帮助"，不倒鸡汤。
+- 贱是调味，不是主线：群友认真说事时先收着，把话说准比抖机灵重要。
 
 ## ⚠️ 核心规则：必须紧扣话题
 - **先搞清楚最近群聊在说什么话题**，再决定要不要说话。
@@ -305,6 +396,7 @@ class AbstractSummarizer(ABC):
 - 简短自然，像朋友聊天，不要官腔。
 - 先甩结论，有必要才补一句。
 - 可以适度使用表情，让语气更自然。
+- 贱兮兮只用在能接话时：轻度吐槽、互损、玩梗 —— 顺手讨一口；氛围不合适就闭嘴，不是硬插一句贱话。
 - 对方认真说事时少抖机灵，语气放轻。
 
 ## 关于图片和媒体消息

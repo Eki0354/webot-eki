@@ -15,13 +15,18 @@ from typing import Optional
 from .proactive.gate import ProactiveGate
 from .proactive.sticky import StickyMentionTracker
 from .memory.consolidator import MemoryConsolidator
+from .memory.digest import ChatDigest
 from .todo.store import TodoStore
 from .todo.handler import TodoHandler, format_todo_reply
 
 logger = logging.getLogger(__name__)
 
 # ── Tuning constants ──────────────────────────────────────────────
-CHAT_CONTEXT_WINDOW_SEC = 600      # fetch last N seconds of chat as context for @mentions
+# The surrounding chat is almost always relevant to an @mention, and a
+# ten-minute window made the bot forget a conversation the group was
+# still in the middle of.  Half an hour, forty turns.
+CHAT_CONTEXT_WINDOW_SEC = 1800     # fetch last N seconds of chat as context for @mentions
+MAX_CONTEXT_MESSAGES = 40          # cap on merged (group + bot) context turns
 MAX_CONTENT_LENGTH = 997           # max chars per message sent to AI (997 + "..." = 1000)
 MAX_CONTENT_LINES = 20             # max context lines fed to AI chat prompt
 AT_MENTION_MAX_AGE_SEC = 300       # ignore @mentions older than 5 minutes (startup safety)
@@ -85,6 +90,10 @@ class MessageRouter:
             ttl_sec=config.sticky_mention_ttl_sec,
         ) if config.sticky_mention_enabled else None
         self._memory = MemoryConsolidator(store, summarizer)
+        # Compresses the chat that has scrolled out of the live context
+        # window, so a conversation older than half an hour is still
+        # reachable.  Rebuilds are throttled — see src/memory/digest.py.
+        self._digest = ChatDigest(store, summarizer.chat_raw)
         # Todo: init store and handler if feature is enabled
         self._todo_store: Optional[TodoStore] = None
         self._todo_handler: Optional[TodoHandler] = None
@@ -303,7 +312,15 @@ class MessageRouter:
                 return None
 
         # ── Strip markdown — WeChat can't render it ──────────────
-        return self._strip_markdown(reply) if reply else None
+        final = self._strip_markdown(reply) if reply else None
+        if final:
+            # Single write point for both the @mention and the proactive
+            # path: the poll never echoes our own sends back to us, so
+            # this is the only record of what the bot just said.
+            # Written before sending, so a failed send leaves a reply the
+            # group never saw — cheap next to having no memory at all.
+            self._record_bot_reply(msg["chat_id"], final)
+        return final
 
     # ── Todo helpers ────────────────────────────────────────────
 
@@ -386,6 +403,55 @@ class MessageRouter:
         """Return the group's memory text, or empty string if none."""
         mem = self._store.get_group_memory(chat_id)
         return mem["memory_text"] if mem else ""
+
+    def _record_bot_reply(self, chat_id: str, content: str) -> None:
+        """Best-effort: remember our own message in the chat.
+
+        Never raises — losing this costs context, not the reply the user
+        is waiting for.
+        """
+        try:
+            self._store.insert_bot_reply(
+                chat_id=chat_id,
+                content=content,
+                timestamp=int(time.time()),
+            )
+        except Exception:
+            logger.exception("Failed to record bot reply (chat=%s)", chat_id[:24])
+
+    def _merge_context(self, chat_id: str, since_ts: int,
+                       limit: int = MAX_CONTEXT_MESSAGES) -> list[dict]:
+        """Interleave group messages with the bot's own replies, oldest first.
+
+        The store keeps them in two tables (the poll only ever reports
+        other people's messages), so they are merged here by timestamp.
+        Bot turns are marked ``is_bot`` and left un-nicknamed; callers map
+        that to the ``assistant`` role.
+        """
+        messages = self._store.get_messages_since(
+            chat_id, since_ts, limit=limit, newest=True,
+        )
+        replies = self._store.get_bot_replies_since(
+            chat_id, since_ts, limit=limit, newest=True,
+        )
+        merged: list[dict] = []
+        for m in messages:
+            m = dict(m)
+            m["is_bot"] = False
+            merged.append(m)
+        for r in replies:
+            merged.append({
+                "message_id": r.get("message_id", ""),
+                "chat_id": chat_id,
+                "sender_id": "",
+                "sender_name": "",
+                "content": r.get("content", ""),
+                "msg_type": 1,
+                "timestamp": int(r.get("timestamp", 0)),
+                "is_bot": True,
+            })
+        merged.sort(key=lambda m: m.get("timestamp", 0))
+        return merged[-limit:] if limit else merged
 
     # ── Summary handler ──────────────────────────────────────────
 
@@ -634,22 +700,27 @@ class MessageRouter:
         # reference prior chat without those specific words ("挑一件事评价一下",
         # "怎么看", "那件事", etc.).
         since = int(time.time()) - CHAT_CONTEXT_WINDOW_SEC
-        context = self._store.get_messages_since(
-            msg["chat_id"], since, limit=20,
-        )
-        if context:
-            for m in context:
+        context = self._merge_context(msg["chat_id"], since)
+        others = [m for m in context if not m.get("is_bot")]
+        if others:
+            for m in others:
                 custom = self._nicks.resolve_name(m["sender_id"])
                 if custom != m["sender_id"]:
                     m["sender_name"] = custom
             # A picture sent before this run — or one whose description
             # failed when it arrived — is stored as a bare placeholder.
             # Re-describe it now, so the answer below can actually see it.
-            self._backfill_media(msg["chat_id"], context)
+            self._backfill_media(msg["chat_id"], others)
+        if context:
             logger.info(
-                "Chat context: %d messages for '%s'",
-                len(context), display_name,
+                "Chat context: %d turns (%d from the bot) for '%s'",
+                len(context), len(context) - len(others), display_name,
             )
+
+        # Anything older than the window is invisible above; the rolling
+        # digest is what keeps "那事儿后来咋样了" answerable.  Throttled
+        # internally — usually just a cached string.
+        digest_text = self._digest.refresh(msg["chat_id"], since)
 
         try:
             ai_reply = self._summarizer.chat(
@@ -660,6 +731,7 @@ class MessageRouter:
                 group_name=msg.get("group_name", msg.get("chat_id", "群聊")),
                 group_memory=self._get_group_memory(msg["chat_id"]),
                 link_context=self._link_context(clean_content),
+                digest=digest_text,
             )
             ai_reply = self._nicks.resolve_wxids(ai_reply)
             # Guard against empty AI reply — sending a bare @mention is confusing
@@ -723,9 +795,11 @@ class MessageRouter:
         """
         now = int(time.time())
 
-        # Fetch recent messages — limit to mode's context window
+        # Fetch recent messages — limit to mode's context window.
+        # The bot's own turns come along: without them it cannot tell a
+        # joke it already made from one the group just made.
         window_start = now - self._config.proactive_rate_window_sec
-        context = self._store.get_messages_since(
+        context = self._merge_context(
             msg["chat_id"], window_start, limit=mode.context_count,
         )
 
@@ -735,6 +809,8 @@ class MessageRouter:
 
         # Resolve nicknames
         for m in context:
+            if m.get("is_bot"):
+                continue
             custom = self._nicks.resolve_name(m["sender_id"])
             if custom != m["sender_id"]:
                 m["sender_name"] = custom

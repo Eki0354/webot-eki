@@ -66,6 +66,34 @@ CREATE TABLE IF NOT EXISTS group_memory (
     updated_at        REAL    NOT NULL DEFAULT (unixepoch())
 );
 
+-- The bot's own side of the conversation.  The WeChat poll only ever sees
+-- other people's messages — the backend drops our own sends — so without
+-- this table the bot has no memory of what it just said.  It then repeats
+-- itself, asks a question it already asked, or contradicts its own joke
+-- from two minutes ago, which reads as "断片" to the group.
+CREATE TABLE IF NOT EXISTS bot_replies (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id     TEXT    NOT NULL,
+    message_id  TEXT    NOT NULL DEFAULT '',
+    content     TEXT    NOT NULL DEFAULT '',
+    timestamp   INTEGER NOT NULL,
+    created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_bot_reply_chat_time
+    ON bot_replies(chat_id, timestamp DESC);
+
+-- Rolling summary of the chat that has already scrolled out of the live
+-- context window.  The window is bounded (a few dozen messages); older
+-- conversation would otherwise be invisible even though the group still
+-- refers to it.  Compressed in batches, never per reply.
+CREATE TABLE IF NOT EXISTS chat_digest (
+    chat_id           TEXT    PRIMARY KEY,
+    digest_text       TEXT    NOT NULL DEFAULT '',
+    last_message_id   TEXT,
+    updated_at        REAL    NOT NULL DEFAULT (unixepoch())
+);
+
 CREATE INDEX IF NOT EXISTS idx_trigger_chat_time
     ON trigger_log(chat_id, processed_at DESC);
 """

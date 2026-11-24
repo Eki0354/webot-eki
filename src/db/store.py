@@ -211,11 +211,32 @@ class MessageStore:
 
     def get_messages_since(self, chat_id: str, since_ts: int,
                            until_ts: Optional[int] = None,
-                           limit: int = 500) -> list[dict]:
-        """Fetch messages from a chat in a time window."""
+                           limit: int = 500,
+                           newest: bool = False) -> list[dict]:
+        """Fetch messages from a chat in a time window.
+
+        Args:
+            newest: Keep the *latest* ``limit`` messages instead of the
+                earliest.  A plain ``ORDER BY timestamp ASC LIMIT`` returns
+                the oldest N of the window, which for a half-hour context
+                window hands the model the start of a conversation and
+                drops the part it was actually in the middle of.
+        """
         with self._lock:
             if until_ts is None:
                 until_ts = int(time.time())
+
+            if newest:
+                rows = self.conn.execute(
+                    """SELECT message_id, chat_id, sender_id, sender_name,
+                              content, msg_type, timestamp
+                       FROM messages
+                       WHERE chat_id = ? AND timestamp BETWEEN ? AND ?
+                       ORDER BY timestamp DESC, id DESC
+                       LIMIT ?""",
+                    (chat_id, since_ts, until_ts, limit),
+                ).fetchall()
+                return [dict(row) for row in reversed(rows)]
 
             rows = self.conn.execute(
                 """SELECT message_id, chat_id, sender_id, sender_name,
@@ -228,6 +249,27 @@ class MessageStore:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def get_messages_before(self, chat_id: str, before_ts: int,
+                            limit: int = 200) -> list[dict]:
+        """Fetch messages strictly older than *before_ts*, newest last.
+
+        Used by the rolling digest: everything before the live context
+        window is what it compresses.  The window is taken from the tail
+        (``ORDER BY ... DESC LIMIT``) so a chat that has been running for
+        months digests its most recent forgotten stretch, not its oldest.
+        """
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT message_id, chat_id, sender_id, sender_name,
+                          content, msg_type, timestamp
+                   FROM messages
+                   WHERE chat_id = ? AND timestamp < ?
+                   ORDER BY timestamp DESC, id DESC
+                   LIMIT ?""",
+                (chat_id, int(before_ts), limit),
+            ).fetchall()
+            return [dict(row) for row in reversed(rows)]
+
     def was_recently_triggered(self, chat_id: str,
                                 window_sec: int) -> bool:
         """Check if a trigger was processed for this chat recently."""
@@ -239,6 +281,97 @@ class MessageStore:
                 (chat_id, cutoff),
             ).fetchone()
             return row["cnt"] > 0 if row else False
+
+    # ── The bot's own replies ──────────────────────────────────────
+
+    def insert_bot_reply(self, chat_id: str, content: str,
+                         timestamp: int | None = None,
+                         message_id: str = "") -> bool:
+        """Record something the bot just sent into a chat.
+
+        The WeChat poll never reports our own messages back to us (the
+        backend drops them), so this table is the only way the bot can
+        see its own half of the conversation.  Best-effort: a failure
+        here costs context, never a reply.
+        """
+        if not chat_id or not content:
+            return False
+        ts = int(timestamp if timestamp is not None else time.time())
+        with self._lock:
+            try:
+                with self.conn:
+                    self.conn.execute(
+                        """INSERT INTO bot_replies
+                           (chat_id, message_id, content, timestamp)
+                           VALUES (?, ?, ?, ?)""",
+                        (str(chat_id), str(message_id or ""),
+                         str(content), ts),
+                    )
+                return True
+            except sqlite3.InterfaceError:
+                logger.debug("insert_bot_reply skipped: connection closed")
+                return False
+            except Exception:
+                logger.exception(
+                    "Failed to record bot reply (chat=%s)", chat_id,
+                )
+                return False
+
+    def get_bot_replies_since(self, chat_id: str, since_ts: int,
+                              limit: int = 50,
+                              newest: bool = False) -> list[dict]:
+        """Fetch the bot's own replies in a time window, oldest first.
+
+        ``newest`` keeps the latest *limit* replies rather than the
+        earliest — see :meth:`get_messages_since`.
+        """
+        order = "DESC, id DESC" if newest else "ASC, id ASC"
+        with self._lock:
+            rows = self.conn.execute(
+                f"""SELECT message_id, content, timestamp
+                    FROM bot_replies
+                    WHERE chat_id = ? AND timestamp >= ?
+                    ORDER BY timestamp {order}
+                    LIMIT ?""",
+                (chat_id, int(since_ts), limit),
+            ).fetchall()
+            out = [dict(row) for row in rows]
+            return list(reversed(out)) if newest else out
+
+    # ── Rolling chat digest ───────────────────────────────────────
+
+    def get_chat_digest(self, chat_id: str) -> dict | None:
+        """Return the cached digest row for a chat, or None."""
+        try:
+            with self._lock:
+                row = self.conn.execute(
+                    """SELECT chat_id, digest_text, last_message_id, updated_at
+                       FROM chat_digest WHERE chat_id = ?""",
+                    (chat_id,),
+                ).fetchone()
+                return dict(row) if row else None
+        except sqlite3.InterfaceError:
+            logger.debug("get_chat_digest skipped: connection closed")
+            return None
+
+    def upsert_chat_digest(self, chat_id: str, digest_text: str,
+                           last_message_id: str | None) -> None:
+        """Store the rolling digest and the cursor it was built up to."""
+        try:
+            with self._lock:
+                with self.conn:
+                    self.conn.execute(
+                        """INSERT INTO chat_digest
+                           (chat_id, digest_text, last_message_id, updated_at)
+                           VALUES (?, ?, ?, ?)
+                           ON CONFLICT(chat_id) DO UPDATE SET
+                           digest_text = excluded.digest_text,
+                           last_message_id = excluded.last_message_id,
+                           updated_at = excluded.updated_at""",
+                        (chat_id, digest_text, last_message_id, time.time()),
+                    )
+        except sqlite3.InterfaceError:
+            logger.debug("upsert_chat_digest skipped: connection closed")
 
     # ── Group memory operations ────────────────────────────────────
 
