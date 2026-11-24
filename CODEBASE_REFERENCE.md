@@ -138,7 +138,9 @@ grep "文件名" CODEBASE_REFERENCE.md
 | `VOICE_ASR_TO_SIMPLIFIED` | `bool` | `True` | `src/config.py` | `src/voice/asr.py` (各ASR后端) |
 | `MEDIA_VISION_ENABLED` | `bool` | `False` | `src/config.py` | `src/media/pipeline.py:MediaPipeline.__init__()` |
 | `MEDIA_VISION_MODEL` | `str` | `""` | `src/config.py` | `src/media/pipeline.py:MediaPipeline._create_vision()` |
-| `LINK_FETCH_ENABLED` | `bool` | `True` | `src/config.py` | `src/router.py:_link_context()`、`src/web/server.py:_fetch_link_context()` |
+| `LINK_FETCH_ENABLED` | `bool` | `True` | `src/config.py` | `src/router.py:_link_context()`、`src/web/server.py:_fetch_link_context()`；Web 侧直接读 `os.environ`（该模块用磁盘 `.env` 而非 `BotConfig`） |
+| `LINK_RENDER_ENABLED` | `bool` | `True` | `src/config.py` | `src/media/link_fetcher.py:fetch_article(render=…)`（经 router / web server 传入）；关掉则从不启动浏览器 |
+| `LINK_RENDER_TIMEOUT` | `float` | `12.0` | `src/config.py` | 同上（`render_timeout`）；单次渲染墙钟上限，整批预算不够时直接跳过渲染 |
 | `FFMPEG_PATH` | `str` | `""` | 环境变量（不经 `config.py`） | `src/media/video.py:_candidate_binaries()`；指定 `ffmpeg.exe` 绝对路径，优先于随包位置 |
 | `IMAGE_XOR_KEY` | `str` | `""` | `src/config.py` | `src/media/keys.py:resolve_image_keys()` |
 | `IMAGE_AES_KEY` | `str` | `""` | `src/config.py` | `src/media/keys.py:resolve_image_keys()` |
@@ -284,7 +286,7 @@ todo_delete_keywords: list[str] = [
 | `MessageRouter._get_group_memory(chat_id)` | ~140 | 获取群聊记忆文本 | `chat_id: str` | `str` |
 | `MessageRouter._handle_summary(msg)` | ~145 | 生成聊天总结 | `msg: dict` | `str \| None` |
 | `MessageRouter._handle_chat(msg, clean_content)` | ~230 | 处理 @bot AI 对话 | `msg: dict, clean_content: str` | `str \| None` |
-| `MessageRouter._link_context(text)` | ~170 | 抓取提问里链接的正文并渲染成 prompt 块；受 `LINK_FETCH_ENABLED` 控制，任何失败都返回 `""`（不打断回复） | `text: str` | `str` |
+| `MessageRouter._link_context(text)` | ~170 | 抓取提问里链接的正文并渲染成 prompt 块；受 `LINK_FETCH_ENABLED` 控制，把 `LINK_RENDER_ENABLED` / `LINK_RENDER_TIMEOUT` 传给 `fetch_for_question()`，任何失败都返回 `""`（不打断回复） | `text: str` | `str` |
 | `MessageRouter._handle_welcome(msg)` | ~280 | 发送新成员欢迎消息 | `msg: dict` | `str \| None` |
 | `MessageRouter._handle_proactive_chat(msg, mode)` | ~305 | 处理主动发言 | `msg: dict, mode: ProactiveMode` | `str \| None` |
 
@@ -897,6 +899,39 @@ subprocess.run(cmd, capture_output=True, timeout=30, **hidden_kwargs())
 | `_MAX_FRAME_WIDTH` | `720` | 上传前降采样宽度 |
 | `_MAX_VIDEO_BYTES` | `48 MB` | 传输上限，拒绝误标的巨型文件而卡住回复 |
 
+**为什么是完整下载，而不是让 ffmpeg 直连 URL 边读边抽**（实测记录，别再「优化」回去）。同一段 2.5 MB / 60 秒测试片抽 3 帧：
+
+| 做法 | 实际传输 |
+|---|---|
+| 完整下载（当前实现） | 100% |
+| ffmpeg 直连，3 次独立调用 | ~49%（**不是**单帧那个 18%） |
+| ffmpeg 直连，一次调用抽 3 帧 | ~50% |
+| 中间加本地校验中继 | 223–270%（比完整下载更差） |
+
+18% 是**单帧**的数字；每多一帧都要重读一次文件头，3 帧最多省一半。而且 ffmpeg **会自行跟随 302**（实测中它毫不迟疑地走进了指向回环地址的重定向），把陌生人的地址交给它等于开一个 SSRF 口子；用进程内中继逐跳复检能堵住（实测 302→内网被拦），但中继没法像 CDN 那样提前断连，实测反而更费流量。省一半字节不值得换个 SSRF 漏洞，而且群里实际分享的片子只有 2–7 MB。
+
+`src/media/browser_render.py` — 用无头 Chromium 执行页面脚本后取 DOM（子进程，不新增 Python 依赖）：
+
+静态抓取拿到的是「服务器发来的字节」。B站、YouTube 这类站点用 JavaScript 现场生成播放器，`<video src=…>` 在原始 HTML 里根本不存在，所以 `link_fetcher` 抽不到地址、正文也可能是脚本画出来的。本模块让机器上**已有**的 Edge/Chrome 以无头模式跑一遍页面，再把完成后 DOM 交回来。**不下载、不打包任何东西**，EXE 体积不变；找不到浏览器时 `available()` 返回 False，调用方退回静态行为。
+
+| 函数 | 描述 | 参数 | 返回值 |
+|---|---|---|---|
+| `browser_path()` | 定位可用 Chromium：`WEBOT_BROWSER_PATH` → Windows 的 Edge/Chrome（Edge 优先，Win10/11 自带）/ POSIX 的常见路径与 `PATH`。结果（含失败）只算一次 | 无 | `str \| None` |
+| `available()` | 能否渲染（等价于找到了浏览器） | 无 | `bool` |
+| `render_html(url, timeout=_RENDER_TIMEOUT_SEC, budget_ms=_VIRTUAL_TIME_BUDGET_MS)` | `--headless=new --dump-dom` 跑一遍页面；Chromium < 112 拒绝新拼写时，用旧版 `--headless` 重试一次；每次用独立临时 profile 并在 `finally` 里删掉（共用 profile 会附着到已运行实例、返回空）；DOM 超 `_MAX_DOM_BYTES` 截断。非 HTTP(S) 输入直接返回 None，**不做** 主机解析（URL 已由调用方校验过，这里再做一次会引入时序不同的第二次解析） | 见参数 | `str \| None` |
+| `reset_browser_cache()` | 忘掉已定位的浏览器（仅供改变搜索路径的测试用） | 无 | `None` |
+| `_run_browser(exe, args, profile, timeout)` | 启动一次浏览器，返回 `(stdout, returncode)`；带 `hidden_kwargs()`，否则每次渲染都会闪一个黑窗口 | 见参数 | `tuple \| None` |
+
+模块级常量：
+
+| 常量 | 值 | 说明 |
+|---|---|---|
+| `_RENDER_TIMEOUT_SEC` | `12` | 单次渲染的墙钟上限（这是上限，不是预期值） |
+| `_VIRTUAL_TIME_BUDGET_MS` | `2500` | 让页面定时器跑多久再 dump：够播放器引导或 XHR 填正文，又不至于被轮询页面拖住 |
+| `_MAX_DOM_BYTES` | `4 MB` | 交回的 DOM 上限，超出截断 |
+
+已知限制（不隐藏）：页面一旦跑起来，**它自己的脚本**会发起同源/跨源请求，而浏览器的网络栈不受 `is_public_url()` 过滤——调用方只能保证交进去的 URL 已校验过挡不住面把渲染器重定向到内网。这与 `urllib` 路径（`_GuardedRedirectHandler` 逐跳复检）是不同的威胁模型；缓解手段是从渲染结果里抽出的媒体地址会**再过一次**校验才去下载。
+
 `src/media/backfill.py` — 历史媒体消息按需回填：
 
 入库时的描述只算一次，失败就永久停在裸 `[图片]`/`[表情]`。本模块在**构建 prompt 之前**把这些行重新描述并写回数据库，所以「本次运行之前的图片」也能被 AI 看到；它是拉取式而非启动全量扫描，每次 prompt 最多回填 `MAX_PER_CALL` 条，失败记忆避免一条坏表情在每次 @mention 时都重试。
@@ -934,14 +969,17 @@ subprocess.run(cmd, capture_output=True, timeout=30, **hidden_kwargs())
 |---|---|---|---|
 | `is_public_url(url, resolve=True)` | 仅放行公网 HTTP(S)：拒绝非 HTTP 协议、带凭证、非 80/443 端口、单标签主机名、`localhost`/`.local`/`.internal`；`resolve=True` 时解析 DNS 并要求**所有**地址均为公网 | `url: str, resolve: bool` | `bool` |
 | `extract_urls(text)` | 从聊天文本提取 URL（按出现顺序去重），剥离中文标点与句末符号 | `text: str` | `list[str]` |
-| `fetch_article(url)` | 抓取并归约为 `Article`；6s 超时、2MB 上限、仅文本类型、gzip/deflate 解压、charset 探测（含 `<meta charset>` 回退）；10 分钟/64 条缓存（失败也缓存）；**永不抛异常** | `url: str` | `Article \| None` |
+| `fetch_article(url, render=None, render_allowed=True, render_timeout=_RENDER_TIMEOUT_SEC, want_video=False)` | 抓取并归约为 `Article`；6s 超时、2MB 上限、仅文本类型、gzip/deflate 解压、charset 探测（含 `<meta charset>` 回退）；10 分钟/64 条缓存（失败也缓存）；**永不抛异常**。`render=None` 取模块默认，`render_allowed=False` 表示调用方预算不够、跳过渲染。`want_video=True`（提问里带视频类字眼）时，正文可读但页内没有媒体地址的页面会额外渲染一次去补地址——**只补 `video_urls`，正文仍用静态那份**（脚本页渲染出的文字通常比服务端发的少） | `url: str` + 关键字 | `Article \| None` |
 | `extract_article(html)` | HTML → `(标题, 正文)`；优先 `#js_content`（微信正文容器），否则整页；剔除 script/style/nav 等噪声；正文以 `{`/`[` 开头视为数据而非文章 | `html: str` | `tuple[str, str]` |
-| `fetch_for_question(text, max_links=2, budget_sec=8)` | 抓取一个提问里的链接；整批共享一个截止时间（两个死链不会各耗一次超时） | `text: str` | `list[Article]` |
+| `fetch_for_question(text, max_links=2, budget_sec=8, render=None, render_timeout=_RENDER_TIMEOUT_SEC)` | 抓取一个提问里的链接；整批共享一个截止时间（两个死链不会各耗一次超时）。**剩余预算不足以覆盖一次渲染时传 `render_allowed=False`**——启动一个会被截止时间杀掉的浏览器，比不启动更差。整批的 `want_video` 由 `wants_video(text)` 一次性决定 | `text: str` + 关键字 | `list[Article]` |
+| `wants_video(text)` | 提问是否在问「画面」。命中 `视频/短片/片段/影片/片子/录像/录屏/镜头/抽帧/画面/动画` 或 `vlog/video/clip/mp4/movie`（英文大小写无关）即为真；只有它为真的分享链接才可能在正文可读时多花一次渲染去补视频地址，普通「这篇讲了啥」完全不启动浏览器 | `text: str` | `bool` |
 | `format_link_context(articles)` | 渲染成 prompt 块，带 `[链接正文]` 标记与「直接据此回答，不要说你打不开」的指令 | `articles: list[Article]` | `str` |
 | `Article.to_prompt_block(max_text=1800)` | 单篇渲染：`[链接正文] 标题 — URL` + 正文 | `Article` | `str` |
 | `Article.video_urls` (字段) | 页内视频地址元组（`masterUrl` 优先）——**必须取自同一次响应**：小红书视频笔记第二次请求会退化成 23 KB 空壳，事后回查会静默丢掉每个视频 | `Article` | `tuple[str, ...]` |
 | `_video_urls(page)` | 从刚抓到的页面里抽媒体地址；函数内导入 `src.media.video`（`video` 反向依赖本模块的 `is_public_url`，模块级导入会成环）；无 ffmpeg 也照常记录 | `page: str` | `list[str]` |
 | `_judge_page(url, page, raw_len, content_type)` | 判定页面是否可读：非文本 → `non-textual`；验证墙/空壳 → `blocked`；正文够长则成 `Article`；**正文不足 `_MIN_USABLE_TEXT` 但页内有视频地址**时，返回 `text=""` 的纯视频 `Article`（只喂抽帧链路，`format_link_context` 会跳过空正文）；否则 `stub`/`empty` | 见参数 | `tuple[Article \| None, str]` |
+| `_render_page(url, timeout)` | 用无头浏览器执行页面脚本后判定 DOM：`_judge_page` 走的是与静态路径**同一套**判据，所以渲染出来的验证墙仍是 `blocked`，不会被当成正文注入 prompt。函数内导入 `src.media.browser_render`，任何失败都返回 `None` | `url: str, timeout: float` | `Article \| None` |
+| `set_render_enabled(enabled)` | 直接调用 `fetch_article` 的场合（测试、一次性工具）设置模块默认开关；线上路径显式传 `render=` | `enabled: bool` | `None` |
 | `clear_cache()` | 清空页面缓存（测试用） | 无 | `None` |
 
 重定向经 `_GuardedRedirectHandler` 逐跳复检（公网 URL 可 302 到 `127.0.0.1`），链长上限 3。
@@ -963,6 +1001,7 @@ TLS：`_ssl_context(host="")` 返回**系统信任库 + `certifi` 合并**的上
 | `_MAX_TEXT` | `1800` | 交给模型的正文长度 |
 | `_MAX_LINKS_PER_QUESTION` | `2` | 单个提问最多抓几个链接 |
 | `_FETCH_BUDGET_SEC` | `8` | 整批抓取的总时限 |
+| `_RENDER_TIMEOUT_SEC` | `12.0` | 单次无头渲染的墙钟上限（比 `_TIMEOUT_SEC` 大是刻意的：冷启动浏览器 + 跑脚本，实测 3–6s） |
 | `_MAX_CHAIN_DEPTH` | `5` | AIA 补链最多上溯几级 |
 | `_AIA_TIMEOUT_SEC` | `3` | 单张 AIA 证书下载超时 |
 | `_CACHE_TTL_SEC` / `_CACHE_MAX` | `600` / `64` | 页面缓存有效期与容量 |
@@ -2130,6 +2169,7 @@ MacHybridBackend
 | `keys.py` | `src/media/keys.py` | 图片密钥来源解析 (`env` / `file`) |
 | `vision.py` | `src/media/vision.py` | 图片/视频帧描述 (OpenAI 兼容接口，请求形状按需协商) |
 | `video.py` | `src/media/video.py` | 分享视频抽帧 (下载 + 外挂 ffmpeg.exe，可选依赖) |
+| `browser_render.py` | `src/media/browser_render.py` | 无头 Edge/Chrome 执行页面脚本后取 DOM (不新增依赖，可选) |
 | `backfill.py` | `src/media/backfill.py` | 历史裸占位符按需重描述并写回 DB |
 
 #### 调用链
@@ -2364,6 +2404,8 @@ WCDB_KEY=
 #   pydantic/webview/psutil/PIL/comtypes/uiautomation) + src.media 与 zstandard
 #   + Crypto (Crypto.Cipher.AES, 用于 .dat 图片头段 AES-128-ECB)
 #   + src.media.video (抽帧；ffmpeg.exe 本身不进包，见下)
+#   + src.media.browser_render (渲染脚本页面；用机器上已有的 Edge/Chrome，
+#     不下载不打包，缺失时降级为纯静态抓取)
 # 排除: faster_whisper, ctranslate2, numpy, onnxruntime, pysilk, tkinter, matplotlib, scipy
 # 注意: native/windows/ffmpeg.exe 刻意不 embed (121MB)，打包后手动复制到
 #       dist/native/windows/ffmpeg.exe；缺失时视频链路降级为纯文字回答

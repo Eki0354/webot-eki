@@ -18,6 +18,27 @@ and ``fetch_article`` is monkeypatched, so these run offline and fast.
 import unittest
 
 
+def setUpModule():
+    """No test in this file may start a browser or touch the network.
+
+    ``fetch_article`` renders a page in a headless browser when the static
+    reads come back empty — which is exactly the shape of the offline
+    fixtures below (a footer-only page, a JS shell).  Left on, the "nothing
+    readable" tests would quietly launch Edge against example.com and change
+    their own verdict.  Off for the whole module; the render tests pass
+    ``render=True`` explicitly and stub the renderer out themselves.
+    """
+    from src.media import link_fetcher
+
+    link_fetcher.set_render_enabled(False)
+
+
+def tearDownModule():
+    from src.media import link_fetcher
+
+    link_fetcher.set_render_enabled(True)
+
+
 _LINK = "https://mp.weixin.qq.com/s/AbCdEf123"
 _TITLE = "DeepSeek 发布新模型"
 
@@ -489,7 +510,7 @@ class FetchForQuestionTests(unittest.TestCase):
 
         calls = []
 
-        def _fake(url):
+        def _fake(url, **_kw):
             calls.append(url)
             return Article(url=url, title="t", text="文" * 10)
 
@@ -503,7 +524,7 @@ class FetchForQuestionTests(unittest.TestCase):
     def test_unreadable_link_is_skipped_not_fatal(self):
         from src.media.link_fetcher import Article
 
-        def _fake(url):
+        def _fake(url, **_kw):
             if "dead" in url:
                 return None
             return Article(url=url, title="活着", text="正文")
@@ -515,7 +536,7 @@ class FetchForQuestionTests(unittest.TestCase):
         self.assertEqual([a.url for a in articles], ["https://alive.com/2"])
 
     def test_no_url_means_no_fetch(self):
-        def _explode(url):  # pragma: no cover - must not be called
+        def _explode(url, **_kw):  # pragma: no cover - must not be called
             raise AssertionError("fetch_article must not run without a URL")
 
         self.fetcher.fetch_article = _explode
@@ -527,7 +548,7 @@ class FetchForQuestionTests(unittest.TestCase):
 
         calls = []
 
-        def _fake(url):
+        def _fake(url, **_kw):
             calls.append(url)
             return Article(url=url, title="t", text="x")
 
@@ -726,6 +747,169 @@ class ConfigSwitchTests(unittest.TestCase):
             importlib.reload(config_module)
 
 
+class RenderSwitchTests(unittest.TestCase):
+    """The script-executing fallback is switchable and budgeted."""
+
+    def test_render_defaults_on(self):
+        """Off by default would hide every script-built page (B站/YouTube)."""
+        import importlib
+        import os
+
+        import src.config as config_module
+
+        saved = os.environ.pop("LINK_RENDER_ENABLED", None)
+        try:
+            importlib.reload(config_module)
+            cfg = config_module.load_config()
+            self.assertTrue(cfg.link_render_enabled)
+            self.assertAlmostEqual(cfg.link_render_timeout, 12.0)
+        finally:
+            if saved is not None:
+                os.environ["LINK_RENDER_ENABLED"] = saved
+            else:
+                os.environ.pop("LINK_RENDER_ENABLED", None)
+            importlib.reload(config_module)
+
+    def test_switch_can_be_turned_off(self):
+        import importlib
+        import os
+
+        import src.config as config_module
+
+        saved = os.environ.get("LINK_RENDER_ENABLED")
+        os.environ["LINK_RENDER_ENABLED"] = "false"
+        try:
+            importlib.reload(config_module)
+            self.assertFalse(config_module.load_config().link_render_enabled)
+        finally:
+            if saved is not None:
+                os.environ["LINK_RENDER_ENABLED"] = saved
+            else:
+                os.environ.pop("LINK_RENDER_ENABLED", None)
+            importlib.reload(config_module)
+
+    #: A page that answered 200 and carries nothing — the JS-shell shape a
+    #: static fetch cannot read and the renderer exists for.
+    _SHELL = (
+        "<html><head><title>某站</title></head>"
+        "<body><div id='app'></div></body></html>"
+    )
+
+    def _install(self, render_result=None):
+        """Serve the empty shell statically and record render attempts.
+
+        ``_request_page`` is patched rather than ``_fetch_once``: the render
+        hook lives inside one attempt, on purpose — that is where the verdict
+        (empty vs blocked vs non-textual) is known, and only *empty* is worth
+        a browser start.
+        """
+        from src.media import link_fetcher
+
+        calls = []
+        shell = self._SHELL
+
+        def _fake_request(url, *, ua, timeout, host=""):
+            return shell, len(shell), "text/html; charset=utf-8"
+
+        def _fake_render(url, *, timeout=12.0):
+            calls.append((url, timeout))
+            return render_result
+
+        originals = {
+            "_request_page": link_fetcher._request_page,
+            "_render_page": link_fetcher._render_page,
+            "is_public_url": link_fetcher.is_public_url,
+        }
+        link_fetcher._request_page = _fake_request
+        link_fetcher._render_page = _fake_render
+        link_fetcher.is_public_url = lambda url, **kw: True
+        for name, original in originals.items():
+            self.addCleanup(setattr, link_fetcher, name, original)
+        link_fetcher.clear_cache()
+        self.addCleanup(link_fetcher.clear_cache)
+        return calls
+
+    def test_render_is_skipped_when_the_config_says_off(self):
+        """With rendering off, an empty page must not cost a browser start."""
+        from src.media import link_fetcher
+
+        calls = self._install()
+        self.assertIsNone(
+            link_fetcher.fetch_article("https://example.com/x", render=False)
+        )
+        self.assertEqual(calls, [])
+
+    def test_render_runs_when_static_reads_are_empty(self):
+        """An empty static read is exactly the case rendering exists for."""
+        from src.media import link_fetcher
+        from src.media.link_fetcher import Article
+
+        calls = self._install(
+            Article(url="https://example.com/x", title="渲染后", text="正文" * 20)
+        )
+        article = link_fetcher.fetch_article(
+            "https://example.com/x", render=True, render_timeout=5.0,
+        )
+        self.assertIsNotNone(article)
+        self.assertEqual(article.title, "渲染后")
+        # Exactly one browser start, with the caller's budget honoured.
+        self.assertEqual(calls, [("https://example.com/x", 5.0)])
+
+    def test_verification_wall_is_not_re_rendered(self):
+        """A wall is an answer, not a shell — rendering it only burns clock."""
+        from src.media import link_fetcher
+
+        calls = self._install()
+        wall = (
+            "<html><head><title></title></head><body>"
+            "<div>当前环境异常，完成验证后即可继续访问。</div>"
+            "<a>去验证</a></body></html>"
+        )
+        original = link_fetcher._request_page
+        link_fetcher._request_page = lambda url, **kw: (
+            wall, len(wall), "text/html; charset=utf-8",
+        )
+        self.addCleanup(setattr, link_fetcher, "_request_page", original)
+
+        self.assertIsNone(
+            link_fetcher.fetch_article("https://example.com/x", render=True)
+        )
+        self.assertEqual(calls, [])
+
+    def test_render_is_skipped_when_the_budget_cannot_cover_it(self):
+        """Starting a browser the deadline will kill is worse than not starting it."""
+        from src.media import link_fetcher
+        from src.media.link_fetcher import Article
+
+        calls = []
+
+        def _fake_render(url, *, timeout=12.0):  # pragma: no cover - must not run
+            calls.append(url)
+            return Article(url=url, title="不该出现", text="x")
+
+        original = link_fetcher._render_page
+        link_fetcher._render_page = _fake_render
+        self.addCleanup(setattr, link_fetcher, "_render_page", original)
+        original_fetch = link_fetcher.fetch_article
+        self.addCleanup(setattr, link_fetcher, "fetch_article", original_fetch)
+
+        # A batch whose budget is entirely consumed before the first render.
+        seen = []
+
+        def _fake_fetch(url, *, render=None, render_allowed=True,
+                        render_timeout=12.0, want_video=False):
+            seen.append((render, render_allowed, want_video))
+            return None
+
+        link_fetcher.fetch_article = _fake_fetch
+        link_fetcher.fetch_for_question(
+            "https://a.com/1", budget_sec=1.0, render=True, render_timeout=12.0,
+        )
+        self.assertEqual(calls, [])
+        # No video intent in this question, so no extra render may be allowed.
+        self.assertEqual(seen, [(True, False, False)])
+
+
 class TlsRepairTests(unittest.TestCase):
     """The build must not depend on the machine's cached intermediates.
 
@@ -834,7 +1018,7 @@ class FetchAttemptTests(unittest.TestCase):
 
         calls = []
 
-        def _fake(url, *, host=""):
+        def _fake(url, *, host="", **_kw):
             calls.append(host)
             if not host:
                 return None, ssl.SSLCertVerificationError("unable to get local issuer")
@@ -855,7 +1039,7 @@ class FetchAttemptTests(unittest.TestCase):
 
         urls = []
 
-        def _fake(url, *, host=""):
+        def _fake(url, *, host="", **_kw):
             urls.append(url)
             if url.startswith("https://"):
                 return None, ssl.SSLCertVerificationError("unable to get local issuer")
@@ -879,7 +1063,7 @@ class FetchAttemptTests(unittest.TestCase):
 
         calls = []
 
-        def _fake(url, *, host=""):
+        def _fake(url, *, host="", **_kw):
             calls.append(url)
             return None, urllib.error.URLError("getaddrinfo failed")
 
@@ -893,7 +1077,7 @@ class FetchAttemptTests(unittest.TestCase):
         """A 200 with nothing readable is not a TLS problem."""
         calls = []
 
-        def _fake(url, *, host=""):
+        def _fake(url, *, host="", **_kw):
             calls.append(url)
             return None, None
 
@@ -1172,6 +1356,139 @@ class VideoOnlyPageTests(unittest.TestCase):
             "<html><head><title>某站</title></head><body><p>短。</p></body></html>"
         )
         self.assertIsNone(self.fetcher.fetch_article(self._URL))
+
+
+class VideoIntentTests(unittest.TestCase):
+    """A readable page must still yield its clip when the question asks for one.
+
+    The shell-render branch only runs when the static views came back *empty*,
+    so a site that writes its caption out as HTML and builds ``<video src>``
+    from JavaScript never reached the browser: the article was readable, its
+    media address was not, and the reply said the clip could not be seen.
+    A question carrying video wording now pays one render for the address —
+    and an ordinary "这文章讲了啥" pays nothing.
+    """
+
+    _URL = "https://www.xiaohongshu.com/discovery/item/6b0348dc000000001b01c79d"
+    _CLIP = "https://sns-video-v3.xhscdn.com/stream/a_259.mp4?sign=1"
+
+    #: Readable prose, no media address anywhere in the bytes — the shape the
+    #: static fetch sees on a page whose player is script-built.
+    _PAGE = (
+        "<html><head><title>周末去爬山</title></head><body><article><p>"
+        + "这次去了城郊的那条老路线，一路上人不多，山顶的风很大。" * 3
+        + "</p></article></body></html>"
+    )
+
+    def setUp(self):
+        from src.media import link_fetcher
+
+        self.fetcher = link_fetcher
+        link_fetcher.clear_cache()
+        self.addCleanup(link_fetcher.clear_cache)
+        original_public = link_fetcher.is_public_url
+        link_fetcher.is_public_url = lambda url, **kw: True
+        self.addCleanup(setattr, link_fetcher, "is_public_url", original_public)
+
+        page = self._PAGE
+        original_opener = link_fetcher._build_opener
+        link_fetcher._build_opener = lambda host="": type(
+            "Opener", (), {"open": lambda *a, **k: _FakeResponse(page)}
+        )()
+        self.addCleanup(setattr, link_fetcher, "_build_opener", original_opener)
+
+        self.renders: list[tuple[str, float]] = []
+        clip = self._CLIP
+
+        def _fake_render(url, *, timeout=12.0):
+            self.renders.append((url, timeout))
+            from src.media.link_fetcher import Article
+
+            return Article(url=url, title="周末去爬山", text="", video_urls=(clip,))
+
+        original_render = link_fetcher._render_page
+        link_fetcher._render_page = _fake_render
+        self.addCleanup(setattr, link_fetcher, "_render_page", original_render)
+
+    def test_video_question_renders_for_the_address(self):
+        article = self.fetcher.fetch_article(self._URL, render=True, want_video=True)
+        self.assertIsNotNone(article)
+        self.assertEqual(len(self.renders), 1)
+        self.assertEqual(article.video_urls, (self._CLIP,))
+        # The static prose is the fuller copy and is what gets summarised;
+        # the render contributes the address only.
+        self.assertIn("城郊的那条老路线", article.text)
+
+    def test_plain_article_question_never_starts_a_browser(self):
+        article = self.fetcher.fetch_article(self._URL, render=True)
+        self.assertIsNotNone(article)
+        self.assertEqual(self.renders, [])
+        self.assertEqual(article.video_urls, ())
+
+    def test_address_already_in_the_static_page_costs_nothing(self):
+        page = self._PAGE.replace(
+            "</article>", f'<video src="{self._CLIP}"></video></article>'
+        )
+        original = self.fetcher._build_opener
+        self.fetcher._build_opener = lambda host="": type(
+            "Opener", (), {"open": lambda *a, **k: _FakeResponse(page)}
+        )()
+        self.addCleanup(setattr, self.fetcher, "_build_opener", original)
+        self.fetcher.clear_cache()
+
+        article = self.fetcher.fetch_article(self._URL, render=True, want_video=True)
+        self.assertEqual(article.video_urls, (self._CLIP,))
+        self.assertEqual(self.renders, [])
+
+    def test_render_is_skipped_when_rendering_is_off(self):
+        article = self.fetcher.fetch_article(self._URL, render=False, want_video=True)
+        self.assertIsNotNone(article)
+        self.assertEqual(self.renders, [])
+
+    def test_render_is_skipped_when_the_budget_cannot_cover_it(self):
+        article = self.fetcher.fetch_article(
+            self._URL, render=True, render_allowed=False, want_video=True,
+        )
+        self.assertIsNotNone(article)
+        self.assertEqual(self.renders, [])
+
+    def test_video_answer_is_not_reused_for_a_plain_question(self):
+        """The cached Article must not leak one question's media address."""
+        self.fetcher.fetch_article(self._URL, render=True, want_video=True)
+        self.renders.clear()
+        plain = self.fetcher.fetch_article(self._URL, render=True)
+        self.assertEqual(self.renders, [])
+        self.assertEqual(plain.video_urls, ())
+
+
+class WantsVideoTests(unittest.TestCase):
+    """Only a question that names the medium may buy a browser start."""
+
+    def test_video_wording_is_recognised(self):
+        from src.media.link_fetcher import wants_video
+
+        for text in (
+            "这个视频讲了啥 https://x.com/a",
+            "帮我看看这段短片",
+            "视频里那个东西是什么",
+            "能描述一下画面吗",
+            "what happens in this video? https://x.com/a",
+            "a short vlog clip",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(wants_video(text))
+
+    def test_article_questions_are_not_video_questions(self):
+        from src.media.link_fetcher import wants_video
+
+        for text in (
+            "这篇讲了啥 https://x.com/a",
+            "帮我总结一下这篇文章",
+            "summarise this article",
+            "",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(wants_video(text))
 
 
 class PromptDocumentationTests(unittest.TestCase):

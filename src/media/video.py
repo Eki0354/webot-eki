@@ -415,6 +415,26 @@ def frames_from_urls(
     response (70 KB) has it — so re-fetching to hunt for the video silently
     drops every clip.
 
+    **Downloading the whole clip is deliberate.**  Streaming it — letting
+    ffmpeg read the URL and seek — looks like the obvious saving, and it was
+    tried and measured on a 2.5 MB / 60 s clip sampling 3 frames:
+
+    ================================  ==================
+    full download (what this does)   100% of the file
+    ffmpeg direct, 3 separate calls  ~49% (not 18%)
+    ffmpeg direct, one call / 3 frames  ~50%
+    local vetting relay in between   223-270% (worse)
+    ================================  ==================
+
+    The 18% figure that motivates the idea is a *single*-frame number; every
+    extra frame pays for reading the header again, so three frames halve the
+    transfer at best.  Worse, ffmpeg follows redirects on its own — a 302 to
+    a loopback address was walked without complaint — so a stranger's URL
+    could aim this machine at an intranet address.  Vetting that with an
+    in-process relay costs more bandwidth than it saves (measured above),
+    because a relay cannot hang up the way a CDN can.  Half the bytes is not
+    worth an SSRF hole, and the clips people actually share are 2-7 MB.
+
     Args:
         urls: Candidate media addresses, best first.
         page_url: Page they came from; used as referer.

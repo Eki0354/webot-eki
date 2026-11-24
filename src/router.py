@@ -572,7 +572,13 @@ class MessageRouter:
             logger.debug("link_fetcher unavailable", exc_info=True)
             return ""
         try:
-            articles = fetch_for_question(text)
+            articles = fetch_for_question(
+                text,
+                render=bool(getattr(self._config, "link_render_enabled", True)),
+                render_timeout=float(
+                    getattr(self._config, "link_render_timeout", 12.0) or 12.0
+                ),
+            )
         except Exception:
             # ``fetch_for_question`` is written not to raise; this is the
             # seatbelt for a future edit that forgets that promise.

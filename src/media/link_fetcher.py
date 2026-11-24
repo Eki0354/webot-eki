@@ -44,7 +44,7 @@ import urllib.parse
 import urllib.request
 import zlib
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from html.parser import HTMLParser
 from typing import Optional
 
@@ -198,6 +198,40 @@ _MAX_LINKS_PER_QUESTION = 2
 #: Total wall-clock budget for a question's fetches.  ``_TIMEOUT_SEC`` is per
 #: request; without this, two dead links would block the reply for 12s.
 _FETCH_BUDGET_SEC = 8
+
+#: Wall clock the headless renderer may take.  A script-built page plus a cold
+#: browser start is slow by nature (measured 3-6s on a warm Edge), so this is
+#: deliberately larger than ``_TIMEOUT_SEC`` — but it only runs once the cheap
+#: static attempts have already come back empty.
+_RENDER_TIMEOUT_SEC = 12.0
+
+#: Words that mean the asker expects *moving pictures* from the link.  Only a
+#: question carrying one of these may spend a browser start on a page whose
+#: static HTML already had readable prose: the static read is the cheap path
+#: and covers every article, while a clip's address is increasingly built by
+#: script alone (measured: a page that sets ``<video src>`` from JavaScript
+#: and injects ``masterUrl`` into a JSON blob 400 ms after load — the static
+#: bytes contain neither).  English terms are matched case-insensitively.
+_VIDEO_INTENT_RE = re.compile(
+    "|".join(
+        (
+            "视频", "短片", "片段", "影片", "片子", "录像", "录屏", "镜头",
+            "抽帧", "画面", "动画",
+            r"\bvlog\b", r"\bvideo\b", r"\bclip\b", r"\bmp4\b", r"\bmovie\b",
+        )
+    ),
+    re.IGNORECASE,
+)
+
+
+def wants_video(text: str) -> bool:
+    """True when *text* asks about a clip rather than an article.
+
+    Deterministic and cheap: this decides whether a readable page may cost one
+    extra browser start to find a media address its static HTML did not carry.
+    Plain article questions ("这篇讲了啥") stay on the static path entirely.
+    """
+    return bool(text) and bool(_VIDEO_INTENT_RE.search(text))
 
 
 @dataclass(frozen=True)
@@ -657,6 +691,26 @@ def _cache_put(url: str, article: Optional[Article]) -> None:
         _cache.popitem(last=False)
 
 
+def _cache_key(url: str, render: bool, want_video: bool = False) -> str:
+    """Cache key that keeps the static and rendered verdicts apart.
+
+    Without the flag, a page first asked about with rendering *off* would
+    cache "nothing readable" and that negative result would then block every
+    later mention from ever trying the renderer.  Screened URLs are the one
+    exception: that decision is a pure function of the URL, so both modes
+    share it and a group that keeps posting an intranet address pays one
+    lookup rather than two.
+
+    ``want_video`` splits one more entry out, and only where it can change
+    the answer: "这文章讲了啥" caches an Article with no media address, and
+    the same link asked later as "视频里是什么" must not inherit that empty
+    tuple.  Two questions about one link in a group chat is the normal case,
+    not the exotic one.
+    """
+    key = f"{url}\x00render" if render else url
+    return f"{key}\x00video" if want_video and render else key
+
+
 def _build_opener(host: str = "") -> urllib.request.OpenerDirector:
     """Opener with the guarded redirect handler in place of the default one.
 
@@ -1103,8 +1157,37 @@ def _judge_page(
     return None, "empty"
 
 
+def _with_video_urls(
+    article: Article, *, url: str, timeout: float,
+) -> Article:
+    """Return *article* carrying a media address, rendering only if it has none.
+
+    Called for questions that actually ask about a clip (:func:`wants_video`).
+    A page whose prose was readable never reaches the shell-render branch
+    below, so without this the address a script built would be lost exactly on
+    the sites that *do* write their caption out — the note describes itself in
+    text and sets ``<video src>`` from JavaScript, which the static bytes never
+    contain (measured: a page doing both 400 ms after load).
+
+    Only ``video_urls`` is borrowed.  The static prose is kept because it is
+    the fuller of the two: a rendered dump of a scripted page routinely paints
+    less text than the server sent, and the answer summarises that text.
+    """
+    if article.video_urls:
+        return article
+    rendered = _render_page(url, timeout=timeout)
+    if rendered is None or not rendered.video_urls:
+        return article
+    logger.info(
+        "Video address found by rendering: %s (%d candidate(s))",
+        url[:80], len(rendered.video_urls),
+    )
+    return replace(article, video_urls=rendered.video_urls)
+
+
 def _fetch_once(
-    url: str, *, host: str = ""
+    url: str, *, host: str = "", render: bool = False,
+    render_timeout: float = 12.0, want_video: bool = False,
 ) -> tuple[Optional[Article], Optional[BaseException]]:
     """One fetch attempt.  Returns ``(article, error)`` and never raises.
 
@@ -1118,6 +1201,10 @@ def _fetch_once(
         url: Page to read.
         host: Passed to :func:`_build_opener` to enable chain repair.  "" for
             the plain verifying context, which is the normal first attempt.
+        render: Allow the script-executing fallback when both static views
+            are empty.  Only meaningful on the first attempt; the TLS-repair
+            retry passes False because rendering does not fix a certificate.
+        render_timeout: Wall clock the renderer may use.
 
     Returns:
         ``(article, None)`` on success, ``(None, exception)`` when the request
@@ -1138,7 +1225,16 @@ def _fetch_once(
 
     article, reason = _judge_page(url, page, raw_len=raw_len,
                                   content_type=content_type)
-    if article is not None or reason == "non-textual":
+    if article is not None:
+        # Readable prose, but the question is about the clip: the player may
+        # still be script-built.  Only this branch pays for that, and only
+        # when the question asked for it.
+        if want_video and render:
+            article = _with_video_urls(
+                article, url=url, timeout=render_timeout,
+            )
+        return article, None
+    if reason == "non-textual":
         return article, None
 
     # The desktop view was a wall, a stub or a shell.  Ask again as a phone:
@@ -1162,17 +1258,97 @@ def _fetch_once(
         )
         return None, None
 
-    article, _ = _judge_page(url, mobile_page, raw_len=mobile_raw,
-                             content_type=mobile_type)
+    article, reason = _judge_page(url, mobile_page, raw_len=mobile_raw,
+                                  content_type=mobile_type)
     if article is not None:
         logger.info(
             "Link fetched with a mobile User-Agent: %s (%d chars, title=%r)",
             url[:80], len(article.text), article.title[:40],
         )
-    return article, None
+        if want_video and render:
+            article = _with_video_urls(
+                article, url=url, timeout=render_timeout,
+            )
+        return article, None
+
+    # Neither text view had anything in it.  That is the signature of a page
+    # whose body *and* player are built by script — the media address is in
+    # no static response at all.  Let a real browser run the page and judge
+    # the finished DOM instead.  ``blocked`` is deliberately excluded: a
+    # verification wall or a "deleted" notice is an answer, and re-rendering
+    # it only burns wall clock on the reply path.
+    if reason in ("empty", "stub") and render:
+        rendered = _render_page(url, timeout=render_timeout)
+        if rendered is not None:
+            return rendered, None
+    return None, None
 
 
-def fetch_article(url: str) -> Optional[Article]:
+#: Whether the script-executing fallback may run.  ``fetch_article`` takes it
+#: as a parameter so the caller (which owns the config) stays in charge; this
+#: is only the default for direct calls such as tests and one-off tools.
+_RENDER_ENABLED = True
+
+
+def set_render_enabled(enabled: bool) -> None:
+    """Turn the rendering fallback on or off for direct ``fetch_article`` calls.
+
+    The live path passes ``render=`` explicitly, so this exists for callers
+    that have no config object — the web UI's one-off fetch, scripts, tests.
+    """
+    global _RENDER_ENABLED
+    _RENDER_ENABLED = bool(enabled)
+
+
+def _render_page(url: str, *, timeout: float = 12.0) -> Optional[Article]:
+    """Render *url* in a headless browser and judge the finished DOM.
+
+    Imported inside the call: :mod:`src.media.browser_render` locates a
+    browser on first use, and a build without one must still read static
+    pages.  Every failure degrades to None — this runs inside the reply path.
+
+    Security note, stated rather than hidden: the page's *own* scripts run in
+    the browser, and that browser's network stack is not filtered by
+    :func:`is_public_url`.  The URL handed here has already been vetted, but a
+    page could redirect the renderer to an internal address.  That is a
+    different threat model from the ``urllib`` path, which re-checks every
+    hop (:class:`_GuardedRedirectHandler`); the mitigation is that anything
+    extracted from the result (a media address) is vetted again before it is
+    fetched.
+    """
+    try:
+        from . import browser_render
+    except Exception:  # pragma: no cover - import cannot realistically fail
+        logger.debug("browser_render unavailable", exc_info=True)
+        return None
+    if not browser_render.available():
+        return None
+
+    dom = browser_render.render_html(url, timeout=timeout)
+    if not dom:
+        logger.info("Link render produced nothing for %s", url[:80])
+        return None
+
+    article, reason = _judge_page(
+        url, dom, raw_len=len(dom.encode("utf-8", errors="replace")),
+        content_type="text/html",
+    )
+    if article is None:
+        logger.info("Link render gave no readable page (%s): %s", reason, url[:80])
+        return None
+    logger.info(
+        "Link fetched by rendering: %s (%d chars, title=%r, %d video address(es))",
+        url[:80], len(article.text), article.title[:40], len(article.video_urls),
+    )
+    return article
+
+
+def fetch_article(
+    url: str, *, render: Optional[bool] = None,
+    render_allowed: bool = True,
+    render_timeout: float = _RENDER_TIMEOUT_SEC,
+    want_video: bool = False,
+) -> Optional[Article]:
     """Fetch *url* and reduce it to an :class:`Article`, or None.
 
     Blocking: the caller is expected to run this off the reply path or accept
@@ -1191,6 +1367,15 @@ def fetch_article(url: str) -> Optional[Article]:
 
     Args:
         url: The shared link.  Must pass :func:`is_public_url`.
+        render: Allow the headless-browser fallback.  ``None`` = module
+            default, which is what direct callers (tests, one-off tools) get.
+        render_allowed: False when the caller's wall-clock budget cannot
+            cover a render any more.  Separate from ``render`` because the
+            two answer different questions: "may I" versus "can I afford it".
+        render_timeout: Wall clock the renderer may use.
+        want_video: The question asks about a clip, so a readable page that
+            names no media address may spend one render to find one.  Off by
+            default: plain article questions must not pay for a browser.
 
     Returns:
         The article, or None when the URL is refused, unreachable, not
@@ -1200,14 +1385,28 @@ def fetch_article(url: str) -> Optional[Article]:
     if not url:
         return None
 
-    hit, cached = _cache_get(url)
+    # ``render=None`` means "whatever the module default is": the live path
+    # always passes the config value, so this only covers direct callers.
+    use_render = _RENDER_ENABLED if render is None else bool(render)
+    use_render = use_render and render_allowed
+    use_video = bool(want_video) and use_render
+    key = _cache_key(url, use_render, use_video)
+
+    hit, cached = _cache_get(key)
     if hit:
         return cached
+    if use_render:
+        # A screened URL is the one entry both modes share.  Without this the
+        # "refused" verdict would be stored under the bare URL and never read
+        # back by the rendering mode, costing a DNS lookup per mention.
+        hit, cached = _cache_get(url)
+        if hit and cached is None:
+            return None
 
     if not is_public_url(url):
         # Rejected URLs are cached too: the decision is a pure function of the
         # URL, and a group that keeps sharing an intranet address must not
-        # cost a DNS lookup per mention.
+        # cost a DNS lookup per mention.  Both modes share this entry.
         _cache_put(url, None)
         return None
 
@@ -1216,13 +1415,19 @@ def fetch_article(url: str) -> Optional[Article]:
     except ValueError:
         hostname = ""
 
-    article, error = _fetch_once(url)
+    article, error = _fetch_once(
+        url, render=use_render, render_timeout=render_timeout,
+        want_video=use_video,
+    )
 
     if article is None and error is not None and _is_tls_error(error) and hostname:
         logger.info(
             "Link fetch: TLS failed for %s (%s), retrying with a repaired "
             "certificate chain", url[:80], type(error).__name__,
         )
+        # ``render=False`` on the retry: rendering runs the page in a browser
+        # that has its own trust store, so it is no repair for *our* TLS
+        # failure.  The renderer gets its own attempt further down instead.
         article, retry_error = _fetch_once(url, host=hostname)
         if article is None and retry_error is not None:
             error = retry_error
@@ -1237,7 +1442,9 @@ def fetch_article(url: str) -> Optional[Article]:
             "chain could not be verified — content is not authenticated",
             fallback[:80],
         )
-        article, fallback_error = _fetch_once(fallback)
+        article, fallback_error = _fetch_once(
+            fallback, render=use_render, render_timeout=render_timeout,
+        )
         if article is None and fallback_error is not None:
             error = fallback_error
 
@@ -1252,7 +1459,7 @@ def fetch_article(url: str) -> Optional[Article]:
         )
         logger.debug("Link fetch traceback", exc_info=error)
 
-    _cache_put(url, article)
+    _cache_put(key, article)
     if article:
         logger.info(
             "Link fetched: %s (%d chars, title=%r)",
@@ -1290,6 +1497,8 @@ def fetch_for_question(
     *,
     max_links: int = _MAX_LINKS_PER_QUESTION,
     budget_sec: float = _FETCH_BUDGET_SEC,
+    render: Optional[bool] = None,
+    render_timeout: float = _RENDER_TIMEOUT_SEC,
 ) -> list[Article]:
     """Fetch the pages a question links to.
 
@@ -1301,6 +1510,11 @@ def fetch_for_question(
         text: The user's question, URLs embedded.
         max_links: Most pages to fetch for one question.
         budget_sec: Total wall clock allowed for the batch.
+        render: Allow the headless-browser fallback.  ``None`` = module
+            default.  Rendering is also *skipped* when the remaining budget
+            cannot cover ``render_timeout`` — starting a browser it will be
+            killed for is worse than not starting it.
+        render_timeout: Wall clock one render may take.
 
     Returns:
         The articles that could be read, in the order the links appeared.
@@ -1310,13 +1524,29 @@ def fetch_for_question(
     if not urls:
         return []
 
+    # Decided once for the whole batch: the question is the only thing that
+    # says whether a media address is wanted, and every link in it is being
+    # asked about the same way.
+    wants_clip = wants_video(text)
     deadline = time.monotonic() + max(0.0, budget_sec)
     articles: list[Article] = []
     for url in urls:
-        if time.monotonic() >= deadline:
+        left = deadline - time.monotonic()
+        if left <= 0:
             logger.info("Link fetch budget exhausted, skipping %s", url[:80])
             break
-        article = fetch_article(url)
+        # The static attempts are cheap and come first inside ``fetch_article``;
+        # the render happens last, so it only runs when the batch can still
+        # afford it.  Starting a browser this deadline will kill is worse than
+        # not starting it: the reply pays the wait and gets nothing.
+        allowance = left >= render_timeout
+        article = fetch_article(
+            url,
+            render=render if render is not None else None,
+            render_allowed=allowance,
+            render_timeout=min(render_timeout, max(1.0, left)),
+            want_video=wants_clip,
+        )
         if article:
             articles.append(article)
     return articles

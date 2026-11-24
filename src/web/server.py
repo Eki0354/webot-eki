@@ -699,9 +699,16 @@ def _fetch_link_context(text: str, env=None) -> str:
     env = os.environ if env is None else env
     if str(env.get("LINK_FETCH_ENABLED", "true")).strip().lower() != "true":
         return ""
+    render = str(env.get("LINK_RENDER_ENABLED", "true")).strip().lower() == "true"
+    try:
+        timeout = float(env.get("LINK_RENDER_TIMEOUT", "12.0"))
+    except (TypeError, ValueError):
+        timeout = 12.0
     try:
         from src.media.link_fetcher import fetch_for_question, format_link_context
-        return format_link_context(fetch_for_question(text))
+        return format_link_context(
+            fetch_for_question(text, render=render, render_timeout=timeout)
+        )
     except Exception:
         logger.debug("Link fetch unavailable in chat sandbox", exc_info=True)
         return ""

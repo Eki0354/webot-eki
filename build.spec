@@ -113,6 +113,11 @@ a = Analysis(
         # and link_fetcher._video_urls, so the static scan cannot see it;
         # without this line the frozen EXE silently answers "看不到视频".
         'src.media.video',
+        # Headless render fallback for pages whose player/body is script-built.
+        # Imported lazily inside link_fetcher._render_page, so the static scan
+        # misses it; without this line the frozen EXE silently never renders
+        # and B站/YouTube-style video pages stay unreadable.
+        'src.media.browser_render',
         'zstandard',
         # AES-128-ECB for the .dat image container.  PyAV (HEVC) is
         # deliberately excluded below: wxgf images then degrade to the

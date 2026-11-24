@@ -469,6 +469,16 @@ class BotConfig:
     # the reported bug.  Off = the URL still reaches the prompt, but the bot
     # cannot read the article.
     link_fetch_enabled: bool = True
+    # Run the page in a headless browser when plain HTTP gives an empty shell.
+    # Sites that build the player (and the video address) in script expose
+    # nothing to a static fetch; this is the only way to read them.  Default
+    # on — it costs nothing unless a page comes back empty, and it degrades to
+    # the static result when no Edge/Chrome is installed.  Off = never start a
+    # browser; script-built pages then read as "打不开".
+    link_render_enabled: bool = True
+    # Wall clock the headless renderer may take, in seconds.  Bounded because
+    # this runs on the reply path, after the static attempts already failed.
+    link_render_timeout: float = 12.0
 
     # === Image decryption (localType=3 ``.dat`` containers) ===
     # WeChat encrypts received images per machine; these keys are not in the
@@ -759,6 +769,11 @@ def load_config() -> BotConfig:
         "media_vision_model": os.getenv("MEDIA_VISION_MODEL", "").strip(),
         # Shared links (fetch the page behind a URL in an @bot question)
         "link_fetch_enabled": os.getenv("LINK_FETCH_ENABLED", "true").strip().lower() == "true",
+        # Headless render fallback for pages whose body/player is script-built
+        "link_render_enabled": os.getenv("LINK_RENDER_ENABLED", "true").strip().lower() == "true",
+        "link_render_timeout": _safe_float(
+            os.getenv("LINK_RENDER_TIMEOUT", "12.0"), 12.0, "LINK_RENDER_TIMEOUT",
+        ),
         # Image decryption keys (per machine, not derivable — see dat_decrypt.py)
         "image_xor_key": os.getenv("IMAGE_XOR_KEY", "").strip(),
         "image_aes_key": os.getenv("IMAGE_AES_KEY", "").strip(),
