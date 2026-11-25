@@ -6,9 +6,9 @@ on:
       tag:
         description: "Release tag to build and upload assets to"
         required: true
-        default: "v1.0.1"
+        default: "v1.3.0"
       source_windows_release:
-        description: "Previous release that contains bundled Windows DLLs"
+        description: "Release asset (webot.exe) to extract the bundled Windows DLLs from"
         required: true
         default: "v1.0.0"
 
@@ -21,6 +21,24 @@ jobs:
     runs-on: windows-latest
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # actions/checkout 用不存在的 ref 会以 "git fetch ... exit code 1" 失败，
+      # 看不出是 tag 没推上去。这里先显式校验，给出可操作的报错。
+      - name: Verify release tag exists
+        shell: pwsh
+        run: |
+          $tag = "${{ inputs.tag }}"
+          git fetch --tags --force origin
+          if (-not (git rev-parse -q --verify "refs/tags/$tag")) {
+            Write-Host "::error::Tag '$tag' 不在远程仓库中，请先创建并推送：git tag $tag <commit>; git push origin $tag"
+            exit 1
+          }
+          Write-Host "Tag '$tag' -> $(git rev-parse --short "refs/tags/$tag")"
+
       - name: Checkout release source
         uses: actions/checkout@v4
         with:
