@@ -138,6 +138,9 @@ grep "文件名" CODEBASE_REFERENCE.md
 | `VOICE_ASR_TO_SIMPLIFIED` | `bool` | `True` | `src/config.py` | `src/voice/asr.py` (各ASR后端) |
 | `MEDIA_VISION_ENABLED` | `bool` | `False` | `src/config.py` | `src/media/pipeline.py:MediaPipeline.__init__()` |
 | `MEDIA_VISION_MODEL` | `str` | `""` | `src/config.py` | `src/media/pipeline.py:MediaPipeline._create_vision()` |
+| `MEDIA_VIDEO_ASR_ENABLED` | `bool` | `False` | `src/config.py` | `src/media/pipeline.py:MediaPipeline.__init__()` → `describe_video` 的 `want_audio`；关掉则完全不要音轨，也不加载模型 |
+| `MEDIA_VIDEO_ASR_MODEL` | `str` | `""` | `src/config.py` | `src/media/pipeline.py:MediaPipeline._get_asr()`；留空复用 `VOICE_LOCAL_MODEL` |
+| `MEDIA_VIDEO_ASR_MAX_SEC` | `float` | `0.0` | `src/config.py` | `src/media/pipeline.py:MediaPipeline._audio_budget()`；0 = 用 `video._MAX_AUDIO_SEC`(120s)，两者因此不会各说各话 |
 | `LINK_FETCH_ENABLED` | `bool` | `True` | `src/config.py` | `src/router.py:_link_context()`、`src/web/server.py:_fetch_link_context()`；Web 侧直接读 `os.environ`（该模块用磁盘 `.env` 而非 `BotConfig`） |
 | `LINK_RENDER_ENABLED` | `bool` | `True` | `src/config.py` | `src/media/link_fetcher.py:fetch_article(render=…)`（经 router / web server 传入）；关掉则从不启动浏览器 |
 | `LINK_RENDER_TIMEOUT` | `float` | `12.0` | `src/config.py` | 同上（`render_timeout`）；单次渲染墙钟上限，整批预算不够时直接跳过渲染 |
@@ -877,8 +880,8 @@ subprocess.run(cmd, capture_output=True, timeout=30, **hidden_kwargs())
 | `MediaPipeline.__init__(config)` | 初始化媒体管道 | `config` | `None` |
 | `MediaPipeline.process(msg, chat_id="")` | 媒体消息 → 文本（占位符由调用方兜底）；图片需 `chat_id` 定位目录；引用图片走 `_describe_quoted()` | `msg: dict, chat_id: str` | `str \| None` |
 | `MediaPipeline._describe_quoted(msg, chat_id)` | 引用消息（`<refermsg>`）里被引用的图片：用其 `<img>` 载荷复用解密+视觉，输出「用户提问（引用的图片：…）」；非图片引用返回 None | `msg: dict, chat_id: str` | `str \| None` |
-| `MediaPipeline.describe_video(video_urls, page_url)` | 抽帧描述分享视频：「你能看到这个视频吗」在只收文本的 chat completion 里原本只能答「看不到」；候选地址取自同一次响应的 `Article.video_urls`（`page_url` 作 Referer），3 帧一次性送给视觉模型让它叙述整段而非三个孤立画面；任一步失败（无 ffmpeg / 下载失败 / 模型无输出）都返回 None，绝不抛异常 | `video_urls: tuple[str, ...] \| list[str], page_url: str` | `str \| None` |
-| `MediaPipeline.stats()` | 计数器快照（`emoji`/`image`/`video`/`described`/`failed`） | 无 | `dict` |
+| `MediaPipeline.describe_video(video_urls, page_url)` | 抽帧描述分享视频：「你能看到这个视频吗」在只收文本的 chat completion 里原本只能答「看不到」；候选地址取自同一次响应的 `Article.video_urls`（`page_url` 作 Referer），3 帧一次性送给视觉模型让它叙述整段而非三个孤立画面。**`MEDIA_VIDEO_ASR_ENABLED` 打开时**再把片中的说话转成文字，和帧合成**一次**请求发给视觉模型——分两次调用会付两倍延迟、还得到两段对不上的总结（一段讲画面、一段讲声音）。帧与台词**独立降级**：任一成功仍出描述；转写超 `_VIDEO_ASR_TIMEOUT_SEC`(90s) 就放弃台词只描述画面。任一步失败（无 ffmpeg / 下载失败 / 模型无输出）都返回 None，绝不抛异常 | `video_urls: tuple[str, ...] \| list[str], page_url: str` | `str \| None` |
+| `MediaPipeline.stats()` | 计数器快照（`emoji`/`image`/`video`/`described`/`failed`/`asr`） | 无 | `dict` |
 | `MediaPipeline.set_emoji_url_lookup(lookup)` | 安装表情下载地址回查回调（精简表情体没有 `cdnurl` 时用） | `lookup: Callable[[str, str], str\|None] \| None` | `None` |
 | `MediaPipeline.remember_emoji_urls(entries)` | 把采集到的 `md5 → cdnurl` 交给 `EmojiStore` 持久化 | `entries: dict[str, str]` | `None` |
 | `MediaPipeline._vision_model()` | 日志用模型名；无视觉客户端时返回 `"?"` | 无 | `str` |
@@ -907,6 +910,10 @@ subprocess.run(cmd, capture_output=True, timeout=30, **hidden_kwargs())
 | `extract_frames(video, dest_dir, count=DEFAULT_FRAME_COUNT)` | 按时间点抽帧并压到 `_MAX_FRAME_WIDTH`(720)，JPEG 约 50–70 KB/帧 | 见参数 | `list[Path]` |
 | `frames_from_urls(urls, page_url, count=DEFAULT_FRAME_COUNT)` | 依次试候选地址：下载 → 抽帧 → 删掉大文件；成功即返回，全失败清掉临时目录返回 `[]`。**地址必须来自同一次响应**（二次请求小红书会退化成 23 KB 空壳） | 见参数 | `list[Path]` |
 | `frames_from_page(page, page_url, count=…)` | 从给定 HTML 抽地址再走 `frames_from_urls`（供已有页面正文的场景） | 见参数 | `list[Path]` |
+| `audio_slices(duration, max_sec=_MAX_AUDIO_SEC, slice_sec=_AUDIO_SLICE_SEC)` | 选出总长不超过 *max_sec* 的 `(start, length)` 片段：短片整段取（一段、不丢内容），长片**均匀采样**——一段十分钟的片子，解释画面的台词在头也在尾，只取前两分钟等于只描述开头。每段是**连续**的一段话（每隔几秒切一刀会让 Whisper 接不上句子），且从第一秒铺到最后一秒，拼起来就是全片主线 | `duration: float` + 关键字 | `list[tuple[float, float]]` |
+| `extract_audio(video, out_dir, max_sec=…, slice_sec=…)` | 抽出 16 kHz 单声道 `audio.wav`（Whisper 的输入格式，直接给就不用转写端再重采样一遍）。超预算的片子按 `audio_slices` 采样，用 ffmpeg 的 `concat` 滤镜一次进程拼好（不是每段一个进程）。**无音轨不算错误**：B 站 DASH 渲染本来就只有画面，调用方降级为只描述画面 | `video: Path, out_dir: Path` + 关键字 | `Path \| None` |
+| `bilibili_audio_urls(page_url)` | **B 站 DASH 的音轨地址**：走同一条 `_bili_dash()`，取 `dash.audio` 渲染列表（视频那份在 `dash.video`）。音轨优先高码率：阶梯顶约 192 kbps、底约 64 kbps，取最高即可。解析失败返回 `[]` | `page_url: str` | `list[str]` |
+| `samples_from_urls(urls, page_url, count=…, want_audio=False, audio_max_sec=…, audio_urls=None)` | 下载一个候选地址并（可选）同时产出帧与音轨——**一次下载出两样**，转写不额外花流量。B 站是例外：DASH 只有画面，故 *audio_urls* 是「下载回来的文件没音轨」时才用的备用地址列表；传**可调用对象**时只在这种情况下才求解（B 站要三次 API 调用，别的站点每片都这个延迟纯属浪费）。`audio_max_sec=None` 表示用模块默认 `_MAX_AUDIO_SEC` | 见参数 | `VideoSamples \| None` |
 
 模块级常量：
 
@@ -915,6 +922,9 @@ subprocess.run(cmd, capture_output=True, timeout=30, **hidden_kwargs())
 | `DEFAULT_FRAME_COUNT` | `3` | 送给视觉模型的帧数：够看出场景切换，又足够便宜 |
 | `_MAX_FRAME_WIDTH` | `720` | 上传前降采样宽度 |
 | `_MAX_VIDEO_BYTES` | `48 MB` | 传输上限，拒绝误标的巨型文件而卡住回复 |
+| `_MAX_AUDIO_SEC` | `120.0` | 交给转写器的音频总长上限（**两分钟**）。实测 6 线程 CPU + `small`(int8)：120 秒音频解码 7.5 秒（16 倍实时），一次性模型加载约 23 秒，首次另有约 500MB 下载。两分钟已覆盖群里几乎全部分享片（大多不到一分钟），所以这个上限只对长片生效，长片由 `audio_slices` 均匀采样仍能带出全片主线 |
+| `_AUDIO_SLICE_SEC` | `30.0` | 长片每段保留的秒数：一两场戏的对话，够跟上线索又足够小，十分钟的片子因而是四段均匀分布而不是一段。永远不超过预算的一半，保证至少两段 |
+| `_MAX_AUDIO_TRACK_BYTES` | `8 MB` | 单独下载 DASH 音轨的上限（两分钟 64 kbps 不到 1 MB，这个值只拒绝误标成音频的东西） |
 | `_STANDARD_PORTS` | `(None, 80, 443)` | `_port_rank` 认定的常规端口；其余端口（B 站 4483/8082）过不了 `is_public_url` 的围栏 |
 | `_BILI_API` | `"https://api.bilibili.com"` | B 站 API 根，`_bili_json` 拼路径用 |
 | `_BILI_API_TIMEOUT_SEC` | `8.0` | 单次 API / 短链解析的墙钟上限 |
@@ -2215,7 +2225,7 @@ MacHybridBackend
 | `emoji.py` | `src/media/emoji.py` | 表情图片定位 (本地 Persist / CDN 下载) |
 | `image.py` | `src/media/image.py` | 图片定位 (`msg/attach/{md5(session)}/`) + 解密 + 缓存 |
 | `dat_decrypt.py` | `src/media/dat_decrypt.py` | `.dat` 四段容器解析 (AES-128-ECB 头 + 明文 + XOR 尾) |
-| `wxgf.py` | `src/media/wxgf.py` | `wxgf`/HEVC 容器解包 (PyAV 可选) |
+| `wxgf.py` | `src/media/wxgf.py` | `wxgf`/HEVC 容器解包 (PyAV 可选；打包版已随包进，见 5.2) |
 | `keys.py` | `src/media/keys.py` | 图片密钥来源解析 (`env` / `file`) |
 | `vision.py` | `src/media/vision.py` | 图片/视频帧描述 (OpenAI 兼容接口，请求形状按需协商) |
 | `video.py` | `src/media/video.py` | 分享视频抽帧 (下载 + 外挂 ffmpeg.exe，可选依赖) + B 站官方 API 取流 (无浏览器) |
@@ -2288,12 +2298,22 @@ MessageRouter._handle_chat(msg, clean_content)
         └── _video_context(articles)
               └── MediaPipeline.describe_video(article.video_urls, article.url)
                     ├── video.available() → ffmpeg_path() 定位外挂 ffmpeg.exe
-                    ├── video.frames_from_urls(urls, page_url)
+                    ├── video.samples_from_urls(urls, page_url,
+                    │        want_audio=media_video_asr_enabled,      ← 默认关
+                    │        audio_max_sec=_audio_budget(),           ← 0 → 120s
+                    │        audio_urls=lambda: _audio_urls(page_url)) ← B 站 DASH
                     │     ├── download_video(url, workdir, referer=page_url)
                     │     │     └── is_public_url(url) 校验 + 48MB 上限
                     │     ├── probe_duration(clip) → frame_timestamps()
-                    │     └── extract_frames(clip, workdir, count=3) → 720px JPEG
-                    ├── VisionClient.describe_frames(frames) — 3 帧同一请求
+                    │     ├── extract_frames(clip, workdir, count=3) → 720px JPEG
+                    │     └── want_audio 时 extract_audio(clip, workdir, max_sec=预算)
+                    │           ├── audio_slices(duration, max_sec, slice_sec) → 均匀切片
+                    │           ├── ffmpeg -f concat 一次进程拼成 16kHz 单声道 WAV
+                    │           └── 无音轨（B 站 DASH）→ bilibili_audio_urls() 另取音轨
+                    ├── _transcribe(samples.audio)                    ← 有音轨才算
+                    │     └── _get_asr() → faster_whisper 线程池 + 90s 截止时间
+                    │           └── LocalWhisperASR.transcribe_media() — greedy + VAD
+                    ├── VisionClient.describe_frames(frames, transcript=…) — 仍是一次请求
                     └── shutil.rmtree(临时目录) → "[视频画面] 标题 — URL\n<描述>"
 ```
 
@@ -2311,7 +2331,7 @@ MessageRouter._handle_chat(msg, clean_content)
 
 1. **AES 密钥** — 每台机器不同，不在消息 XML 里、也无法推导，必须 `IMAGE_AES_KEY` 手动填（XOR 密钥可自动推导，见下）
 2. **容器结构** — `.dat` 是四段拼接，不是整段 AES：只有头部一段是 AES-128-ECB，中段明文，尾段单字节 XOR
-3. **codec** — `wxgf` 载荷是 HEVC；打包版为控制体积不含 PyAV，这类图片改走**同图 JPEG 副本兜底**（`_h`/`_b`/`_t` 同基名 `.dat`），实测 1683 组真实图片 0 失败（其中 587 组靠兜底救回）。兜底也没有时才降级 `[图片]`
+3. **codec** — `wxgf` 载荷是 HEVC。打包版现在**带** PyAV（视频台词转写需要它，见 5.2），所以这类图片可以直接解；仍保留**同图 JPEG 副本兜底**（`_h`/`_b`/`_t` 同基名 `.dat`），实测 1683 组真实图片 0 失败（其中 587 组靠兜底救回），用于无 PyAV 的环境。兜底也没有时才降级 `[图片]`
 
 **XOR 密钥不需要提取。** 尾段是单字节 XOR，而图片有固定结尾符（JPEG `FF D9`、PNG `IEND®B\`\x82`），所以密钥可以从文件本身反推。`ImageStore._resolve_xor_key()` 在未配置时遍历附件目录、对每个 V2 文件的尾段投票，选出唯一能让最多文件正确收尾的字节。实测本机 3807 个文件：真值 `0xED` 得 2650 票，次高仅 1 票，前 10 个文件即可稳定得出，耗时 0.15s，结果（含推导失败）每次运行只算一次。
 
@@ -2462,7 +2482,10 @@ WCDB_KEY=
 #   + src.media.video (抽帧；ffmpeg.exe 本身不进包，见下)
 #   + src.media.browser_render (渲染脚本页面；用机器上已有的 Edge/Chrome，
 #     不下载不打包，缺失时降级为纯静态抓取)
-# 排除: faster_whisper, ctranslate2, numpy, onnxruntime, pysilk, tkinter, matplotlib, scipy
+#   + src.voice / src.voice.asr + faster_whisper(及其子模块) / ctranslate2 /
+#     onnxruntime / av / opencc / numpy (视频台词转写，见下)
+# 排除: pysilk, sounddevice, soundfile, tkinter, matplotlib, scipy,
+#       torch, torchvision, transformers, pandas, cv2, sklearn, ultralytics, joblib
 # 注意: native/windows/ffmpeg.exe 刻意不 embed (121MB)，打包后手动复制到
 #       dist/native/windows/ffmpeg.exe；缺失时视频链路降级为纯文字回答
 ```
@@ -2472,8 +2495,15 @@ WCDB_KEY=
 路径，漏掉会让打出的 EXE 在运行时抛 `ImportError`。
 
 图片解密新增的 `src.media.dat_decrypt` / `wxgf` / `image` / `keys` 与 `Crypto`
-同理必须显式列出。**PyAV 被刻意排除**：`wxgf` 载荷是 HEVC，带上 PyAV 会让
-EXE 增大约 100 MB；不带时这类图片降级为 `[图片]` 占位符，其余链路不受影响。
+同理必须显式列出。**PyAV（`av`）现在随包进**：`faster-whisper` 用它解码音轨，而
+视频台词转写要读 WAV/AAC，所以它不能再像以前那样为了省体积而排除——代价是 EXE
+**从 ~56 MB 增到 ~135 MB**（`av` 连同 FFmpeg shared libs、`ctranslate2` 的 58 MB
+推理 DLL、`onnxruntime` 的 VAD 运行时）。顺带的好处是 `wxgf` 的 HEVC 图片可以
+直接解，不再依赖同图 JPEG 兜底。
+
+**版本上限 `av<19`**：`faster_whisper.audio.decode_audio()` 仍调用
+`av.open(..., metadata_errors="ignore")`，而 PyAV 19 删除了该关键字——实测装 19
+会让每次转写抛 `TypeError`，表现为「台词莫名其妙丢了」。`requirements.txt` 已钉住。
 
 ### 5.3 `requirements.txt` 依赖说明
 
@@ -2493,6 +2523,7 @@ EXE 增大约 100 MB；不带时这类图片降级为 `[图片]` 占位符，其
 | `pyperclip>=1.8` | 剪贴板操作 | 是 |
 | `silk-python>=0.2.8` | SILK v3 音频解码 | 语音功能 |
 | `faster-whisper>=1.0` | 本地语音识别 | 语音功能 |
+| `av>=11,<19` | faster-whisper 的音频解码（PyAV） | 语音功能；**必须 <19**：`faster_whisper.audio.decode_audio()` 仍在传 `av.open(..., metadata_errors="ignore")`，而 PyAV 19 删掉了这个关键字，实测直接 `TypeError: open() got an unexpected keyword argument 'metadata_errors'`，表现为"台词莫名其妙丢了" |
 | `opencc-python-reimplemented>=0.1.7` | 繁简中文转换 | 语音功能 |
 | `zstandard>=0.22` | 解压微信非文本消息体 (base64 → zstd → 文本) | 媒体功能 |
 | `pycryptodome>=3.20` | `.dat` 图片容器头段 AES-128-ECB 解密 | 图片功能 |

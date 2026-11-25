@@ -462,6 +462,20 @@ class BotConfig:
     media_vision_enabled: bool = False
     # Vision model override. Empty = reuse the configured AI backend's model.
     media_vision_model: str = ""
+    # Transcribe a shared video's own speech and send it along with the
+    # frames.  Off by default: it costs CPU time on the reply path and a
+    # several-hundred-megabyte model download on first use — neither should
+    # happen without the operator asking.
+    media_video_asr_enabled: bool = False
+    # Local Whisper size for video speech.  Empty = reuse voice_local_model.
+    # A clip only has to be understood roughly, so this may be smaller than
+    # the voice-message model without hurting voice accuracy.
+    media_video_asr_model: str = ""
+    # Seconds of a clip's sound that may be transcribed.  0 = the built-in
+    # budget in ``src.media.video``.  A clip longer than this is sampled in
+    # evenly spaced slices, so the result is the whole storyline at a fixed
+    # cost rather than only its opening.
+    media_video_asr_max_sec: float = 0.0
 
     # === Shared links (appmsg / URLs in a question) ===
     # Fetch the page behind a link and put its text in the prompt.  Default on:
@@ -767,6 +781,11 @@ def load_config() -> BotConfig:
         # Media (image / emoji / appmsg)
         "media_vision_enabled": os.getenv("MEDIA_VISION_ENABLED", "false").strip().lower() == "true",
         "media_vision_model": os.getenv("MEDIA_VISION_MODEL", "").strip(),
+        "media_video_asr_enabled": os.getenv("MEDIA_VIDEO_ASR_ENABLED", "false").strip().lower() == "true",
+        "media_video_asr_model": os.getenv("MEDIA_VIDEO_ASR_MODEL", "").strip(),
+        "media_video_asr_max_sec": _safe_float(
+            os.getenv("MEDIA_VIDEO_ASR_MAX_SEC", "0"), 0.0, "MEDIA_VIDEO_ASR_MAX_SEC",
+        ),
         # Shared links (fetch the page behind a URL in an @bot question)
         "link_fetch_enabled": os.getenv("LINK_FETCH_ENABLED", "true").strip().lower() == "true",
         # Headless render fallback for pages whose body/player is script-built

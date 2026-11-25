@@ -27,8 +27,11 @@ What is supported, and why:
   ``[图片]`` placeholder.  See :mod:`src.media.image`.
 """
 
+import concurrent.futures
 import logging
 import shutil
+import time
+from pathlib import Path
 from typing import Callable, Optional
 
 from src.config import PROJECT_ROOT, resolve_wechat_data_dir
@@ -58,6 +61,17 @@ LOCAL_TYPE_SYSTEM = 10000
 #: is worth one retry when it refuses the request.  More than that only adds
 #: latency to a reply.
 _MAX_VIDEO_SOURCES = 2
+
+#: How long a clip's speech may take to transcribe before the reply goes on
+#: without it, in seconds.
+#:
+#: Someone is waiting for this answer, so the cap is a deadline and not an
+#: estimate: measured on this machine, two minutes of audio takes ~7.5 s with
+#: ``small`` at ``int8`` on 6 threads (16x realtime), and a slower VM can
+#: take several times that — plus ~23 s for the first model load.  At 90 s
+#: a clip that would have made the reply feel stuck instead degrades to the
+#: frame-only description the bot already produced without this feature.
+_VIDEO_ASR_TIMEOUT_SEC = 90.0
 
 
 class MediaPipeline:
@@ -90,8 +104,20 @@ class MediaPipeline:
         self._image: Optional[ImageStore] = (
             self._create_image(config) if self._vision else None
         )
+        #: Transcribing a clip's speech.  Off by default: it costs CPU time on
+        #: the reply path and, on a first run, a several-hundred-megabyte
+        #: model download — neither should happen behind someone's back.
+        self._video_asr = bool(
+            getattr(config, "media_video_asr_enabled", False)
+        )
+        #: Built on first use, not here: constructing a local Whisper model
+        #: loads ~500 MB of weights, which a bot that never sees a video
+        #: should not pay for at startup.
+        self._asr = None
+        self._config = config
         self._stats = {
-            "emoji": 0, "image": 0, "video": 0, "described": 0, "failed": 0,
+            "emoji": 0, "image": 0, "video": 0, "asr": 0,
+            "described": 0, "failed": 0,
         }
         if self._vision_on:
             logger.info(
@@ -161,7 +187,7 @@ class MediaPipeline:
     def describe_video(
         self, video_urls: tuple[str, ...] | list[str], page_url: str,
     ) -> Optional[str]:
-        """Sample a shared clip's frames and describe what it shows.
+        """Sample a shared clip and describe what it shows and says.
 
         A chat completion receives text only, so "你能看到这个视频吗" used to
         be answered with "看不到" even when the page's media address was
@@ -169,9 +195,17 @@ class MediaPipeline:
         they go to the model in one request so it narrates the clip rather
         than three unrelated stills.
 
+        When ``MEDIA_VIDEO_ASR_ENABLED`` is on, the clip's own speech is
+        transcribed and sent in that *same* request.  A clip with no
+        subtitles often only makes sense once you hear it, and two separate
+        calls would cost twice the latency to produce two disconnected
+        summaries — one of the picture, one of the sound — that the model
+        then cannot line up.
+
         Every step degrades to None instead of raising: this runs inside the
         reply path, and a clip that will not download must not cost the
-        answer.
+        answer.  Frames and speech are independent: either alone still
+        produces a description.
 
         Args:
             video_urls: Candidate media addresses, best first (from
@@ -188,7 +222,7 @@ class MediaPipeline:
         try:
             # Imported lazily: the module locates ffmpeg at first use, and a
             # build without the binary must still work for text links.
-            from .video import available, frames_from_urls
+            from .video import available, samples_from_urls
         except Exception:
             logger.debug("video module unavailable", exc_info=True)
             return None
@@ -200,28 +234,47 @@ class MediaPipeline:
             return None
 
         self._stats["video"] += 1
-        frames = frames_from_urls(urls, page_url)
-        if not frames:
+        samples = samples_from_urls(
+            urls, page_url,
+            want_audio=self._video_asr,
+            audio_max_sec=self._audio_budget(),
+            # Resolved only if the download turns out to have no sound at
+            # all; Bilibili needs three API calls to produce these.
+            audio_urls=lambda: self._audio_urls(page_url),
+        )
+        if not samples:
             self._stats["failed"] += 1
             logger.warning(
-                "MediaPipeline: video frames unavailable for %s", page_url[:80],
+                "MediaPipeline: video unavailable for %s", page_url[:80],
             )
             return None
 
         try:
-            description = self._vision.describe_frames(frames)
+            if not samples.frames and not samples.audio:
+                self._stats["failed"] += 1
+                logger.warning(
+                    "MediaPipeline: no frames and no audio for %s",
+                    page_url[:80],
+                )
+                return None
+            transcript = self._transcribe(samples.audio) if samples.audio else ""
+            description = self._vision.describe_frames(
+                samples.frames, transcript=transcript,
+            )
         finally:
-            # ``frames_from_urls`` hands over a per-call temp directory; the
+            # ``samples_from_urls`` hands over a per-call temp directory; the
             # caller owns it (see its note).
-            shutil.rmtree(frames[0].parent, ignore_errors=True)
+            shutil.rmtree(samples.workdir, ignore_errors=True)
 
         if description:
             self._stats["described"] += 1
             return description
         self._stats["failed"] += 1
         logger.warning(
-            "MediaPipeline: vision gave no text for video frames "
-            "(model=%s): %s", self._vision_model(), self._vision_error(),
+            "MediaPipeline: vision gave no text for video "
+            "(frames=%d, transcript=%d chars, model=%s): %s",
+            len(samples.frames), len(transcript), self._vision_model(),
+            self._vision_error(),
         )
         return None
 
@@ -239,6 +292,133 @@ class MediaPipeline:
         if self._vision is None:
             return "vision disabled"
         return getattr(self._vision, "last_error", "") or "unknown reason"
+
+    def _audio_budget(self) -> Optional[float]:
+        """Seconds of a clip's sound worth extracting, or None for the default.
+
+        The configured value wins when set; 0 (the default) means "whatever
+        :mod:`src.media.video` budgets", so the two cannot drift apart.  Read
+        per call rather than cached, so a config reload takes effect without
+        a restart.
+        """
+        try:
+            configured = float(
+                getattr(self._config, "media_video_asr_max_sec", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            configured = 0.0
+        return configured if configured > 0 else None
+
+    def _audio_urls(self, page_url: str) -> list[str]:
+        """Sound-track addresses for the clip on *page_url*, or [].
+
+        Only Bilibili needs this: its DASH payload serves picture and sound as
+        separate transfers, so the downloaded video has no audio at all.
+        Everywhere else the sound rides inside the file and this is never
+        asked — which is why it is a callable, resolved by
+        :func:`~src.media.video.samples_from_urls` only after a silent track.
+        """
+        try:
+            from .video import bilibili_audio_urls
+        except Exception:
+            logger.debug("video module unavailable", exc_info=True)
+            return []
+        try:
+            return bilibili_audio_urls(page_url)
+        except Exception:
+            # Never let address resolution cost the description.
+            logger.debug("Bilibili audio addresses failed", exc_info=True)
+            return []
+
+    def _transcribe(self, audio: Path) -> str:
+        """What the clip says, or "" when it cannot be transcribed.
+
+        Bounded by a deadline rather than left to run: someone is waiting for
+        this reply.  A clip whose transcription overruns the budget falls back
+        to the frame-only description the bot produced before this feature
+        existed, which is a far better outcome than a reply that arrives
+        minutes late.
+
+        Every failure returns "": the caller then describes the picture alone.
+        """
+        asr = self._get_asr()
+        if asr is None or not audio or not audio.exists():
+            return ""
+
+        language = getattr(self._config, "voice_asr_language", "zh")
+        # "zh-en" / "auto" mean "let Whisper decide" on the voice path too.
+        if language in ("zh-en", "auto"):
+            language = None
+
+        started = time.monotonic()
+        # Manual pool management: a with-block would join the worker even
+        # after the timeout fires, which is exactly the stall being avoided.
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="video-asr",
+        )
+        try:
+            future = pool.submit(asr.transcribe_media, audio, language)
+            result = future.result(timeout=_VIDEO_ASR_TIMEOUT_SEC)
+        except concurrent.futures.TimeoutError:
+            logger.warning(
+                "MediaPipeline: video transcription exceeded %.0fs — "
+                "describing the picture only", _VIDEO_ASR_TIMEOUT_SEC,
+            )
+            pool.shutdown(wait=False)
+            return ""
+        except Exception as exc:
+            logger.warning(
+                "MediaPipeline: video transcription failed (%s: %s)",
+                type(exc).__name__, exc,
+            )
+            pool.shutdown(wait=False)
+            return ""
+        pool.shutdown(wait=False)
+
+        text = (getattr(result, "text", "") or "").strip()
+        if not text:
+            logger.info("MediaPipeline: video had no recognisable speech")
+            return ""
+        self._stats["asr"] += 1
+        logger.info(
+            "MediaPipeline: video speech %d chars in %.1fs (confidence=%.2f)",
+            len(text), time.monotonic() - started,
+            getattr(result, "confidence", 0.0),
+        )
+        return text
+
+    def _get_asr(self):
+        """The transcriber, built on first use; None when unavailable.
+
+        Building it loads the model, so it is deferred until a clip actually
+        has sound.  A machine without ``faster_whisper`` installed (or with
+        the model download blocked) gets None once and keeps it — the failure
+        is not retried on every video.
+        """
+        if self._asr is not None:
+            return self._asr or None
+        try:
+            from src.voice.asr import create_asr
+        except Exception:
+            logger.warning(
+                "MediaPipeline: ASR unavailable — describing clips from "
+                "their picture only", exc_info=True,
+            )
+            self._asr = False
+            return None
+        try:
+            self._asr = create_asr(
+                self._config,
+                model=getattr(self._config, "media_video_asr_model", "") or "",
+            )
+        except Exception:
+            logger.warning(
+                "MediaPipeline: ASR construction failed — describing clips "
+                "from their picture only", exc_info=True,
+            )
+            self._asr = False
+            return None
+        return self._asr
 
     @staticmethod
     def _msg_id(msg: dict) -> str:

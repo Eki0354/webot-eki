@@ -49,6 +49,55 @@ def _find_certifi_bundle():
     return []
 
 
+def _whisper_bundle():
+    """(datas, binaries) needed by local Whisper, or ([], []) when absent.
+
+    Transcribing a clip's speech (``MEDIA_VIDEO_ASR_ENABLED``) runs
+    faster-whisper, which needs three things PyInstaller does not find on its
+    own:
+
+    * ``ctranslate2``'s DLLs — the inference engine, and by far the largest
+      entry (58 MB).  There is no contributed hook for it, and its libraries
+      sit beside the package rather than being picked up by the static scan.
+    * the Silero VAD model that ships inside ``faster_whisper/assets``; the
+      fast decode path filters silence with it, and without the file that
+      call raises instead of degrading.
+    * ``opencc``'s conversion tables — traditional → simplified, which every
+      transcript goes through.
+
+    ``av`` and ``onnxruntime`` need nothing here: their contributed hooks
+    already collect the FFmpeg and provider libraries.
+
+    Optional on purpose.  A machine without these packages must still build a
+    working EXE — it then describes a clip from its picture alone, the same
+    trade-off as a missing ``ffmpeg.exe``.
+    """
+    try:
+        from PyInstaller.utils.hooks import (
+            collect_data_files,
+            collect_dynamic_libs,
+        )
+    except Exception:
+        return [], []
+
+    datas: list = []
+    for package in ("faster_whisper", "opencc"):
+        try:
+            datas += collect_data_files(package)
+        except Exception:
+            pass
+
+    binaries: list = []
+    try:
+        binaries += collect_dynamic_libs("ctranslate2")
+    except Exception:
+        pass
+    return datas, binaries
+
+
+_whisper_datas, _whisper_binaries = _whisper_bundle()
+
+
 if not _webview_runtime.exists():
     raise FileNotFoundError(f"WebView2Loader.dll not found at {_webview_runtime}")
 if not _webview_interop.exists():
@@ -75,7 +124,11 @@ a = Analysis(
         #   cp native/windows/ffmpeg.exe dist/native/windows/
         # Without it the bot degrades to the text-only answer, which is the
         # same trade-off as voice recognition.
-    ],
+    ]
+    # ctranslate2's DLLs (58 MB) — the local Whisper engine.  Empty when the
+    # package is not installed, in which case the build still works and video
+    # transcription simply degrades to describing the picture alone.
+    + _whisper_binaries,
     datas=[
         ('ui/dist', 'ui/dist'),
         ('.env.example', '.'),
@@ -86,7 +139,12 @@ a = Analysis(
     # link fetching then fails on sites whose chain needs an intermediate
     # (measured: example.com fails, python.org passes).  Optional: without
     # certifi installed the build still works, just less reliably.
-    + _find_certifi_bundle(),
+    + _find_certifi_bundle()
+    # Silero VAD model + opencc conversion tables: the fast decode path
+    # filters silence with the first, and every transcript is converted from
+    # traditional to simplified with the second.  Both are data files inside
+    # their packages, so the static import scan never sees them.
+    + _whisper_datas,
     hiddenimports=[
         'src', 'src.bot', 'src.config', 'src.main',
         'src.db', 'src.db.schema', 'src.db.store',
@@ -116,6 +174,16 @@ a = Analysis(
         # and link_fetcher._video_urls, so the static scan cannot see it;
         # without this line the frozen EXE silently answers "看不到视频".
         'src.media.video',
+        # Video speech.  MediaPipeline._get_asr imports src.voice.asr inside a
+        # method, so the static scan misses it and the frozen EXE would fall
+        # back to describing every clip from its picture alone.  The whole
+        # voice package comes along — the ASR factory is reached through
+        # ``src.voice``'s package init.
+        'src.voice', 'src.voice.asr',
+        'faster_whisper', 'faster_whisper.transcribe', 'faster_whisper.vad',
+        'faster_whisper.audio', 'faster_whisper.feature_extractor',
+        'faster_whisper.tokenizer', 'faster_whisper.utils',
+        'ctranslate2', 'onnxruntime', 'av', 'opencc', 'numpy',
         # Headless render fallback for pages whose player/body is script-built.
         # Imported lazily inside link_fetcher._render_page, so the static scan
         # misses it; without this line the frozen EXE silently never renders
@@ -154,8 +222,14 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=['tkinter', 'matplotlib', 'scipy', 'jedi', 'IPython',
-              'faster_whisper', 'ctranslate2', 'numpy', 'onnxruntime',
-              'pysilk', 'av', 'sounddevice', 'soundfile',
+              # Local Whisper for video speech (MEDIA_VIDEO_ASR_ENABLED) needs
+              # faster_whisper and its engine, so these four are no longer
+              # excluded: ctranslate2 ships the 58 MB inference DLL, numpy is
+              # its array type, av decodes the WAV, and onnxruntime runs the
+              # Silero VAD that drops silence.  ``pysilk`` stays out — it
+              # decodes WeChat's SILK voice messages, which this feature
+              # never touches, and voice recognition is not enabled by it.
+              'pysilk', 'sounddevice', 'soundfile',
               # Exclude packages that are NOT webot dependencies but may
               # be installed in the local Python environment.  Bundling
               # them bloats the EXE by hundreds of MB.

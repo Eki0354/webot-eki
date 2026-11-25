@@ -13,6 +13,12 @@ pyperclip>=1.8
 # Voice recognition — SILK decode + local/cloud ASR
 silk-python>=0.2.8
 faster-whisper>=1.0
+# faster-whisper decodes audio through PyAV and still calls
+# av.open(..., metadata_errors="ignore").  PyAV 19 removed that keyword, so
+# every transcription dies with "open() got an unexpected keyword argument
+# 'metadata_errors'" — which surfaces as a clip whose speech is silently
+# dropped.  Pin below 19 until faster-whisper stops passing it.
+av>=11,<19
 opencc-python-reimplemented>=0.1.7
 
 # Media messages — WeChat stores non-text bodies as zstd-compressed BLOBs

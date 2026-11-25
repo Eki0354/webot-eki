@@ -37,8 +37,9 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from ..utils.subprocess_win import hidden_kwargs
 from .link_fetcher import is_public_url
@@ -58,12 +59,37 @@ _MAX_FRAME_WIDTH = 720
 #: this refuses a mislabelled 500 MB file instead of stalling the reply path.
 _MAX_VIDEO_BYTES = 48 * 1024 * 1024
 
+#: Longest span of audio handed to the transcriber, in seconds.
+#:
+#: A clip's speech is only useful as far as it explains the picture, and
+#: transcription costs CPU time on the reply path.  Measured on a 6-thread
+#: desktop CPU with ``small`` at ``int8``: 120 s of audio decodes in 7.5 s
+#: (16x realtime); the one-off model load is ~23 s and the first run also
+#: pays a ~500 MB download.  Two minutes covers almost every clip shared
+#: into a WeChat group
+#: (most are under one), so the cap only bites on long videos, where the
+#: slices below still carry the whole storyline.
+_MAX_AUDIO_SEC = 120.0
+
+#: Seconds kept from each slice of a clip too long for :data:`_MAX_AUDIO_SEC`.
+#: Thirty is a scene or two of speech: enough to follow the thread, small
+#: enough that a ten-minute video yields four evenly spaced pieces instead of
+#: one.  Never more than half the budget, so there are always >= 2 slices.
+_AUDIO_SLICE_SEC = 30.0
+
 _DOWNLOAD_TIMEOUT_SEC = 20
 _PROBE_TIMEOUT_SEC = 15
 _FFMPEG_TIMEOUT_SEC = 40
 
 #: A JPEG below this is a placeholder/blank frame, not a picture.
 _MIN_FRAME_BYTES = 2048
+
+#: A WAV below this is only the 44-byte RIFF header — i.e. no sound at all.
+_MIN_AUDIO_BYTES = 1024
+
+#: Cap on a separate DASH audio transfer.  A two-minute 64 kbps track is under
+#: 1 MB; this refuses something mislabelled as sound without stalling anything.
+_MAX_AUDIO_TRACK_BYTES = 8 * 1024 * 1024
 
 #: Where the addresses live.  Xiaohongshu puts them in ``masterUrl`` /
 #: ``backupUrl`` inside its embedded state; other sites use a ``<video>`` or
@@ -257,12 +283,57 @@ def _bili_bvid(page_url: str) -> str:
     return match.group(1) if match else ""
 
 
+def _bili_dash(page_url: str) -> dict:
+    """The DASH payload for the video behind *page_url*, or {}.
+
+    Resolving the id, the cid and the playurl is the same three calls for
+    video and audio, and Bilibili rate-limits a client that asks twice — so
+    both address functions share this.
+
+    Never raises: an API hiccup degrades to "no addresses".
+    """
+    bvid = _bili_bvid(page_url)
+    if not bvid:
+        return {}
+    view = _bili_json(f"/x/web-interface/view?bvid={bvid}")
+    data = (view or {}).get("data") or {}
+    cid = data.get("cid")
+    if not cid:
+        logger.info("Bilibili API: no cid for %s (code=%s)", bvid,
+                    (view or {}).get("code"))
+        return {}
+    play = _bili_json(
+        f"/x/player/playurl?bvid={bvid}&cid={cid}&qn=64&fnval=16&fourk=1"
+    )
+    return ((play or {}).get("data") or {}).get("dash") or {}
+
+
+def _rendition_urls(renditions: list[dict]) -> list[str]:
+    """Flatten one DASH rendition list into candidate addresses.
+
+    Standard-port copies come first — same reasoning as :func:`_port_rank`:
+    a rendition served on 4483 is unreachable to this module by design, and
+    it must not be tried first.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+    for rendition in renditions or []:
+        for candidate in [rendition.get("baseUrl"),
+                          *(rendition.get("backupUrl") or [])]:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            found.append(candidate)
+    found.sort(key=_port_rank)
+    return found
+
+
 def bilibili_video_urls(page_url: str) -> list[str]:
     """Media addresses for the Bilibili video behind *page_url*, best first.
 
     Uses the site's public JSON API instead of rendering the page, so it works
-    where a headless browser does not.  DASH splits video and audio; only the
-    video renditions matter here, because frames are all that get sampled.
+    where a headless browser does not.  DASH splits video and audio; this
+    returns the video renditions, which is what frames are sampled from.
 
     Args:
         page_url: A ``bilibili.com/video/BV…`` page or a ``b23.tv`` share
@@ -272,35 +343,45 @@ def bilibili_video_urls(page_url: str) -> list[str]:
         Candidate video-stream addresses, standard-port copies first, or an
         empty list when the id cannot be resolved or the API refuses.
     """
-    bvid = _bili_bvid(page_url)
-    if not bvid:
+    dash = _bili_dash(page_url)
+    if not dash:
         return []
-    view = _bili_json(f"/x/web-interface/view?bvid={bvid}")
-    data = (view or {}).get("data") or {}
-    cid = data.get("cid")
-    if not cid:
-        logger.info("Bilibili API: no cid for %s (code=%s)", bvid,
-                    (view or {}).get("code"))
-        return []
-    play = _bili_json(
-        f"/x/player/playurl?bvid={bvid}&cid={cid}&qn=64&fnval=16&fourk=1"
-    )
-    dash = ((play or {}).get("data") or {}).get("dash") or {}
-    found: list[str] = []
-    seen: set[str] = set()
-    for rendition in dash.get("video") or []:
-        for candidate in [rendition.get("baseUrl"), *(rendition.get("backupUrl") or [])]:
-            if not candidate or candidate in seen:
-                continue
-            seen.add(candidate)
-            found.append(candidate)
-    # Same reasoning as :func:`_port_rank`: a rendition served on 4483 is
-    # unreachable to this module by design, and it must not be tried first.
-    found.sort(key=_port_rank)
+    found = _rendition_urls(dash.get("video") or [])
     if found:
         logger.info(
-            "Bilibili API: %d video address(es) for %s", len(found), bvid,
+            "Bilibili API: %d video address(es) for %s", len(found),
+            _bili_bvid(page_url),
         )
+    return found
+
+
+def bilibili_audio_urls(page_url: str) -> list[str]:
+    """Audio-track addresses for the Bilibili video behind *page_url*.
+
+    DASH serves sound separately from picture, so a video rendition carries no
+    audio at all — transcription needs this list.  The lowest-bitrate track is
+    preferred: the bitrate ladder tops out around 192 kbps and bottoms out near
+    64 kbps, and Whisper resamples to 16 kHz mono before it looks at anything,
+    so the cheap track transcribes identically for a fraction of the transfer.
+
+    Args:
+        page_url: A ``bilibili.com/video/BV…`` page or a ``b23.tv`` share
+            link.
+
+    Returns:
+        Candidate audio-stream addresses, cheapest first, or an empty list.
+    """
+    dash = _bili_dash(page_url)
+    if not dash:
+        return []
+    audios = list(dash.get("audio") or [])
+    # Cheapest first; a missing bandwith sorts last rather than crashing.
+    audios.sort(key=lambda r: r.get("bandwidth") or float("inf"))
+    found = _rendition_urls(audios)
+    if not found:
+        # Older/flv payloads carry the sound inside the video stream instead.
+        logger.info("Bilibili API: no separate audio for %s",
+                    _bili_bvid(page_url))
     return found
 
 
@@ -454,6 +535,7 @@ def download_video(
     *,
     referer: str = "",
     max_bytes: int = _MAX_VIDEO_BYTES,
+    filename: str = "clip.mp4",
 ) -> Optional[Path]:
     """Fetch *url* into *dest_dir* and return the file, or None.
 
@@ -463,12 +545,14 @@ def download_video(
 
     Args:
         url: Media address taken from a page.
-        dest_dir: Directory to write ``clip.mp4`` into.
+        dest_dir: Directory to write the file into.
         referer: Page the address came from.  Several CDNs reject a request
             with no referer; the caller passes the article URL.  Hosts that
             pin the referer to their own root (see :func:`_media_referer`)
             get that root instead.
         max_bytes: Transfer cap.
+        filename: Name inside *dest_dir*.  A DASH clip's sound is a separate
+            transfer, so the two must not land on the same path.
 
     Returns:
         The written file, or None on refusal, failure, or an empty body.
@@ -490,7 +574,7 @@ def download_video(
     request = urllib.request.Request(url, headers=headers)
 
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / "clip.mp4"
+    dest = dest_dir / filename
     try:
         with urllib.request.urlopen(request, timeout=_DOWNLOAD_TIMEOUT_SEC) as response:
             total = 0
@@ -557,6 +641,73 @@ def probe_duration(video: Path, *, ffmpeg: Optional[str] = None) -> float:
         return 0.0
     hours, minutes, seconds = match.groups()
     return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+@dataclass
+class VideoSamples:
+    """What one download of a shared clip yields.
+
+    Both products come from the same transfer, so a caller that wants either
+    pays for one fetch.  Either may be empty: a DASH video rendition carries
+    no sound, and a clip whose frames all decoded to noise still has audio.
+
+    Attributes:
+        frames: JPEG stills in playback order.
+        audio: 16 kHz mono WAV of the sound, when one was requested.
+        workdir: Temporary directory holding both; the caller owns it and is
+            responsible for removing it.
+    """
+
+    frames: list[Path] = field(default_factory=list)
+    audio: Optional[Path] = None
+    workdir: Optional[Path] = None
+
+
+def audio_slices(
+    duration: float,
+    *,
+    max_sec: float = _MAX_AUDIO_SEC,
+    slice_sec: float = _AUDIO_SLICE_SEC,
+) -> list[tuple[float, float]]:
+    """Pick ``(start, length)`` spans whose total fits *max_sec*.
+
+    A clip short enough is taken whole — one span, nothing dropped.  A longer
+    one is sampled evenly: the speech that explains what happens across ten
+    minutes lives at both ends, so taking the first two minutes would describe
+    the opening and nothing else.  Each span is a *continuous* run of speech
+    (cutting mid-sentence every few seconds produces text Whisper cannot
+    follow), and the spans are spread from the first second to the last so the
+    concatenation reads as the clip's storyline.
+
+    Args:
+        duration: Clip length in seconds; 0 or less when unknown.
+        max_sec: Total audio budget.
+        slice_sec: Preferred length of one span in a sampled clip.
+
+    Returns:
+        ``(start, length)`` pairs in playback order.  Empty when there is no
+        budget.
+    """
+    if max_sec <= 0:
+        return []
+    if duration <= 0:
+        # Length unknown: one span from the start, capped by the budget.
+        return [(0.0, max_sec)]
+    if duration <= max_sec:
+        return [(0.0, round(duration, 3))]
+
+    # Never let one span take more than half the budget, so there are at
+    # least two and the middle of a long clip is represented at all.
+    span = min(slice_sec, max_sec / 2)
+    count = max(2, int(max_sec // span))
+    span = max_sec / count
+    # Spread the starts evenly across what is left after the last span, so
+    # the final slice still ends inside the clip.
+    last_start = duration - span
+    if count == 1:
+        return [(0.0, round(span, 3))]
+    step = last_start / (count - 1)
+    return [(round(i * step, 3), round(span, 3)) for i in range(count)]
 
 
 def frame_timestamps(duration: float, count: int) -> list[float]:
@@ -638,13 +789,127 @@ def extract_frames(
     return frames
 
 
-def frames_from_urls(
+def extract_audio(
+    video: Path,
+    out_dir: Path,
+    *,
+    max_sec: float = _MAX_AUDIO_SEC,
+    slice_sec: float = _AUDIO_SLICE_SEC,
+) -> Optional[Path]:
+    """Write a 16 kHz mono WAV of *video*'s sound into *out_dir*.
+
+    Whisper wants 16 kHz mono, and asking ffmpeg for it here means the
+    transcriber never resamples — one decode instead of two.
+
+    A clip longer than *max_sec* is sampled by :func:`audio_slices`, so the
+    result is the clip's whole storyline at a bounded cost rather than its
+    opening minutes.  Spans are joined by ffmpeg's ``concat`` filter, which is
+    why this is one process and not one per span.
+
+    A video with no audio track is not an error: Bilibili's DASH renditions
+    carry no sound at all, and the caller falls back to describing the
+    picture alone.
+
+    Args:
+        video: Downloaded clip.
+        out_dir: Where ``audio.wav`` goes.  Created if missing.
+        max_sec: Total audio budget.
+        slice_sec: Preferred span length when sampling.
+
+    Returns:
+        The WAV file, or None when ffmpeg is missing, the clip has no sound,
+        or the output came back empty.
+    """
+    exe = ffmpeg_path()
+    if not exe:
+        return None
+
+    duration = probe_duration(video, ffmpeg=exe)
+    spans = audio_slices(duration, max_sec=max_sec, slice_sec=slice_sec)
+    if not spans:
+        return None
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dest = out_dir / "audio.wav"
+    base = [exe, "-y", "-hide_banner", "-loglevel", "error"]
+
+    if len(spans) == 1:
+        start, length = spans[0]
+        args = list(base)
+        # ``-ss`` before ``-i`` seeks instead of decoding: a clip whose sound
+        # starts later is reached without reading everything before it.
+        if start > 0:
+            args += ["-ss", f"{start:.3f}"]
+        args += ["-i", str(video), "-t", f"{length:.3f}", "-vn",
+                 "-ac", "1", "-ar", "16000", "-f", "wav", str(dest)]
+    else:
+        cuts = ";".join(
+            f"[0:a]atrim=start={start:.3f}:duration={length:.3f},"
+            f"asetpts=PTS-STARTPTS[a{i}]"
+            for i, (start, length) in enumerate(spans)
+        )
+        joined = "".join(f"[a{i}]" for i in range(len(spans)))
+        graph = (
+            f"{cuts};{joined}concat=n={len(spans)}:v=0:a=1[out]"
+        )
+        args = list(base) + [
+            "-i", str(video), "-filter_complex", graph,
+            "-map", "[out]", "-ac", "1", "-ar", "16000", "-f", "wav",
+            str(dest),
+        ]
+
+    try:
+        proc = subprocess.run(
+            args, capture_output=True, timeout=_FFMPEG_TIMEOUT_SEC,
+            **hidden_kwargs(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning(
+            "Audio extraction failed: %s", type(exc).__name__,
+        )
+        return None
+
+    if proc.returncode != 0:
+        # The usual reason is "no audio stream": Bilibili serves sound as a
+        # separate DASH rendition, so its video rendition is silent by design.
+        logger.info(
+            "Audio extraction refused (rc=%d, %s): %s",
+            proc.returncode, video.name,
+            proc.stderr.decode(errors="replace")[:200],
+        )
+        return None
+
+    # 44-byte RIFF header is all an empty WAV has; anything under a few
+    # hundred bytes means the sound was silence or the write was cut short.
+    if not dest.exists() or dest.stat().st_size < _MIN_AUDIO_BYTES:
+        logger.info("Audio extraction produced no sound (%s)", video.name)
+        dest.unlink(missing_ok=True)
+        return None
+
+    if len(spans) == 1:
+        logger.info(
+            "Video audio: %.1fs from a %.1fs clip (%s)",
+            spans[0][1], duration, video.name,
+        )
+    else:
+        logger.info(
+            "Video audio: %d slices, %.1fs of a %.1fs clip (%s)",
+            len(spans), sum(length for _, length in spans), duration,
+            video.name,
+        )
+    return dest
+
+
+def samples_from_urls(
     urls: list[str],
     page_url: str,
     *,
     count: int = DEFAULT_FRAME_COUNT,
-) -> list[Path]:
-    """Download one of *urls* and return sample frames of it.
+    want_audio: bool = False,
+    audio_max_sec: Optional[float] = _MAX_AUDIO_SEC,
+    audio_urls: "list[str] | Callable[[], list[str]] | None" = None,
+) -> Optional["VideoSamples"]:
+    """Download one of *urls* and sample its frames (and sound, optionally).
 
     Split from :func:`frames_from_page` because the media address has to come
     from the *same* response that carried the article text.  Measured on a
@@ -652,6 +917,12 @@ def frames_from_urls(
     degraded 23 KB shell with no ``masterUrl`` at all, while the first
     response (70 KB) has it — so re-fetching to hunt for the video silently
     drops every clip.
+
+    The clip is downloaded **once** and both products are taken from it: the
+    sound is a by-product of a file already on disk, so transcribing costs no
+    extra transfer.  Bilibili is the exception — its DASH renditions are
+    picture-only, so *audio_urls* is a separate address list to fall back on
+    when the downloaded file turns out to have no audio track.
 
     **Downloading the whole clip is deliberate.**  Streaming it — letting
     ffmpeg read the URL and seek — looks like the obvious saving, and it was
@@ -677,26 +948,83 @@ def frames_from_urls(
         urls: Candidate media addresses, best first.
         page_url: Page they came from; used as referer.
         count: How many frames to sample.
+        want_audio: Also produce a 16 kHz mono WAV of the sound.
+        audio_max_sec: Audio budget when *want_audio* is set.  None uses the
+            module default (:data:`_MAX_AUDIO_SEC`).
+        audio_urls: Picture-only fallback for the sound (see above).  A
+            callable is resolved only when the downloaded file turns out to
+            have no audio track — Bilibili needs three API calls to produce
+            those addresses, and paying for them on every other site's clip
+            would be pure latency.
 
     Returns:
-        Frame files in a per-call temporary directory, or an empty list.
+        A :class:`VideoSamples` in a per-call temp directory — the caller owns
+        the directory — or None when nothing downloads at all.  Frames may be
+        empty while audio exists, and the reverse.
     """
     if not available() or not urls:
-        return []
+        return None
 
+    budget = _MAX_AUDIO_SEC if audio_max_sec is None else audio_max_sec
     workdir = Path(tempfile.mkdtemp(prefix="webot_video_"))
     for url in urls:
         video = download_video(url, workdir, referer=page_url)
         if not video:
             continue
         frames = extract_frames(video, workdir, count=count)
-        # The clip is large and no longer needed once the frames exist.
+        audio: Optional[Path] = None
+        if want_audio:
+            audio = extract_audio(video, workdir, max_sec=budget)
+            fallback = audio_urls() if callable(audio_urls) else audio_urls
+            if not audio and fallback:
+                # DASH served the picture without sound; the sound is its own
+                # transfer, so fetch it and decode from there.
+                track = download_video(
+                    fallback[0], workdir, referer=page_url,
+                    filename="audio_track.m4s",
+                    max_bytes=_MAX_AUDIO_TRACK_BYTES,
+                )
+                if track:
+                    audio = extract_audio(
+                        track, workdir, max_sec=budget,
+                    )
+                    track.unlink(missing_ok=True)
+        # The clip is large and no longer needed once both products exist.
         video.unlink(missing_ok=True)
-        if frames:
-            return frames
+        if frames or audio:
+            return VideoSamples(frames=frames, audio=audio, workdir=workdir)
+        # Nothing usable from this address; try the next one in the same dir.
 
     shutil.rmtree(workdir, ignore_errors=True)
-    return []
+    return None
+
+
+def frames_from_urls(
+    urls: list[str],
+    page_url: str,
+    *,
+    count: int = DEFAULT_FRAME_COUNT,
+) -> list[Path]:
+    """Download one of *urls* and return sample frames of it.
+
+    Thin wrapper over :func:`samples_from_urls` for callers that want the
+    picture only — the frames live in a temp directory handed to the caller.
+
+    Args:
+        urls: Candidate media addresses, best first.
+        page_url: Page they came from; used as referer.
+        count: How many frames to sample.
+
+    Returns:
+        Frame files in a per-call temporary directory, or an empty list.
+    """
+    samples = samples_from_urls(urls, page_url, count=count)
+    if not samples:
+        return []
+    if not samples.frames:
+        shutil.rmtree(samples.workdir, ignore_errors=True)
+        return []
+    return samples.frames
 
 
 def frames_from_page(

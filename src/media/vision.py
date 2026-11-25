@@ -62,6 +62,32 @@ FRAME_PROMPT = (
     "像跟朋友转述那样，不要把每帧分开描述，不要罗列元素，不要加引号。"
 )
 
+#: Prompt when the clip's own speech was transcribed as well.
+#:
+#: Frames alone answer "拍的是什么"; a video without subtitles often only
+#: makes sense once you hear it.  Both go in one request so the model can
+#: line them up (the speech says *what* is happening, the frames show *who*
+#: and *where*) instead of writing two disconnected summaries.
+#:
+#: The transcript is flagged as machine-made on purpose: it is Whisper output
+#: with homophone errors and dropped words, and a model that trusts it as
+#: gospel will confidently misreport names.
+FRAME_TRANSCRIPT_PROMPT = (
+    "这是群聊里分享的一段短视频，按时间顺序抽了几帧，"
+    "下面还附了这段视频里说出来的话（语音识别得到，可能有错字、漏字或同音字）。"
+    "用两三句中文说说这段视频在讲什么事，把画面和台词对照着看，"
+    "台词只作参考、跟画面对不上时以画面为准，"
+    "像跟朋友转述那样，不要逐句复述台词，不要把每帧分开描述，不要加引号。\n\n"
+    "{transcript_label}：\n{transcript}"
+)
+
+#: How much of a transcript goes into the prompt.
+#:
+#: Two minutes of Chinese speech is roughly 500 characters; this leaves room
+#: for that and ends the prompt there rather than letting a bad decode push
+#: the frames out of context.
+MAX_TRANSCRIPT_CHARS = 2000
+
 #: Error text meaning "this endpoint does not accept the ``thinking`` field".
 #: Matching stays loose: providers word it differently ("unknown parameter",
 #: "extra fields not permitted", "unrecognized request argument"), but all of
@@ -166,7 +192,7 @@ class VisionClient:
         return self._describe([data_url], prompt)
 
     def describe_frames(
-        self, frames: list[Path], prompt: str = FRAME_PROMPT
+        self, frames: list[Path], prompt: str = "", transcript: str = ""
     ) -> Optional[str]:
         """Describe a clip from frames sampled across it, or None.
 
@@ -174,26 +200,51 @@ class VisionClient:
         say what happens over the clip, and three separate calls would cost
         three times as much to produce three disjoint captions.
 
+        When *transcript* is given it rides along in that same request.  A
+        video without subtitles is often only comprehensible from its speech,
+        and asking twice would double the latency for a worse answer — two
+        disconnected summaries instead of one that lines the sound up with the
+        picture.
+
         Args:
-            frames: Ordered stills, first to last.
-            prompt: Wording that tells the model these are one clip.
+            frames: Ordered stills, first to last.  May be empty when
+                *transcript* is not, in which case the clip is described from
+                its speech alone.
+            prompt: Overrides the wording for this call.  Empty picks the
+                frame-only or the frame-plus-speech prompt.
+            transcript: What was said in the clip, from ASR.  Empty when the
+                clip had no speech or transcription is off.
 
         Returns:
-            A short description, or None when there is no client or the
-            frames cannot be read.
+            A short description, or None when there is nothing to describe.
         """
+        spoken = (transcript or "").strip()[:MAX_TRANSCRIPT_CHARS]
         data_urls = [u for u in (to_data_url(f) for f in frames) if u]
-        if not data_urls:
+        if not data_urls and not spoken:
             self.last_error = "no readable frame"
             return None
-        return self._describe(data_urls, prompt)
+        if not prompt:
+            prompt = (
+                FRAME_TRANSCRIPT_PROMPT.format(
+                    transcript_label="视频里的语音",
+                    transcript=spoken,
+                )
+                if spoken
+                else FRAME_PROMPT
+            )
+        return self._describe(data_urls, prompt, allow_text_only=bool(spoken))
 
-    def _describe(self, data_urls: list[str], prompt: str) -> Optional[str]:
-        """Ask about one or more images, negotiating the request shape."""
+    def _describe(self, data_urls: list[str], prompt: str,
+                  *, allow_text_only: bool = False) -> Optional[str]:
+        """Ask about one or more images, negotiating the request shape.
+
+        *allow_text_only* lets a request go out with no image at all, which is
+        what a clip described from its speech alone needs.
+        """
         if not self.available:
             self.last_error = "no api key or model configured"
             return None
-        if not data_urls:
+        if not data_urls and not allow_text_only:
             self.last_error = "no image to describe"
             return None
 

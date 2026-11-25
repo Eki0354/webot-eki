@@ -27,7 +27,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.media.video import frame_timestamps, video_urls_from_page
+from src.media.video import VideoSamples, frame_timestamps, video_urls_from_page
 from src.media.link_fetcher import Article
 
 
@@ -317,7 +317,94 @@ class BilibiliApiTests(unittest.TestCase):
             self.assertEqual(video_mod.bilibili_video_urls(self._PAGE), [])
 
 
-def _pipeline(vision=True):
+class AudioSliceTests(unittest.TestCase):
+    """A clip's sound is budgeted, never dumped whole into the transcriber.
+
+    Transcription runs on the reply path, so the amount of audio decides how
+    long someone waits.  A short clip is taken whole; a long one is sampled
+    evenly, because the speech that explains ten minutes lives at both ends.
+    """
+
+    def _mod(self):
+        from src.media import video as video_mod
+        return video_mod
+
+    def test_short_clip_is_taken_whole(self):
+        spans = self._mod().audio_slices(45.0)
+        self.assertEqual(spans, [(0.0, 45.0)])
+
+    def test_clip_exactly_at_budget_is_not_sliced(self):
+        spans = self._mod().audio_slices(120.0)
+        self.assertEqual(spans, [(0.0, 120.0)])
+
+    def test_unknown_length_takes_one_budgeted_span_from_the_start(self):
+        spans = self._mod().audio_slices(0.0)
+        self.assertEqual(spans, [(0.0, 120.0)])
+
+    def test_no_budget_asks_for_nothing(self):
+        self.assertEqual(self._mod().audio_slices(60.0, max_sec=0), [])
+
+    def test_long_clip_fits_the_budget(self):
+        spans = self._mod().audio_slices(600.0)
+        self.assertLessEqual(sum(length for _, length in spans), 120.01)
+        self.assertGreaterEqual(len(spans), 2)
+
+    def test_long_clip_is_spread_from_start_to_finish(self):
+        """Taking only the opening would describe the first minute and nothing
+        else; the slices have to reach the end of the clip."""
+        spans = self._mod().audio_slices(600.0)
+        self.assertAlmostEqual(spans[0][0], 0.0, places=3)
+        last_start, last_len = spans[-1]
+        self.assertLessEqual(last_start + last_len, 600.01)
+        # The last slice must actually be near the end, not merely inside it.
+        self.assertGreater(last_start + last_len, 600.0 - 120.0)
+
+    def test_slices_are_contiguous_runs_not_scattered_frames(self):
+        """Cutting mid-sentence every few seconds gives Whisper text it cannot
+        follow, so each span has to be a usable length of speech."""
+        spans = self._mod().audio_slices(3600.0)
+        for _, length in spans:
+            self.assertGreaterEqual(length, 20.0)
+
+
+class BilibiliAudioUrlTests(unittest.TestCase):
+    """DASH serves sound separately from picture, so frames alone are silent.
+
+    The cheapest track is preferred on purpose: Whisper resamples to 16 kHz
+    mono anyway, so the 64 kbps rendition transcribes identically to the
+    192 kbps one for a fraction of the transfer.
+    """
+
+    _BVID = "BV1xx411c7mD"
+    _PAGE = f"https://www.bilibili.com/video/{_BVID}?share_source=copy"
+
+    def test_cheapest_rendition_comes_first(self):
+        from src.media import video as video_mod
+
+        dash = {"audio": [
+            {"baseUrl": "https://cdn/hi.m4s", "bandwidth": 192000},
+            {"baseUrl": "https://cdn/lo.m4s", "bandwidth": 64000},
+        ]}
+        with patch.object(
+            video_mod, "_bili_dash", return_value=dash,
+        ):
+            urls = video_mod.bilibili_audio_urls(self._PAGE)
+        self.assertEqual(urls[0], "https://cdn/lo.m4s")
+
+    def test_no_audio_rendition_means_no_addresses(self):
+        from src.media import video as video_mod
+
+        with patch.object(video_mod, "_bili_dash", return_value={"video": []}):
+            self.assertEqual(video_mod.bilibili_audio_urls(self._PAGE), [])
+
+    def test_unresolvable_page_is_not_an_error(self):
+        from src.media import video as video_mod
+
+        with patch.object(video_mod, "_bili_dash", return_value={}):
+            self.assertEqual(video_mod.bilibili_audio_urls(""), [])
+
+
+def _pipeline(vision=True, asr=False):
     from src.media.pipeline import MediaPipeline
 
     config = MagicMock()
@@ -331,6 +418,12 @@ def _pipeline(vision=True):
     config.image_xor_key = ""
     config.image_aes_key = ""
     config.image_key_provider = "env"
+    # A MagicMock answers every attribute with a truthy Mock, so the video
+    # transcription switch has to be pinned down or it reads as enabled.
+    config.media_video_asr_enabled = asr
+    config.media_video_asr_model = ""
+    config.media_video_asr_max_sec = 0.0
+    config.voice_asr_language = "zh"
     return MediaPipeline(config)
 
 
@@ -361,7 +454,7 @@ class DescribeVideoTests(unittest.TestCase):
     def test_undownloadable_clip_is_counted_and_reported(self):
         pipeline = _pipeline()
         with patch("src.media.video.available", return_value=True), \
-             patch("src.media.video.frames_from_urls", return_value=[]), \
+             patch("src.media.video.samples_from_urls", return_value=None), \
              patch("src.media.pipeline.logger"):
             self.assertIsNone(
                 pipeline.describe_video(_VIDEO_URLS, "https://x.com/p")
@@ -375,9 +468,10 @@ class DescribeVideoTests(unittest.TestCase):
         workdir = Path(tempfile.mkdtemp(prefix="webot_video_test_"))
         frame = workdir / "frame_0.jpg"
         frame.write_bytes(b"jpg")
+        samples = VideoSamples(frames=[frame], audio=None, workdir=workdir)
 
         with patch("src.media.video.available", return_value=True), \
-             patch("src.media.video.frames_from_urls", return_value=[frame]), \
+             patch("src.media.video.samples_from_urls", return_value=samples), \
              patch.object(
                  pipeline._vision, "describe_frames",
                  return_value="一个女生在客厅里跳舞，然后镜头转向一屋子盒子。",
@@ -386,7 +480,7 @@ class DescribeVideoTests(unittest.TestCase):
 
         self.assertIn("跳舞", text)
         self.assertEqual(pipeline.stats()["described"], 1)
-        # ``frames_from_urls`` hands the directory over; retaining it would
+        # ``samples_from_urls`` hands the directory over; retaining it would
         # leak a clip-sized temp dir per shared video.
         self.assertFalse(workdir.exists())
 
@@ -395,9 +489,10 @@ class DescribeVideoTests(unittest.TestCase):
         workdir = Path(tempfile.mkdtemp(prefix="webot_video_test_"))
         frame = workdir / "frame_0.jpg"
         frame.write_bytes(b"jpg")
+        samples = VideoSamples(frames=[frame], audio=None, workdir=workdir)
 
         with patch("src.media.video.available", return_value=True), \
-             patch("src.media.video.frames_from_urls", return_value=[frame]), \
+             patch("src.media.video.samples_from_urls", return_value=samples), \
              patch.object(pipeline._vision, "describe_frames",
                           return_value=None), \
              patch("src.media.pipeline.logger"):
@@ -406,6 +501,203 @@ class DescribeVideoTests(unittest.TestCase):
             )
         self.assertEqual(pipeline.stats()["failed"], 1)
         self.assertFalse(workdir.exists())
+
+
+class VideoSpeechTests(unittest.TestCase):
+    """The clip's own speech is transcribed and sent with the frames.
+
+    Frames answer "拍的是什么"; a clip without subtitles often only makes
+    sense once you hear it.  Both go in one request so the model can line the
+    speech up with the picture instead of writing two disjoint summaries.
+    """
+
+    def _samples(self, *, frames=True, audio=True):
+        workdir = Path(tempfile.mkdtemp(prefix="webot_video_test_"))
+        stills = []
+        if frames:
+            frame = workdir / "frame_0.jpg"
+            frame.write_bytes(b"\xff\xd8\xff\xe0" + b"0" * 64)
+            stills.append(frame)
+        track = None
+        if audio:
+            track = workdir / "audio.wav"
+            track.write_bytes(b"RIFF" + b"0" * 2048)
+        return VideoSamples(frames=stills, audio=track, workdir=workdir)
+
+    @staticmethod
+    def _asr(text="今天我们来开箱这个盒子"):
+        asr = MagicMock()
+        asr.transcribe_media.return_value = MagicMock(
+            text=text, confidence=0.9, duration_sec=42.0,
+        )
+        return asr
+
+    def test_transcript_reaches_the_model_with_the_frames(self):
+        pipeline = _pipeline(asr=True)
+        samples = self._samples()
+        asr = self._asr()
+        captured = {}
+
+        def _describe(frames, prompt="", transcript=""):
+            captured["frames"] = frames
+            captured["transcript"] = transcript
+            return "开箱视频，他在说这个盒子很难开。"
+
+        with patch("src.media.video.available", return_value=True), \
+             patch("src.media.video.samples_from_urls", return_value=samples), \
+             patch.object(pipeline, "_get_asr", return_value=asr), \
+             patch.object(pipeline._vision, "describe_frames", side_effect=_describe):
+            text = pipeline.describe_video(_VIDEO_URLS, "https://x.com/p")
+
+        self.assertIn("开箱", text)
+        self.assertEqual(captured["transcript"], "今天我们来开箱这个盒子")
+        self.assertEqual(len(captured["frames"]), 1)
+        self.assertEqual(pipeline.stats()["asr"], 1)
+        # The WAV travelled to the transcriber, not the video file.
+        self.assertTrue(asr.transcribe_media.call_args[0][0].name == "audio.wav")
+        self.assertFalse(samples.workdir.exists())
+
+    def test_only_speech_still_produces_a_description(self):
+        """A clip whose frames all decoded to noise still has sound."""
+        pipeline = _pipeline(asr=True)
+        samples = self._samples(frames=False, audio=True)
+        captured = {}
+
+        def _describe(frames, prompt="", transcript=""):
+            captured["frames"] = frames
+            captured["transcript"] = transcript
+            return "他说这个盒子很难开。"
+
+        with patch("src.media.video.available", return_value=True), \
+             patch("src.media.video.samples_from_urls", return_value=samples), \
+             patch.object(pipeline, "_get_asr", return_value=self._asr()), \
+             patch.object(pipeline._vision, "describe_frames", side_effect=_describe):
+            text = pipeline.describe_video(_VIDEO_URLS, "https://x.com/p")
+
+        self.assertIn("盒子", text)
+        self.assertEqual(captured["frames"], [])
+        self.assertTrue(captured["transcript"])
+
+    def test_slow_transcription_degrades_to_the_picture(self):
+        """Someone is waiting: overrunning the deadline must not stall the reply."""
+        import time as _time
+
+        pipeline = _pipeline(asr=True)
+        samples = self._samples()
+        asr = MagicMock()
+        asr.transcribe_media.side_effect = lambda *a, **kw: _time.sleep(2) or None
+        captured = {}
+
+        def _describe(frames, prompt="", transcript=""):
+            captured["transcript"] = transcript
+            return "画面上是一个盒子。"
+
+        with patch("src.media.video.available", return_value=True), \
+             patch("src.media.video.samples_from_urls", return_value=samples), \
+             patch.object(pipeline, "_get_asr", return_value=asr), \
+             patch("src.media.pipeline._VIDEO_ASR_TIMEOUT_SEC", 0.05), \
+             patch.object(pipeline._vision, "describe_frames", side_effect=_describe):
+            text = pipeline.describe_video(_VIDEO_URLS, "https://x.com/p")
+
+        self.assertEqual(text, "画面上是一个盒子。")
+        self.assertEqual(captured["transcript"], "")
+        self.assertEqual(pipeline.stats()["asr"], 0)
+
+    def test_failing_transcription_degrades_to_the_picture(self):
+        pipeline = _pipeline(asr=True)
+        samples = self._samples()
+        asr = MagicMock()
+        asr.transcribe_media.side_effect = RuntimeError("model exploded")
+
+        with patch("src.media.video.available", return_value=True), \
+             patch("src.media.video.samples_from_urls", return_value=samples), \
+             patch.object(pipeline, "_get_asr", return_value=asr), \
+             patch.object(pipeline._vision, "describe_frames",
+                          return_value="画面上是一个盒子。"):
+            text = pipeline.describe_video(_VIDEO_URLS, "https://x.com/p")
+
+        self.assertEqual(text, "画面上是一个盒子。")
+        self.assertEqual(pipeline.stats()["asr"], 0)
+
+    def test_switch_off_asks_for_no_audio_at_all(self):
+        """Off by default: no transcription, no model download, no extra wait."""
+        pipeline = _pipeline(asr=False)
+        seen = {}
+
+        def _samples_from_urls(urls, page_url, **kwargs):
+            seen.update(kwargs)
+            return None
+
+        with patch("src.media.video.available", return_value=True), \
+             patch("src.media.video.samples_from_urls",
+                   side_effect=_samples_from_urls):
+            pipeline.describe_video(_VIDEO_URLS, "https://x.com/p")
+
+        self.assertFalse(seen["want_audio"])
+
+    def test_configured_budget_is_handed_to_the_extractor(self):
+        pipeline = _pipeline(asr=True)
+        pipeline._config.media_video_asr_max_sec = 90.0
+        seen = {}
+
+        def _samples_from_urls(urls, page_url, **kwargs):
+            seen.update(kwargs)
+            return None
+
+        with patch("src.media.video.available", return_value=True), \
+             patch("src.media.video.samples_from_urls",
+                   side_effect=_samples_from_urls):
+            pipeline.describe_video(_VIDEO_URLS, "https://x.com/p")
+
+        self.assertEqual(seen["audio_max_sec"], 90.0)
+
+    def test_zero_budget_falls_back_to_the_module_default(self):
+        pipeline = _pipeline(asr=True)
+        pipeline._config.media_video_asr_max_sec = 0.0
+        seen = {}
+
+        def _samples_from_urls(urls, page_url, **kwargs):
+            seen.update(kwargs)
+            return None
+
+        with patch("src.media.video.available", return_value=True), \
+             patch("src.media.video.samples_from_urls",
+                   side_effect=_samples_from_urls):
+            pipeline.describe_video(_VIDEO_URLS, "https://x.com/p")
+
+        self.assertIsNone(seen["audio_max_sec"])
+
+    def test_unbuildable_transcriber_is_not_retried_every_time(self):
+        """A machine without faster-whisper must not reload the failure."""
+        pipeline = _pipeline(asr=True)
+
+        with patch("src.media.video.available", return_value=True), \
+             patch("src.media.video.samples_from_urls",
+                   side_effect=lambda *a, **k: self._samples()), \
+             patch("src.voice.asr.create_asr",
+                   side_effect=ImportError("no faster_whisper")) as made, \
+             patch.object(pipeline._vision, "describe_frames",
+                          return_value="画面上是一个盒子。"):
+            pipeline.describe_video(_VIDEO_URLS, "https://x.com/p")
+            pipeline.describe_video(_VIDEO_URLS, "https://x.com/p")
+
+        self.assertEqual(made.call_count, 1)
+        self.assertFalse(pipeline._asr or False)
+
+    def test_missing_audio_file_is_not_transcribed(self):
+        pipeline = _pipeline(asr=True)
+        samples = self._samples()
+        samples.audio.unlink()
+        asr = self._asr()
+
+        with patch("src.media.video.available", return_value=True), \
+             patch("src.media.video.samples_from_urls", return_value=samples), \
+             patch.object(pipeline, "_get_asr", return_value=asr), \
+             patch.object(pipeline._vision, "describe_frames",
+                          return_value="画面上是一个盒子。"):
+            pipeline.describe_video(_VIDEO_URLS, "https://x.com/p")
+
+        asr.transcribe_media.assert_not_called()
 
 
 class RouterVideoContextTests(unittest.TestCase):

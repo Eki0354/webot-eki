@@ -103,6 +103,97 @@ class VisionHelperTests(unittest.TestCase):
             self.assertIsNone(to_data_url(Path("x")))
 
 
+class FrameTranscriptPromptTests(unittest.TestCase):
+    """A clip's speech rides along in the *same* request as its frames.
+
+    Two calls would cost twice the latency for a worse answer: two
+    disconnected summaries the model cannot line up, one of the picture and
+    one of the sound.
+    """
+
+    def _client(self):
+        from src.media.vision import VisionClient
+        return VisionClient("sk-test", "vision-model")
+
+    def _capture(self, client):
+        """Record what ``describe_frames`` hands to the request layer."""
+        seen = {}
+
+        def _fake(data_urls, prompt, *, allow_text_only=False):
+            seen["urls"] = data_urls
+            seen["prompt"] = prompt
+            seen["text_only"] = allow_text_only
+            return "一段描述"
+
+        client._describe = _fake
+        return seen
+
+    @staticmethod
+    def _frame(name="frame_0.jpg"):
+        path = Path(tempfile.mkdtemp(prefix="webot_frame_test_")) / name
+        path.write_bytes(b"\xff\xd8\xff\xe0" + b"0" * 64)
+        return path
+
+    def test_transcript_goes_into_the_prompt(self):
+        from src.media.vision import FRAME_TRANSCRIPT_PROMPT
+
+        client = self._client()
+        seen = self._capture(client)
+        client.describe_frames([self._frame()], transcript="今天我们来开箱这个盒子")
+
+        self.assertIn("今天我们来开箱这个盒子", seen["prompt"])
+        self.assertIn("语音", seen["prompt"])
+        self.assertTrue(seen["text_only"])
+        # The wording has to warn that ASR output is fallible, or the model
+        # reports a homophone as a fact.
+        self.assertIn("错字", FRAME_TRANSCRIPT_PROMPT)
+
+    def test_no_transcript_keeps_the_frame_only_prompt(self):
+        from src.media.vision import FRAME_PROMPT
+
+        client = self._client()
+        seen = self._capture(client)
+        client.describe_frames([self._frame()], transcript="")
+
+        self.assertEqual(seen["prompt"], FRAME_PROMPT)
+        self.assertFalse(seen["text_only"])
+
+    def test_whitespace_only_transcript_is_treated_as_absent(self):
+        from src.media.vision import FRAME_PROMPT
+
+        client = self._client()
+        seen = self._capture(client)
+        client.describe_frames([self._frame()], transcript="   \n ")
+
+        self.assertEqual(seen["prompt"], FRAME_PROMPT)
+
+    def test_transcript_alone_is_enough_to_describe(self):
+        """A clip whose frames all decoded to noise still has sound."""
+        client = self._client()
+        seen = self._capture(client)
+        result = client.describe_frames([], transcript="他在说这个盒子很难开")
+
+        self.assertEqual(result, "一段描述")
+        self.assertEqual(seen["urls"], [])
+        self.assertTrue(seen["text_only"])
+
+    def test_nothing_at_all_is_not_a_request(self):
+        client = self._client()
+        self.assertIsNone(client.describe_frames([], transcript=""))
+        self.assertEqual(client.last_error, "no readable frame")
+
+    def test_long_transcript_is_capped(self):
+        """A bad decode must not push the frames out of the context window."""
+        from src.media.vision import MAX_TRANSCRIPT_CHARS
+
+        client = self._client()
+        seen = self._capture(client)
+        client.describe_frames(
+            [self._frame()], transcript="啊" * (MAX_TRANSCRIPT_CHARS + 500),
+        )
+        self.assertNotIn("啊" * (MAX_TRANSCRIPT_CHARS + 1), seen["prompt"])
+
+
 class EmojiStoreTests(unittest.TestCase):
     """Local Persist files are only trusted when they really are images."""
 
